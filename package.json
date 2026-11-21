@@ -1,0 +1,77 @@
+{
+  "name": "opencode-studio",
+  "version": "1.0.0",
+  "description": "OpenCode Studio — 开源透明、跨平台、开箱即用的个人 AI Agent 工作台（内置多供应商与模型能力自适应、双引擎无缝切换、MCP/Skills/背景联网商店、历史编辑分支与双通道更新）",
+  "type": "module",
+  "main": "electron/main.mjs",
+  "author": "gniygniynus",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gniygniynus/opencode-studio.git"
+  },
+  "homepage": "https://github.com/gniygniynus/opencode-studio",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "node server/index.mjs",
+    "dev": "node --watch server/index.mjs",
+    "desktop": "electron .",
+    "test": "node --test tests/*.test.mjs",
+    "build:win": "electron-builder --win nsis portable",
+    "build:mac": "electron-builder --mac dmg zip",
+    "build:linux": "electron-builder --linux AppImage deb"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^36.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.opencode.studio",
+    "productName": "OpenCode Studio",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "server/**/*",
+      "public/**/*",
+      "package.json",
+      "LICENSE",
+      "README.md"
+    ],
+    "extraMetadata": {
+      "main": "electron/main.mjs"
+    },
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        { "target": "dmg", "arch": ["arm64", "x64"] },
+        { "target": "zip", "arch": ["arm64", "x64"] }
+      ]
+    },
+    "linux": {
+      "category": "Development",
+      "target": [
+        { "target": "AppImage", "arch": ["x64"] },
+        { "target": "deb", "arch": ["x64"] }
+      ]
+    }
+  }
+}

@@ -1,0 +1,108 @@
+name: CI & Cross-Platform Release (Windows / macOS / Linux)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_channel:
+        description: "Release channel when manually building (none / stable / latest)"
+        required: false
+        default: "none"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Automated Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --omit=dev --no-audit --no-fund
+      - run: npm test
+
+  build-desktop:
+    name: Package Desktop (${{ matrix.label }})
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows-x64
+            os: windows-latest
+            cmd: npm run build:win
+          - label: macOS-Universal
+            os: macos-latest
+            cmd: npm run build:mac
+          - label: Linux-x64
+            os: ubuntu-latest
+            cmd: npm run build:linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --no-audit --no-fund
+      - run: ${{ matrix.cmd }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opencode-studio-${{ matrix.label }}
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.zip
+            dist/*.AppImage
+            dist/*.deb
+          if-no-files-found: ignore
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-desktop
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+      - name: Determine channel (stable vs latest pre-release)
+        id: meta
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "channel=latest (beta/pre-release)" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: "OpenCode Studio ${{ steps.meta.outputs.tag }}"
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          generate_release_notes: true
+          body: |
+            ## OpenCode Studio ${{ steps.meta.outputs.tag }}
+            - 发布通道：**${{ steps.meta.outputs.channel }}**
+            - 支持平台：Windows (`Setup.exe` / 便携版)、macOS (Apple Silicon `arm64` & Intel `x64` `.dmg`)、Linux (`.AppImage` / `.deb`)
+            - macOS 首次打开未签名开源应用提示解决：在终端执行 `xattr -cr "/Applications/OpenCode Studio.app"` 后打开即可。
+          files: release-artifacts/*

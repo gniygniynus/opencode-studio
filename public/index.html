@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenCode Studio</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- Wallpaper Background Layer -->
+  <div id="wallpaper-layer" class="wallpaper-layer"></div>
+  <div id="wallpaper-scrim" class="wallpaper-scrim"></div>
+
+  <div id="app" class="app-shell">
+    <!-- ==================== LEFT SIDEBAR ==================== -->
+    <aside id="sidebar" class="sidebar glass-panel">
+      <div class="sidebar-top">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1">
+              <rect x="3" y="3" width="18" height="18" rx="5"></rect>
+              <path d="M8 10l3 2-3 2"></path>
+              <line x1="13" y1="14" x2="16.5" y2="14"></line>
+            </svg>
+          </span>
+          <div class="brand-text">
+            <span class="brand-name">OpenCode Studio</span>
+            <span id="app-version-badge" class="brand-sub">v1.0.0 · 开源透明</span>
+          </div>
+        </div>
+        <div class="sidebar-top-actions">
+          <button id="btn-new-session" class="icon-btn primary-ghost" title="新建会话 (Ctrl+Shift+O)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1">
+              <path d="M12 5v14M5 12h14"></path>
+            </svg>
+          </button>
+          <button id="btn-collapse-sidebar" class="icon-btn" title="收起侧边栏">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+              <line x1="9" y1="4" x2="9" y2="20"></line>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="sidebar-search">
+        <div class="search-box">
+          <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="7"></circle>
+            <line x1="20" y1="20" x2="16.65" y2="16.65"></line>
+          </svg>
+          <input id="global-search-input" type="text" placeholder="搜索全部对话标题或正文…" autocomplete="off" />
+          <button id="global-search-clear" class="search-clear hidden" title="清除">×</button>
+        </div>
+        <select id="cwd-filter-select" class="cwd-filter-select" title="按工作目录筛选">
+          <option value="">全部工作目录</option>
+        </select>
+      </div>
+
+      <div id="session-list" class="session-list">
+        <div class="empty-hint">点击右上角 + 开始新对话</div>
+      </div>
+
+      <div class="sidebar-footer">
+        <!-- Built-in Provider Quick Card -->
+        <button id="btn-open-providers" class="provider-summary-card" title="点击管理内置供应商与模型能力">
+          <div class="psc-top">
+            <span id="sidebar-prov-dot" class="status-dot"></span>
+            <span id="sidebar-prov-name" class="psc-name">未配置供应商</span>
+            <span id="sidebar-prov-kind" class="psc-tag">设置</span>
+          </div>
+          <div id="sidebar-prov-model" class="psc-sub">点击添加 API 或启用 Claude 原生登录</div>
+        </button>
+
+        <!-- Tool Grid: Stores / Memory / Settings / Logs -->
+        <div class="footer-nav-grid">
+          <button id="btn-open-stores" class="footer-nav-btn" title="开源 MCP / Skills / 背景壁纸商店">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"></path>
+              <line x1="3" y1="6" x2="21" y2="6"></line>
+              <path d="M16 10a4 4 0 0 1-8 0"></path>
+            </svg>
+            <span>商店</span>
+          </button>
+          <button id="btn-open-memory" class="footer-nav-btn" title="全局与项目持久化记忆库">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+              <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
+            </svg>
+            <span>记忆</span>
+          </button>
+          <button id="btn-open-settings" class="footer-nav-btn" title="系统提示词、安全模式与双通道更新">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+            <span>设置</span>
+          </button>
+          <button id="btn-open-logs" class="footer-nav-btn" title="运行日志与 AI 排障中心">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+              <line x1="8" y1="13" x2="16" y2="13"></line>
+              <line x1="8" y1="17" x2="13" y2="17"></line>
+            </svg>
+            <span>日志</span>
+            <span id="log-error-dot" class="badge-dot hidden"></span>
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ==================== MAIN WORKSPACE ==================== -->
+    <main class="main-pane">
+      <header class="topbar glass-panel">
+        <div class="topbar-left">
+          <button id="btn-expand-sidebar" class="icon-btn hidden" title="展开侧边栏">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+              <line x1="9" y1="4" x2="9" y2="20"></line>
+            </svg>
+          </button>
+          <h1 id="thread-title" class="thread-title" title="点击重命名会话">新会话</h1>
+          <button id="cwd-pill" class="cwd-pill" title="点击自定义当前会话工作目录">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+            </svg>
+            <span id="cwd-pill-text">选择工作目录</span>
+          </button>
+        </div>
+
+        <div class="topbar-right">
+          <span id="ctx-pill" class="meta-pill hidden"></span>
+          <span id="ws-pill" class="meta-pill ws-ok">● 已连接</span>
+
+          <div class="segmented-bar">
+            <button class="seg-btn" data-tab="outline" title="本会话提问目录（点击精准跳转）">目录</button>
+            <button class="seg-btn" data-tab="find" title="当前会话内全文查找 (Ctrl+F)">找对话</button>
+            <button class="seg-btn" data-tab="activity" title="本会话文件改动与工具统计">改动</button>
+          </div>
+
+          <button id="btn-quick-bg" class="icon-btn" title="外观与开源背景壁纸商店">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <circle cx="12" cy="12" r="5"></circle>
+              <line x1="12" y1="1" x2="12" y2="3"></line>
+              <line x1="12" y1="21" x2="12" y2="23"></line>
+              <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+              <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+              <line x1="1" y1="12" x2="3" y2="12"></line>
+              <line x1="21" y1="12" x2="23" y2="12"></line>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <div class="workspace-body">
+        <div class="chat-column">
+          <div id="messages-scroll" class="messages-scroll">
+            <div id="messages-container" class="messages-container">
+              <div id="welcome-view" class="welcome-view">
+                <div class="welcome-badge">Open-Source · Cross-Platform · Zero Telemetry</div>
+                <h2>OpenCode Studio</h2>
+                <p class="welcome-desc">
+                  开源透明的个人 AI Agent 工作台：内置多供应商与模型思考能力自动适配，兼容 Claude 原生登录与任意 API 丝滑互切，支持开源 MCP / Skills / 背景商店与历史分支编辑。
+                </p>
+                <div class="welcome-grid">
+                  <div class="welcome-card glass-card" id="wc-providers">
+                    <div class="wc-title">1. 配置供应商与模型</div>
+                    <div class="wc-body">支持 Anthropic / OpenAI 兼容 API 与 Claude 原生订阅登录，自动识别思考等级与上下文窗口。</div>
+                  </div>
+                  <div class="welcome-card glass-card" id="wc-stores">
+                    <div class="wc-title">2. 开源 MCP & Skills 商店</div>
+                    <div class="wc-body">默认精选常用开源工具与技能，支持联网实时搜索并一键下载启用。</div>
+                  </div>
+                  <div class="welcome-card glass-card" id="wc-wallpaper">
+                    <div class="wc-title">3. 自定义外观与背景商店</div>
+                    <div class="wc-body">明暗主题、字体排版、毛玻璃透明度调节与免费开源高清壁纸联网搜索。</div>
+                  </div>
+                  <div class="welcome-card glass-card" id="wc-settings">
+                    <div class="wc-title">4. 自定义提示词与双通道更新</div>
+                    <div class="wc-body">100% 透明掌控 System Prompt，支持学生安全确认模式与稳定版/最新版更新。</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <button id="btn-scroll-bottom" class="scroll-bottom-btn hidden" title="直达底部">↓</button>
+
+          <!-- ==================== COMPOSER ==================== -->
+          <div class="composer-shell">
+            <div id="composer-box" class="composer-box glass-card">
+              <div id="autocomplete-popup" class="autocomplete-popup hidden"></div>
+              <div id="attachment-strip" class="attachment-strip hidden"></div>
+
+              <textarea
+                id="composer-input"
+                class="composer-input"
+                rows="1"
+                placeholder="输入指令或问题…（鼠标任意定位编辑 · Ctrl+V 粘贴图片 · / 命令与 Skills · @ 引用文件）"
+              ></textarea>
+
+              <div class="composer-toolbar">
+                <div class="composer-left">
+                  <select id="provider-select" class="pill-select provider-pill-select" title="快速切换当前供应商（对话历史无缝衔接）"></select>
+                  <select id="model-select" class="pill-select model-pill-select" title="当前供应商模型列表（直接显示模型名与上下文窗口）"></select>
+                  <select id="thinking-select" class="pill-select thinking-pill-select hidden" title="该模型自动适配的思考/推理等级"></select>
+                  <span id="model-cap-badge" class="cap-badge hidden"></span>
+                  <button id="btn-quick-compact" class="chip-btn" title="手动压缩当前长会话上下文">/compact</button>
+                </div>
+
+                <div class="composer-right">
+                  <input id="file-upload-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple class="hidden" />
+                  <button id="btn-attach-image" class="icon-btn" title="添加图片（也支持 Ctrl+V 粘贴或拖拽）">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                      <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+                      <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                      <polyline points="21 15 16 10 5 21"></polyline>
+                    </svg>
+                  </button>
+                  <button id="btn-stop" class="send-btn stop hidden" title="停止生成">■ 停止</button>
+                  <button id="btn-send" class="send-btn" title="发送 (Enter 发送 · Shift+Enter 换行)">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                      <line x1="12" y1="19" x2="12" y2="5"></line>
+                      <polyline points="5 12 12 5 19 12"></polyline>
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div class="composer-footnote">
+              <span>Enter 发送 · Shift+Enter 换行 · Ctrl+F 本会话搜索 · 悬停历史提问可编辑重发</span>
+              <span id="composer-engine-note"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ==================== RIGHT DRAWER ==================== -->
+        <aside id="right-drawer" class="right-drawer glass-panel hidden">
+          <div class="drawer-header">
+            <div class="drawer-tabs">
+              <button class="drawer-tab active" data-tab="outline">提问目录</button>
+              <button class="drawer-tab" data-tab="find">会话搜索</button>
+              <button class="drawer-tab" data-tab="activity">改动统计</button>
+            </div>
+            <button id="btn-close-drawer" class="icon-btn xs" title="关闭">×</button>
+          </div>
+
+          <div id="drawer-panel-outline" class="drawer-panel">
+            <div class="drawer-subbar">
+              <input id="outline-filter" type="text" class="mini-input" placeholder="筛选提问…" />
+              <span id="outline-count" class="muted-text">0 轮</span>
+            </div>
+            <div id="outline-list" class="drawer-list"></div>
+          </div>
+
+          <div id="drawer-panel-find" class="drawer-panel hidden">
+            <div class="drawer-subbar">
+              <input id="thread-find-input" type="text" class="mini-input" placeholder="搜索本会话（含工具与压缩摘要）…" />
+              <span id="thread-find-count" class="muted-text">0</span>
+              <button id="btn-find-prev" class="icon-btn xs" title="上一处">↑</button>
+              <button id="btn-find-next" class="icon-btn xs" title="下一处">↓</button>
+            </div>
+            <div id="thread-find-results" class="drawer-list"></div>
+          </div>
+
+          <div id="drawer-panel-activity" class="drawer-panel hidden">
+            <div id="activity-content" class="activity-content"></div>
+          </div>
+        </aside>
+      </div>
+    </main>
+  </div>
+
+  <!-- ==================== MODAL: PROVIDERS (BUILT-IN CC SWITCH REPLACEMENT) ==================== -->
+  <div id="modal-providers" class="modal-backdrop hidden">
+    <div class="modal-card xl">
+      <div class="modal-header">
+        <div>
+          <h3>内置供应商与模型能力管理</h3>
+          <p class="modal-sub">彻底摆脱第三方切换器：管理全部 API 供应商与 Claude 原生登录，自动识别模型思考等级与上下文窗口</p>
+        </div>
+        <button class="icon-btn xs modal-close" data-close="modal-providers">×</button>
+      </div>
+      <div class="modal-body split">
+        <div class="modal-left-col">
+          <button id="btn-add-provider" class="btn-primary full">+ 新增 API 供应商</button>
+          <div id="provider-list" class="stack-list"></div>
+          <div id="claude-native-status-box" class="info-box"></div>
+        </div>
+        <div class="modal-right-col">
+          <div id="provider-form-wrap">
+            <div class="form-grid">
+              <label class="field">
+                <span>供应商名称</span>
+                <input id="pf-name" class="text-input" placeholder="如：DeepSeek / OpenRouter / 中转站" />
+              </label>
+              <label class="field">
+                <span>接口协议类型</span>
+                <select id="pf-kind" class="text-input">
+                  <option value="openai">OpenAI 兼容协议 (/v1/chat/completions)</option>
+                  <option value="anthropic">Anthropic 原生协议 (/v1/messages)</option>
+                  <option value="claude_native">Claude 原生会员订阅登录 (本机 CLI)</option>
+                </select>
+              </label>
+              <label class="field full" id="pf-baseurl-wrap">
+                <span>Base URL（接口根地址）</span>
+                <input id="pf-baseurl" class="text-input mono" placeholder="https://api.openai.com 或 https://your-relay.com" />
+              </label>
+              <label class="field full" id="pf-apikey-wrap">
+                <span>API Key（本地 AES-256 加密保存，绝不上传）</span>
+                <input id="pf-apikey" type="password" class="text-input mono" placeholder="留空表示保持原密钥不变" />
+              </label>
+              <label class="field full">
+                <span>默认模型 ID</span>
+                <input id="pf-default-model" class="text-input mono" placeholder="如 claude-sonnet-4-6 或 deepseek-reasoner" />
+              </label>
+              <label class="field full">
+                <span>可用模型列表（每行一个，或点击下方「联网拉取模型」自动填充）</span>
+                <textarea id="pf-models" class="code-textarea sm" placeholder="gpt-4o&#10;claude-sonnet-4-6&#10;deepseek-reasoner"></textarea>
+              </label>
+            </div>
+            <div class="action-row">
+              <button id="btn-save-provider" class="btn-primary">保存供应商</button>
+              <button id="btn-activate-provider" class="btn-secondary">设为当前使用</button>
+              <button id="btn-fetch-models" class="btn-secondary">联网拉取模型 & 自动识别能力</button>
+              <button id="btn-delete-provider" class="btn-danger">删除</button>
+            </div>
+            <div class="section-label">已识别模型能力预览（思考等级 / 上下文窗口 / 视觉）</div>
+            <div id="pf-caps-preview" class="caps-grid"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: OPEN-SOURCE STORES (MCP / SKILLS / WALLPAPERS) ==================== -->
+  <div id="modal-stores" class="modal-backdrop hidden">
+    <div class="modal-card xl">
+      <div class="modal-header">
+        <div>
+          <h3>开源生态商店 & 外观定制</h3>
+          <p class="modal-sub">默认展示精选开源内容，输入关键词可联网搜索下载并即时启用</p>
+        </div>
+        <button class="icon-btn xs modal-close" data-close="modal-stores">×</button>
+      </div>
+      <div class="modal-tabs-bar">
+        <button class="modal-tab active" data-storetab="mcp">MCP 商店与管理</button>
+        <button class="modal-tab" data-storetab="skills">Skills 商店与管理</button>
+        <button class="modal-tab" data-storetab="wallpapers">背景壁纸与外观</button>
+      </div>
+      <div class="modal-body">
+        <!-- Store Tab 1: MCP -->
+        <div id="store-pane-mcp" class="store-pane">
+          <div class="store-search-bar">
+            <input id="mcp-search-input" class="text-input" placeholder="输入关键词联网搜索开源 MCP（如 postgres, github, browser, notion）…" />
+            <button id="btn-search-mcp" class="btn-primary">联网搜索</button>
+            <button id="btn-custom-mcp" class="btn-secondary">+ 手动添加 MCP</button>
+          </div>
+          <div class="section-label">已安装的 MCP 服务</div>
+          <div id="installed-mcp-list" class="card-grid"></div>
+          <div class="section-label">开源 MCP 商店（默认精选 · 支持联网检索）</div>
+          <div id="store-mcp-list" class="card-grid"></div>
+        </div>
+
+        <!-- Store Tab 2: Skills -->
+        <div id="store-pane-skills" class="store-pane hidden">
+          <div class="store-search-bar">
+            <input id="skills-search-input" class="text-input" placeholder="输入关键词联网搜索 GitHub 开源 Agent Skills…" />
+            <button id="btn-search-skills" class="btn-primary">联网搜索</button>
+            <button id="btn-custom-skill" class="btn-secondary">+ 新建本地 Skill</button>
+          </div>
+          <div class="section-label">已安装的 Skills（启用后自动注入 Agent 并支持 /slug 调用）</div>
+          <div id="installed-skills-list" class="card-grid"></div>
+          <div class="section-label">开源 Skills 商店</div>
+          <div id="store-skills-list" class="card-grid"></div>
+        </div>
+
+        <!-- Store Tab 3: Wallpapers & Appearance -->
+        <div id="store-pane-wallpapers" class="store-pane hidden">
+          <div class="appearance-controls-bar">
+            <label class="inline-ctrl">
+              <span>主题</span>
+              <select id="ap-theme" class="compact-select">
+                <option value="light">浅色极简</option>
+                <option value="dark">深色雅黑</option>
+              </select>
+            </label>
+            <label class="inline-ctrl">
+              <span>字号 <b id="ap-fontsize-val">14.5px</b></span>
+              <input id="ap-fontsize" type="range" min="13" max="17.5" step="0.5" value="14.5" />
+            </label>
+            <label class="inline-ctrl">
+              <span>背景模糊 <b id="ap-blur-val">8px</b></span>
+              <input id="ap-blur" type="range" min="0" max="24" step="1" value="8" />
+            </label>
+            <label class="inline-ctrl">
+              <span>毛玻璃浓度 <b id="ap-opacity-val">86%</b></span>
+              <input id="ap-opacity" type="range" min="0.55" max="0.98" step="0.02" value="0.86" />
+            </label>
+            <input id="bg-upload-input" type="file" accept="image/png,image/jpeg,image/webp" class="hidden" />
+            <button id="btn-upload-bg" class="btn-secondary sm">上传本地背景图</button>
+          </div>
+
+          <div class="store-search-bar">
+            <input id="wp-search-input" class="text-input" placeholder="联网搜索 Wikimedia 免费开源壁纸（如 mountain, sunset, galaxy, forest, ocean）…" />
+            <button id="btn-search-wp" class="btn-primary">联网搜索壁纸</button>
+          </div>
+
+          <div id="custom-bg-section" class="hidden">
+            <div class="section-label">我的上传背景</div>
+            <div id="custom-bg-grid" class="wp-grid"></div>
+          </div>
+
+          <div class="section-label">开源高清壁纸商店（精选 + 联网搜索）</div>
+          <div id="store-wp-grid" class="wp-grid"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: SETTINGS (PROMPT / SAFETY / DUAL-CHANNEL UPDATER) ==================== -->
+  <div id="modal-settings" class="modal-backdrop hidden">
+    <div class="modal-card lg">
+      <div class="modal-header">
+        <div>
+          <h3>工作台设置 · 自定义提示词 · 双通道更新</h3>
+          <p class="modal-sub">所有发给模型的指令完全透明可控，支持稳定版 / 最新版更新检查</p>
+        </div>
+        <button class="icon-btn xs modal-close" data-close="modal-settings">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="settings-section">
+          <div class="section-header-row">
+            <div class="section-label" style="margin:0;">自定义系统提示词（System Prompt · 100% 透明）</div>
+            <div class="preset-chips">
+              <button class="chip-btn prompt-preset" data-preset="default">默认全能</button>
+              <button class="chip-btn prompt-preset" data-preset="tutor">教学导师</button>
+              <button class="chip-btn prompt-preset" data-preset="minimal">极简无约束</button>
+            </div>
+          </div>
+          <textarea id="set-system-prompt" class="code-textarea md"></textarea>
+        </div>
+
+        <div class="settings-section two-col">
+          <label class="field">
+            <span>命令执行权限模式（推荐给学生开启高风险确认）</span>
+            <select id="set-permission-mode" class="text-input">
+              <option value="auto">全自动执行（高效开发，不弹窗）</option>
+              <option value="confirm_dangerous">安全护栏模式（删除/重置/强制推送前弹窗确认）</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>默认新建会话工作目录</span>
+            <input id="set-default-cwd" class="text-input mono" />
+          </label>
+        </div>
+
+        <div class="action-row" style="margin-bottom:18px;">
+          <button id="btn-save-settings" class="btn-primary">保存设置</button>
+        </div>
+
+        <div class="settings-section updater-box">
+          <div class="section-header-row">
+            <div>
+              <div class="section-label" style="margin:0;">软件更新（GitHub Releases 双通道）</div>
+              <p class="modal-sub" id="updater-current-line">当前版本：v1.0.0</p>
+            </div>
+            <div class="updater-controls">
+              <select id="set-update-channel" class="compact-select">
+                <option value="stable">稳定版通道 (stable)</option>
+                <option value="latest">最新版通道 (latest / beta)</option>
+              </select>
+              <button id="btn-check-update" class="btn-primary sm">检查更新</button>
+            </div>
+          </div>
+          <div id="updater-result" class="updater-result">选择通道后点击「检查更新」，将自动检测当前操作系统对应的安装包。</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: WORKDIR PICKER ==================== -->
+  <div id="modal-cwd" class="modal-backdrop hidden">
+    <div class="modal-card sm">
+      <div class="modal-header">
+        <h3>自定义工作目录</h3>
+        <button class="icon-btn xs modal-close" data-close="modal-cwd">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="cwd-input-row">
+          <input id="cwd-manual-input" class="text-input mono" placeholder="输入路径或下方浏览选择" />
+          <button id="btn-cwd-native" class="btn-secondary hidden">系统选框</button>
+          <button id="btn-cwd-browse" class="btn-secondary">浏览</button>
+          <button id="btn-cwd-apply" class="btn-primary">应用</button>
+        </div>
+        <div class="section-label">快捷目录</div>
+        <div id="cwd-shortcuts" class="dir-list"></div>
+        <div class="section-label">
+          <span>当前浏览：</span><code id="cwd-cur-path"></code>
+          <button id="btn-cwd-up" class="link-btn">上一级 ↑</button>
+        </div>
+        <div id="cwd-children" class="dir-list scroll"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: MEMORY MANAGER ==================== -->
+  <div id="modal-memory" class="modal-backdrop hidden">
+    <div class="modal-card lg">
+      <div class="modal-header">
+        <div>
+          <h3>持久化记忆管理（多窗口并发安全 · 版本锁防覆盖）</h3>
+          <p class="modal-sub">置顶记忆会自动精简注入系统上下文，其余记忆由 Agent 按需检索，绝不浪费 Token</p>
+        </div>
+        <button class="icon-btn xs modal-close" data-close="modal-memory">×</button>
+      </div>
+      <div class="modal-body split">
+        <div class="modal-left-col">
+          <div style="display:flex;gap:6px;">
+            <input id="mem-search-input" class="mini-input" placeholder="筛选记忆…" />
+            <button id="btn-new-memory" class="btn-primary sm">+ 新建</button>
+          </div>
+          <div id="mem-list" class="stack-list"></div>
+        </div>
+        <div class="modal-right-col">
+          <div class="form-grid">
+            <label class="field">
+              <span>标题</span>
+              <input id="mf-title" class="text-input" placeholder="简短清晰的标题" />
+            </label>
+            <label class="field">
+              <span>作用域</span>
+              <select id="mf-scope" class="text-input">
+                <option value="global">全局记忆（所有项目共享）</option>
+                <option value="project">项目记忆（绑定当前工作目录）</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>分类标签</span>
+              <input id="mf-category" class="text-input" placeholder="preference / project / ops" />
+            </label>
+            <label class="field checkbox-field">
+              <input id="mf-pinned" type="checkbox" />
+              <span>置顶常驻（自动精简注入每轮对话）</span>
+            </label>
+            <label class="field full">
+              <span>记忆正文</span>
+              <textarea id="mf-content" class="code-textarea lg" placeholder="记录偏好、项目约定或排障结论…"></textarea>
+            </label>
+          </div>
+          <div class="action-row">
+            <button id="btn-save-memory" class="btn-primary">保存记忆</button>
+            <button id="btn-delete-memory" class="btn-danger">删除</button>
+            <span id="mf-version-info" class="muted-text"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: LOGS & AI DIAGNOSTICS ==================== -->
+  <div id="modal-logs" class="modal-backdrop hidden">
+    <div class="modal-card lg">
+      <div class="modal-header">
+        <div>
+          <h3>运行日志与 AI 排障中心</h3>
+          <p id="logs-path-line" class="modal-sub"></p>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button id="btn-copy-ai-report" class="btn-primary sm">复制 AI 排障报告 (Markdown)</button>
+          <button class="icon-btn xs modal-close" data-close="modal-logs">×</button>
+        </div>
+      </div>
+      <div class="modal-tabs-bar">
+        <button class="modal-tab active" data-logtab="server">结构化服务日志</button>
+        <button class="modal-tab" data-logtab="turn">当前会话追踪</button>
+        <button class="modal-tab" data-logtab="report">AI 排障报告预览</button>
+        <div class="tab-spacer"></div>
+        <select id="log-level-filter" class="compact-select">
+          <option value="ALL">全部级别</option>
+          <option value="WARN+">警告与错误</option>
+          <option value="ERROR">仅错误</option>
+        </select>
+        <button id="btn-reload-logs" class="btn-secondary sm">刷新</button>
+      </div>
+      <div class="modal-body">
+        <div id="log-pane-server" class="log-pane"></div>
+        <pre id="log-pane-turn" class="log-pre hidden"></pre>
+        <pre id="log-pane-report" class="log-pre hidden"></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: DANGEROUS COMMAND CONFIRMATION ==================== -->
+  <div id="modal-confirm" class="modal-backdrop hidden">
+    <div class="modal-card sm">
+      <div class="modal-header">
+        <h3>⚠ 高风险命令安全确认</h3>
+      </div>
+      <div class="modal-body">
+        <p id="confirm-reason" class="modal-hint"></p>
+        <pre id="confirm-cmd" class="tool-pre"></pre>
+        <div class="action-row" style="margin-top:14px;justify-content:flex-end;">
+          <button id="btn-confirm-deny" class="btn-secondary">拒绝执行</button>
+          <button id="btn-confirm-allow" class="btn-danger">确认允许</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="lightbox" class="lightbox hidden"><img id="lightbox-img" alt="预览" /></div>
+  <div id="toast-root" class="toast-root"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
