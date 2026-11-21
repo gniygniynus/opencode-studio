@@ -4,7 +4,7 @@
   "description": "OpenCode Studio — 开源透明、跨平台、开箱即用的个人 AI Agent 工作台（内置多供应商与模型能力自适应、双引擎无缝切换、MCP/Skills/背景联网商店、历史编辑分支与双通道更新）",
   "type": "module",
   "main": "electron/main.mjs",
-  "author": "gniygniynus",
+  "author": "gniygniynus <gniygniynus@users.noreply.github.com>",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -19,9 +19,9 @@
     "dev": "node --watch server/index.mjs",
     "desktop": "electron .",
     "test": "node --test tests/*.test.mjs",
-    "build:win": "electron-builder --win nsis portable",
-    "build:mac": "electron-builder --mac dmg zip",
-    "build:linux": "electron-builder --linux AppImage deb"
+    "build:win": "electron-builder --win nsis portable --publish never",
+    "build:mac": "electron-builder --mac dmg zip --publish never",
+    "build:linux": "electron-builder --linux AppImage deb --publish never"
   },
   "dependencies": {
     "ws": "^8.18.0"
