@@ -219,8 +219,8 @@ export const CURATED_WALLPAPERS = [
     author: "Wikimedia Commons",
     license: "CC BY-SA",
     type: "image",
-    thumb: proxyWmUrl("https://upload.wikimedia.org/wikipedia/commons/thumb/e/e7/Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg/640px-Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg"),
-    url: proxyWmUrl("https://upload.wikimedia.org/wikipedia/commons/thumb/e/e7/Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg/1920px-Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg"),
+    thumb: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg?width=640"),
+    url: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg?width=1920"),
   },
   {
     id: "wp-wm-aurora",
@@ -228,8 +228,8 @@ export const CURATED_WALLPAPERS = [
     author: "Wikimedia Commons",
     license: "CC BY",
     type: "image",
-    thumb: proxyWmUrl("https://upload.wikimedia.org/wikipedia/commons/thumb/a/aa/Polarlicht_2.jpg/640px-Polarlicht_2.jpg"),
-    url: proxyWmUrl("https://upload.wikimedia.org/wikipedia/commons/thumb/a/aa/Polarlicht_2.jpg/1920px-Polarlicht_2.jpg"),
+    thumb: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Polarlicht_2.jpg?width=640"),
+    url: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Polarlicht_2.jpg?width=1920"),
   },
   {
     id: "wp-wm-fuji",
@@ -237,8 +237,8 @@ export const CURATED_WALLPAPERS = [
     author: "Wikimedia Commons",
     license: "CC BY-SA",
     type: "image",
-    thumb: proxyWmUrl("https://upload.wikimedia.org/wikipedia/commons/thumb/1/1b/080103_hakkai_fuji.jpg/640px-080103_hakkai_fuji.jpg"),
-    url: proxyWmUrl("https://upload.wikimedia.org/wikipedia/commons/thumb/1/1b/080103_hakkai_fuji.jpg/1920px-080103_hakkai_fuji.jpg"),
+    thumb: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/080103_hakkai_fuji.jpg?width=640"),
+    url: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/080103_hakkai_fuji.jpg?width=1920"),
   },
   {
     id: "wp-wm-forest",
@@ -246,8 +246,8 @@ export const CURATED_WALLPAPERS = [
     author: "Wikimedia Commons",
     license: "CC0 / Public Domain",
     type: "image",
-    thumb: proxyWmUrl("https://upload.wikimedia.org/wikipedia/commons/thumb/c/c8/Altja_j%C3%B5gi_Lahemaal.jpg/640px-Altja_j%C3%B5gi_Lahemaal.jpg"),
-    url: proxyWmUrl("https://upload.wikimedia.org/wikipedia/commons/thumb/c/c8/Altja_j%C3%B5gi_Lahemaal.jpg/1920px-Altja_j%C3%B5gi_Lahemaal.jpg"),
+    thumb: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Altja_j%C3%B5gi_Lahemaal.jpg?width=640"),
+    url: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Altja_j%C3%B5gi_Lahemaal.jpg?width=1920"),
   },
 ];
 

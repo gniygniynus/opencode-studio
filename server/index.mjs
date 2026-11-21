@@ -430,7 +430,11 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       if (method === "GET" && pathname === "/api/wallpaper-proxy") {
         const rawUrl = urlObj.searchParams.get("url") || "";
         // Strict open-source allowlist: Wikimedia Commons only (prevents SSRF)
-        if (!/^https:\/\/upload\.wikimedia\.org\/wikipedia\/commons\//i.test(rawUrl)) {
+        if (
+          !/^https:\/\/(upload\.wikimedia\.org\/wikipedia\/commons\/|commons\.wikimedia\.org\/wiki\/Special:FilePath\/)/i.test(
+            rawUrl,
+          )
+        ) {
           return sendJson(res, 400, { error: "仅允许代理 Wikimedia Commons 开源图源" });
         }
         const hash = crypto.createHash("sha1").update(rawUrl).digest("hex");
