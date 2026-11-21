@@ -167,15 +167,79 @@ export const CURATED_SKILLS = [
   },
 ];
 
-function proxyWmUrl(raw) {
+function proxyImageUrl(raw) {
   return `/api/wallpaper-proxy?url=${encodeURIComponent(raw)}`;
 }
 
-// ==================== 3. CURATED OPEN-SOURCE WALLPAPERS (CC0 / PUBLIC DOMAIN + PURE CSS) ====================
+// Built-in 60fps Canvas live wallpapers (zero bandwidth, super smooth, optional pause)
+export const LIVE_WALLPAPERS = [
+  {
+    id: "live-aurora",
+    name: "动态 · 极光流影",
+    author: "Live Canvas",
+    license: "MIT",
+    type: "live",
+    liveBg: "live-aurora",
+    url: "",
+    preview_css: "linear-gradient(135deg, #0f2027 0%, #203a43 45%, #2c5364 100%)",
+  },
+  {
+    id: "live-starfield",
+    name: "动态 · 深空星河",
+    author: "Live Canvas",
+    license: "MIT",
+    type: "live",
+    liveBg: "live-starfield",
+    url: "",
+    preview_css: "radial-gradient(circle at 30% 30%, #1b2845 0%, #090c14 75%)",
+  },
+  {
+    id: "live-mesh",
+    name: "动态 · 莫兰迪柔雾",
+    author: "Live Canvas",
+    license: "MIT",
+    type: "live",
+    liveBg: "live-mesh",
+    url: "",
+    preview_css: "linear-gradient(125deg, #dfe9f3 0%, #f3e7e9 50%, #e3eeff 100%)",
+  },
+  {
+    id: "live-waves",
+    name: "动态 · 深海光波",
+    author: "Live Canvas",
+    license: "MIT",
+    type: "live",
+    liveBg: "live-waves",
+    url: "",
+    preview_css: "linear-gradient(160deg, #134e5e 0%, #1a2a6c 60%, #0f172a 100%)",
+  },
+  {
+    id: "live-constellation",
+    name: "动态 · 几何呼吸星网",
+    author: "Live Canvas",
+    license: "MIT",
+    type: "live",
+    liveBg: "live-constellation",
+    url: "",
+    preview_css: "linear-gradient(135deg, #16222a 0%, #3a6073 100%)",
+  },
+  {
+    id: "live-matrix",
+    name: "动态 · 赛博微光代码雨",
+    author: "Live Canvas",
+    license: "MIT",
+    type: "live",
+    liveBg: "live-matrix",
+    url: "",
+    preview_css: "linear-gradient(180deg, #07140d 0%, #0d2b1d 60%, #050a08 100%)",
+  },
+];
+
+// ==================== 3. CURATED OPEN-SOURCE WALLPAPERS ====================
 export const CURATED_WALLPAPERS = [
   {
     id: "wp-none",
-    name: "纯色极简（无背景图）",
+    name: "纯色极简（无背景）",
     author: "OpenCode Studio",
     license: "MIT",
     type: "none",
@@ -213,14 +277,15 @@ export const CURATED_WALLPAPERS = [
     url: "linear-gradient(125deg, #e6f4ea 0%, #eef6f9 52%, #f4f1ea 100%)",
     preview_css: "linear-gradient(125deg, #e6f4ea 0%, #eef6f9 52%, #f4f1ea 100%)",
   },
+  ...LIVE_WALLPAPERS,
   {
     id: "wp-wm-alps",
-    name: "阿尔卑斯雪峰（Wikimedia CC）",
+    name: "雪峰晨曦（Wikimedia CC）",
     author: "Wikimedia Commons",
     license: "CC BY-SA",
     type: "image",
-    thumb: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg?width=640"),
-    url: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg?width=1920"),
+    thumb: proxyImageUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg?width=640"),
+    url: proxyImageUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg?width=1920"),
   },
   {
     id: "wp-wm-aurora",
@@ -228,28 +293,49 @@ export const CURATED_WALLPAPERS = [
     author: "Wikimedia Commons",
     license: "CC BY",
     type: "image",
-    thumb: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Polarlicht_2.jpg?width=640"),
-    url: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Polarlicht_2.jpg?width=1920"),
-  },
-  {
-    id: "wp-wm-fuji",
-    name: "富士山晨景（Wikimedia CC）",
-    author: "Wikimedia Commons",
-    license: "CC BY-SA",
-    type: "image",
-    thumb: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/080103_hakkai_fuji.jpg?width=640"),
-    url: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/080103_hakkai_fuji.jpg?width=1920"),
-  },
-  {
-    id: "wp-wm-forest",
-    name: "迷雾森林（Wikimedia CC）",
-    author: "Wikimedia Commons",
-    license: "CC0 / Public Domain",
-    type: "image",
-    thumb: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Altja_j%C3%B5gi_Lahemaal.jpg?width=640"),
-    url: proxyWmUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Altja_j%C3%B5gi_Lahemaal.jpg?width=1920"),
+    thumb: proxyImageUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Polarlicht_2.jpg?width=640"),
+    url: proxyImageUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Polarlicht_2.jpg?width=1920"),
   },
 ];
+
+// Chinese -> English wallpaper keyword mapping so Wallhaven returns rich 4K hits for Chinese queries
+const ZH_WALLPAPER_DICT = {
+  星空: "stars galaxy night sky",
+  宇宙: "space nebula universe",
+  动漫: "anime scenery landscape",
+  二次元: "anime art wallpaper",
+  赛博朋克: "cyberpunk neon city",
+  赛博: "cyberpunk neon",
+  风景: "landscape nature mountains",
+  山水: "mountains lake landscape",
+  雪山: "snow mountains alps",
+  森林: "forest mist nature",
+  海洋: "ocean sea waves",
+  海边: "beach ocean sunset",
+  日落: "sunset clouds sky",
+  日出: "sunrise mountain",
+  城市: "cityscape night lights",
+  夜景: "night city neon",
+  极简: "minimalism abstract clean",
+  极光: "aurora borealis northern lights",
+  樱花: "cherry blossom japan sakura",
+  猫: "cat cute",
+  暗黑: "dark abstract minimal",
+  科幻: "sci-fi futuristic",
+  建筑: "architecture minimal",
+  治愈: "pastel sky clouds calm",
+  古风: "traditional chinese landscape",
+};
+
+function translateWallpaperQuery(q) {
+  let out = String(q || "").trim();
+  for (const [zh, en] of Object.entries(ZH_WALLPAPER_DICT)) {
+    if (out.includes(zh)) {
+      out = out.replaceAll(zh, ` ${en} `);
+    }
+  }
+  return out.replace(/\s+/g, " ").trim();
+}
 
 async function fetchJsonWithTimeout(url, timeoutMs = 10000) {
   const controller = new AbortController();
@@ -413,61 +499,108 @@ export async function downloadRemoteSkillContent(item) {
   return `# ${item.name}\n\n来源: ${item.source_url}\n\n${item.description || ""}`;
 }
 
-// ==================== ONLINE SEARCH: OPEN-SOURCE WALLPAPER STORE ====================
-export async function searchWallpaperStore(query = "") {
+// ==================== ONLINE SEARCH: MASSIVE OPEN WALLPAPER STORE (WALLHAVEN 4K + WIKIMEDIA + LIVE) ====================
+export async function searchWallpaperStore(query = "", page = 1, category = "all") {
   const q = String(query || "").trim();
-  if (!q) {
-    return {
-      ok: true,
-      mode: "curated",
-      items: CURATED_WALLPAPERS,
-      online_note: "输入英文或中文主题词（如 mountain, sunset, architecture, nebula）可联网搜索 Wikimedia 开源壁纸",
-    };
+  const pageNum = Math.max(1, Number(page) || 1);
+  const translated = translateWallpaperQuery(q);
+
+  // Category filter for live wallpapers only
+  if (category === "live") {
+    const liveList = LIVE_WALLPAPERS.filter((w) => !q || w.name.toLowerCase().includes(q.toLowerCase()));
+    return { ok: true, mode: "live", page: 1, has_more: false, items: liveList };
   }
 
-  const localHits = CURATED_WALLPAPERS.filter((w) => w.name.toLowerCase().includes(q.toLowerCase()));
   const onlineItems = [];
   let onlineError = "";
+  let lastPage = 1;
+  let totalCount = 0;
 
+  // Query Wallhaven public 4K wallpaper API (24 HD wallpapers per page, infinite pagination, SFW purity=100)
   try {
-    const wmUrl =
-      `https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*` +
-      `&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(`${q} filetype:bitmap`)}&gsrlimit=18` +
-      `&prop=imageinfo&iiprop=url|extmetadata|size&iiurlwidth=640`;
-    const data = await fetchJsonWithTimeout(wmUrl, 10000);
-    const pages = Object.values(data?.query?.pages || {});
-    for (const pg of pages) {
-      const info = pg.imageinfo?.[0];
-      if (!info?.url || !info?.thumburl) continue;
-      if ((info.width || 0) < 900 || (info.height || 0) < 500) continue; // wallpaper resolution floor
-      const lic = info.extmetadata?.LicenseShortName?.value || "Open License";
-      const cleanName = String(pg.title || "")
-        .replace(/^File:/i, "")
-        .replace(/\.[^.]+$/, "")
-        .replace(/_/g, " ")
-        .slice(0, 60);
+    const whParams = new URLSearchParams({
+      purity: "100",
+      page: String(pageNum),
+      sorting: translated ? "relevance" : "toplist",
+      ratios: "16x9,16x10,21x9",
+    });
+    if (translated) {
+      whParams.set("q", translated);
+    } else if (category === "anime") {
+      whParams.set("categories", "010");
+    } else if (category === "scenery") {
+      whParams.set("q", "landscape nature");
+    } else {
+      whParams.set("categories", "110"); // general + anime (clean wallpapers)
+    }
+
+    const whUrl = `https://wallhaven.cc/api/v1/search?${whParams.toString()}`;
+    const data = await fetchJsonWithTimeout(whUrl, 10000);
+    lastPage = Number(data?.meta?.last_page || 1);
+    totalCount = Number(data?.meta?.total || 0);
+
+    for (const item of data?.data || []) {
+      // Wallhaven's `thumbs.small` (300x200) and `path` (full 4K) are publicly accessible 200 OK
+      // without hotlink 403 (unlike `thumbs.large`/`thumbs.original`).
+      const thumb = item.thumbs?.small || item.path;
+      const full = item.path;
+      if (!thumb || !full) continue;
       onlineItems.push({
-        id: `wm-${pg.pageid}`,
-        name: cleanName || "开源壁纸",
-        author: "Wikimedia Commons",
-        license: lic,
+        id: `wh-${item.id}`,
+        name: `${item.category || "HD"} · ${item.resolution || "4K"}`,
+        author: "Wallhaven",
+        license: item.resolution || "HD",
         type: "image",
-        thumb: proxyWmUrl(info.thumburl),
-        url: proxyWmUrl(info.url),
-        width: info.width,
-        height: info.height,
+        thumb: proxyImageUrl(thumb),
+        url: proxyImageUrl(full),
+        resolution: item.resolution || "",
+        colors: item.colors || [],
       });
     }
   } catch (err) {
-    onlineError = `Wikimedia 开源图源联网搜索失败: ${err.message}`;
-    logEvent("WARN", "stores", "wallpaper_search_err", onlineError);
+    onlineError = `Wallhaven 联网搜索失败: ${err.message}`;
+    logEvent("WARN", "stores", "wallhaven_err", onlineError);
   }
 
+  // Fallback / supplement with Wikimedia Commons if Wallhaven returned few hits
+  if (onlineItems.length < 6 && q) {
+    try {
+      const wmUrl =
+        `https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*` +
+        `&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(`${translated || q} filetype:bitmap`)}&gsrlimit=12` +
+        `&prop=imageinfo&iiprop=url|extmetadata|size&iiurlwidth=640`;
+      const data = await fetchJsonWithTimeout(wmUrl, 9000);
+      for (const pg of Object.values(data?.query?.pages || {})) {
+        const info = pg.imageinfo?.[0];
+        if (!info?.url || !info?.thumburl) continue;
+        if ((info.width || 0) < 900) continue;
+        const cleanName = String(pg.title || "").replace(/^File:/i, "").replace(/\.[^.]+$/, "").replace(/_/g, " ").slice(0, 50);
+        onlineItems.push({
+          id: `wm-${pg.pageid}`,
+          name: cleanName || "Wikimedia 壁纸",
+          author: "Wikimedia",
+          license: info.extmetadata?.LicenseShortName?.value || "CC",
+          type: "image",
+          thumb: proxyImageUrl(info.thumburl),
+          url: proxyImageUrl(info.url),
+        });
+      }
+    } catch {
+      // ignore fallback err
+    }
+  }
+
+  const baseItems = pageNum === 1 && !q && category === "all" ? CURATED_WALLPAPERS : [];
   return {
     ok: true,
-    mode: "online",
+    mode: q ? "online" : "curated+online",
     query: q,
-    items: [...localHits, ...onlineItems].slice(0, 20),
+    translated_query: translated,
+    page: pageNum,
+    last_page: lastPage,
+    total_online: totalCount,
+    has_more: pageNum < lastPage,
+    items: [...baseItems, ...onlineItems],
     online_error: onlineError,
   };
 }

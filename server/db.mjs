@@ -26,13 +26,15 @@ export const DEFAULT_SYSTEM_PROMPT = `你是 OpenCode Studio 内置的开源透�
 
 export const DEFAULT_APPEARANCE = {
   theme: "light",           // light | dark
-  fontFamily: "system",     // system | serif | mono-friendly
+  fontFamily: "system",
   fontSize: 14.5,
   lineHeight: 1.72,
-  bgType: "none",           // none | preset | url | upload
+  bgType: "none",           // none | gradient | image | live | video | upload
+  bgMode: "subtle",         // hd (高清原版清晰呈现) | subtle (隐性护眼柔和氛围)
   bgUrl: "",
-  bgBlur: 8,
-  bgOpacity: 0.86,          // glass surface opacity over wallpaper
+  liveBg: "",               // live-aurora | live-starfield | live-matrix | live-waves | live-mesh | live-constellation
+  bgBlur: 10,
+  bgOpacity: 0.88,
   bgName: "",
 };
 
@@ -218,6 +220,8 @@ function seedInitialData(db) {
   };
 
   ensureKv("system_prompt", DEFAULT_SYSTEM_PROMPT);
+  ensureKv("prompt_mode", "replace"); // replace | append | native
+  ensureKv("engine_mode", "claude_code"); // claude_code (原生 Claude Code 主内核) | api_direct (无 CLI 兜底)
   ensureKv("permission_mode", "auto"); // auto | confirm_dangerous
   ensureKv("update_channel", "stable"); // stable | latest
   ensureKv("appearance", DEFAULT_APPEARANCE);
@@ -265,6 +269,8 @@ export function setSetting(key, value) {
 export function getAllSettings() {
   return {
     system_prompt: getSetting("system_prompt", DEFAULT_SYSTEM_PROMPT),
+    prompt_mode: getSetting("prompt_mode", "replace"),
+    engine_mode: getSetting("engine_mode", "claude_code"),
     permission_mode: getSetting("permission_mode", "auto"),
     update_channel: getSetting("update_channel", "stable"),
     appearance: { ...DEFAULT_APPEARANCE, ...(getSetting("appearance", DEFAULT_APPEARANCE) || {}) },

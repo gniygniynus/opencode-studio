@@ -9,6 +9,7 @@ import { after, before, describe, it } from "node:test";
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-studio-test-"));
 const tmpWorkdir = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-studio-cwd-"));
 process.env.OPENCODE_DATA_DIR = tmpRoot;
+process.env.OPENCODE_FORCE_API_DIRECT = "1";
 
 const {
   addMessage,
@@ -268,12 +269,72 @@ describe("OpenCode Studio Core Suite", () => {
     assert.equal(tl2.items[0].branch_index, 2);
     assert.equal(tl2.items[0].branch_total, 2);
     assert.ok(tl2.items[1].content_text.includes("改个问题"));
+
+    // Test AI Regenerate Reply (creates sibling assistant branch 2/2)
+    const regen = await studioServer.orchestrator.regenerateReply({
+      sessionId: sent.session_id,
+      assistantMessageId: tl2.items[1].id,
+    });
+    assert.equal(regen.ok, true);
+    for (let i = 0; i < 60; i++) {
+      if (!studioServer.orchestrator.runningSessionIds().includes(sent.session_id)) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const tl3 = getSessionTimeline(sent.session_id);
+    assert.equal(tl3.items.length, 2);
+    assert.equal(tl3.items[1].branch_index, 2);
+    assert.equal(tl3.items[1].branch_total, 2);
+
+    // Test Multi-turn accumulation (2nd user question appends -> 4 items, never overwrites 1st!)
+    const sent2 = await studioServer.orchestrator.sendMessage({
+      sessionId: sent.session_id,
+      text: "第二轮连续提问测试",
+      cwd: tmpWorkdir,
+      providerId: saveRes.provider.id,
+      model: "deepseek-reasoner",
+      thinkingLevel: "off",
+    });
+    assert.equal(sent2.ok, true);
+    for (let i = 0; i < 60; i++) {
+      if (!studioServer.orchestrator.runningSessionIds().includes(sent.session_id)) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const tl4 = getSessionTimeline(sent.session_id);
+    assert.equal(tl4.items.length, 4);
+    assert.equal(tl4.items[0].content_text, "改个问题：只打招呼");
+    assert.equal(tl4.items[2].content_text, "第二轮连续提问测试");
+
+    // Test Built-in Transparent Anthropic <-> OpenAI Proxy (used by Native Claude Code)
+    const proxyRes = await fetch(`${studioServer.url}/proxy/provider/${saveRes.provider.id}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "dummy" },
+      body: JSON.stringify({
+        model: "deepseek-reasoner",
+        max_tokens: 1024,
+        stream: true,
+        messages: [{ role: "user", content: "请执行 CREATE_FILE 任务" }],
+      }),
+    });
+    assert.equal(proxyRes.status, 200);
+    const sseText = await proxyRes.text();
+    assert.ok(sseText.includes("event: message_start"));
+    assert.ok(sseText.includes("thinking_delta"));
+    assert.ok(sseText.includes('"name":"write_file"'));
+    assert.ok(sseText.includes("event: message_stop"));
+
+    const countRes = await fetch(`${studioServer.url}/proxy/provider/${saveRes.provider.id}/v1/messages/count_tokens`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hello world" }] }),
+    }).then((r) => r.json());
+    assert.ok(countRes.input_tokens > 0);
   });
 
-  it("provides curated open-source catalogs and accurate semver comparison", () => {
+  it("provides curated open-source catalogs (including live wallpapers) and accurate semver comparison", () => {
     assert.ok(CURATED_MCPS.length >= 6);
     assert.ok(CURATED_SKILLS.length >= 5);
-    assert.ok(CURATED_WALLPAPERS.length >= 6);
+    assert.ok(CURATED_WALLPAPERS.length >= 10);
+    assert.ok(CURATED_WALLPAPERS.some((w) => w.type === "live" && w.liveBg));
     assert.equal(compareSemver("1.1.0", "1.0.0"), 1);
     assert.equal(compareSemver("1.0.0", "1.0.0-beta.1"), 1);
     assert.equal(compareSemver("1.0.1-beta.1", "1.0.0"), 1);

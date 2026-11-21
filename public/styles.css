@@ -122,17 +122,32 @@ html, body {
 .mono { font-family: var(--font-mono) !important; }
 
 /* Wallpaper System */
-.wallpaper-layer {
+.wallpaper-layer,
+.wallpaper-canvas,
+.wallpaper-video {
   position: fixed;
-  inset: -24px;
+  inset: -16px;
+  width: calc(100vw + 32px);
+  height: calc(100vh + 32px);
   z-index: 0;
+  object-fit: cover;
   background-size: cover;
   background-position: center;
   background-repeat: no-repeat;
   filter: blur(var(--bg-blur));
-  transform: scale(1.04);
+  transform: scale(1.03);
   transition: background-image 0.3s ease, filter 0.2s ease;
   pointer-events: none;
+}
+
+body.bg-mode-hd .wallpaper-layer,
+body.bg-mode-hd .wallpaper-canvas,
+body.bg-mode-hd .wallpaper-video {
+  filter: blur(0px) !important;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  transform: none;
 }
 
 .wallpaper-scrim {
@@ -145,7 +160,11 @@ html, body {
 }
 
 body.has-wallpaper .wallpaper-scrim {
-  background: rgba(var(--surface-rgb), calc(1 - var(--glass-alpha) * 0.55));
+  background: rgba(var(--surface-rgb), calc(1 - var(--glass-alpha) * 0.52));
+}
+
+body.has-wallpaper.bg-mode-hd .wallpaper-scrim {
+  background: rgba(0, 0, 0, 0.06);
 }
 
 .glass-panel {
@@ -1162,6 +1181,85 @@ mark.search-hl { background: var(--mark-bg); color: var(--mark-text); padding: 0
 
 .toast-root { position: fixed; bottom: 22px; right: 22px; display: flex; flex-direction: column; gap: 8px; z-index: 300; }
 .toast { background: var(--accent); color: var(--accent-contrast); padding: 9px 15px; border-radius: 10px; font-size: 13px; box-shadow: var(--shadow-md); }
+
+/* Subtle symbol action bars BELOW user & assistant messages */
+.msg-footer-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+  opacity: 0.58;
+  transition: opacity 0.15s ease;
+}
+.msg-user .msg-footer-bar {
+  justify-content: flex-end;
+  padding-right: 4px;
+}
+.msg-assistant .msg-footer-bar {
+  justify-content: flex-start;
+  padding-top: 6px;
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.msg-user:hover .msg-footer-bar,
+.msg-assistant:hover .msg-footer-bar {
+  opacity: 1;
+}
+
+.sym-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.sym-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border);
+}
+
+.auth-panel {
+  padding: 13px 15px;
+  border-radius: 12px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-subtle);
+  margin-bottom: 12px;
+}
+
+.wp-cat-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.wp-cat.active {
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border-color: var(--accent);
+}
+.wp-live-badge {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  backdrop-filter: blur(6px);
+}
+.wp-thumb {
+  position: relative;
+}
 
 .streaming-cursor::after { content: "▍"; display: inline-block; margin-left: 2px; color: var(--brand); animation: blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }

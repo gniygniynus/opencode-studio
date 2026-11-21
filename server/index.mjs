@@ -5,6 +5,7 @@
  * Can run standalone (`npm start`) or embedded inside Electron (`electron/main.mjs`).
  */
 
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -12,6 +13,13 @@ import os from "node:os";
 import path from "node:path";
 import { WebSocketServer } from "ws";
 
+import { handleProviderProxyRequest } from "./api_proxy.mjs";
+import {
+  getClaudeRuntimeAndAuth,
+  installOrSwitchClaudeVersion,
+  runClaudeAuthLogin,
+  runClaudeAuthLogout,
+} from "./claude_runtime.mjs";
 import {
   activateProvider,
   addCustomBackground,
@@ -41,7 +49,6 @@ import {
   switchBranch,
   updateSessionMeta,
 } from "./db.mjs";
-import { probeClaudeNativeStatus } from "./engine_claude_cli.mjs";
 import {
   buildAiDiagnosticBundle,
   classifyError,
@@ -74,6 +81,8 @@ const MIME = {
   ".jpeg": "image/jpeg",
   ".webp": "image/webp",
   ".gif": "image/gif",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
   ".ico": "image/x-icon",
 };
 
@@ -84,6 +93,50 @@ const ALLOWED_IMAGE_MIMES = {
   "image/webp": ".webp",
   "image/gif": ".gif",
 };
+
+const ALLOWED_BG_MIMES = {
+  ...ALLOWED_IMAGE_MIMES,
+  "video/mp4": ".mp4",
+  "video/webm": ".webm",
+};
+
+function pickNativeDirectoryDialog() {
+  if (process.platform === "win32") {
+    const ps = `
+Add-Type -AssemblyName System.Windows.Forms
+$f = New-Object System.Windows.Forms.Form
+$f.TopMost = $true
+$d = New-Object System.Windows.Forms.FolderBrowserDialog
+$d.Description = "选择 OpenCode Studio 工作目录"
+$d.UseDescriptionForTitle = $true
+$d.ShowNewFolderButton = $true
+if ($d.ShowDialog($f) -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+  Write-Output $d.SelectedPath
+}
+`;
+    const res = spawnSync("powershell.exe", ["-NoProfile", "-STA", "-Command", ps], {
+      encoding: "utf8",
+      timeout: 120000,
+      windowsHide: false,
+    });
+    return (res.stdout || "").trim() || null;
+  }
+  if (process.platform === "darwin") {
+    const res = spawnSync("osascript", ["-e", 'POSIX path of (choose folder with prompt "选择工作目录")'], {
+      encoding: "utf8",
+      timeout: 120000,
+    });
+    return (res.stdout || "").trim() || null;
+  }
+  const z = spawnSync("zenity", ["--file-selection", "--directory", "--title=选择工作目录"], {
+    encoding: "utf8",
+    timeout: 120000,
+  });
+  if (z.status === 0 && z.stdout.trim()) return z.stdout.trim();
+  const k = spawnSync("kdialog", ["--getexistingdirectory"], { encoding: "utf8", timeout: 120000 });
+  return k.status === 0 ? k.stdout.trim() || null : null;
+}
 
 function sendJson(res, status, data) {
   const body = JSON.stringify(data);
@@ -200,15 +253,22 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
     }
   };
 
-  const orchestrator = new SessionOrchestrator({ broadcast, mcpManager });
+  let boundPort = port;
+  const orchestrator = new SessionOrchestrator({ broadcast, mcpManager, getPort: () => boundPort });
   const appVersion = getAppVersion();
 
   const server = http.createServer(async (req, res) => {
     const reqId = newReqId();
     try {
-      const urlObj = new URL(req.url || "/", `http://${host}:${port}`);
+      const urlObj = new URL(req.url || "/", `http://${host}:${boundPort || port}`);
       const pathname = decodeURIComponent(urlObj.pathname);
       const method = (req.method || "GET").toUpperCase();
+
+      // ==================== BUILT-IN TRANSPARENT API PROXY FOR NATIVE CLAUDE CODE ====================
+      const proxyMatch = pathname.match(/^\/proxy\/provider\/([^/]+)(\/v1\/.*)$/);
+      if (method === "POST" && proxyMatch) {
+        return await handleProviderProxyRequest(req, res, proxyMatch[1], proxyMatch[2]);
+      }
 
       // ==================== HEALTH & BOOTSTRAP ====================
       if (method === "GET" && pathname === "/api/health") {
@@ -234,12 +294,43 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           settings: getAllSettings(),
           providers,
           active_provider: providers.find((p) => p.is_active) || providers[0] || null,
-          claude_native: probeClaudeNativeStatus(),
+          claude_native: getClaudeRuntimeAndAuth(false),
           installed_mcps: mcpManager.getStatusList(),
           installed_skills: listInstalledSkills(),
           custom_backgrounds: listCustomBackgrounds(),
           running_sessions: orchestrator.runningSessionIds(),
         });
+      }
+
+      // ==================== NATIVE CLAUDE CODE AUTH & VERSION MANAGEMENT ====================
+      if (method === "GET" && pathname === "/api/claude/status") {
+        const force = urlObj.searchParams.get("refresh") === "1";
+        return sendJson(res, 200, getClaudeRuntimeAndAuth(force));
+      }
+      if (method === "POST" && pathname === "/api/claude/auth/login") {
+        const body = await readJsonBody(req);
+        const result = await runClaudeAuthLogin({
+          mode: body.mode || "claudeai",
+          email: body.email || "",
+          onProgress: (ev) => broadcast({ type: "claude_auth_progress", ...ev }),
+        });
+        broadcast({ type: "claude_status_updated", claude_native: getClaudeRuntimeAndAuth(true) });
+        return sendJson(res, 200, result);
+      }
+      if (method === "POST" && pathname === "/api/claude/auth/logout") {
+        const result = runClaudeAuthLogout();
+        broadcast({ type: "claude_status_updated", claude_native: result.runtime });
+        return sendJson(res, 200, result);
+      }
+      if (method === "POST" && pathname === "/api/claude/install") {
+        const body = await readJsonBody(req);
+        const result = await installOrSwitchClaudeVersion({
+          channel: body.channel === "latest" ? "latest" : "stable",
+          forceNativeWin: Boolean(body.force_native_win),
+          onProgress: (chunk) => broadcast({ type: "claude_install_log", text: chunk }),
+        });
+        broadcast({ type: "claude_status_updated", claude_native: result.runtime || getClaudeRuntimeAndAuth(true) });
+        return sendJson(res, 200, result);
       }
 
       // ==================== SETTINGS ====================
@@ -248,7 +339,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       }
       if (method === "PUT" && pathname === "/api/settings") {
         const body = await readJsonBody(req);
-        for (const key of ["system_prompt", "permission_mode", "update_channel", "appearance", "default_cwd"]) {
+        for (const key of ["system_prompt", "prompt_mode", "engine_mode", "permission_mode", "update_channel", "appearance", "default_cwd"]) {
           if (body[key] !== undefined) setSetting(key, body[key]);
         }
         const next = getAllSettings();
@@ -260,7 +351,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       if (method === "GET" && pathname === "/api/providers") {
         return sendJson(res, 200, {
           providers: listProviders(false).map(enrichProviderForClient),
-          claude_native: probeClaudeNativeStatus(),
+          claude_native: getClaudeRuntimeAndAuth(false),
         });
       }
       if (method === "POST" && pathname === "/api/providers") {
@@ -425,20 +516,22 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
 
       if (method === "GET" && pathname === "/api/stores/wallpapers") {
         const q = urlObj.searchParams.get("q") || "";
-        return sendJson(res, 200, await searchWallpaperStore(q));
+        const page = Number(urlObj.searchParams.get("page") || 1);
+        const category = urlObj.searchParams.get("category") || "all";
+        return sendJson(res, 200, await searchWallpaperStore(q, page, category));
       }
       if (method === "GET" && pathname === "/api/wallpaper-proxy") {
         const rawUrl = urlObj.searchParams.get("url") || "";
-        // Strict open-source allowlist: Wikimedia Commons only (prevents SSRF)
+        // Strict open wallpaper allowlist: Wallhaven + Wikimedia Commons (prevents SSRF)
         if (
-          !/^https:\/\/(upload\.wikimedia\.org\/wikipedia\/commons\/|commons\.wikimedia\.org\/wiki\/Special:FilePath\/)/i.test(
+          !/^https:\/\/(th\.wallhaven\.cc\/|w\.wallhaven\.cc\/|upload\.wikimedia\.org\/wikipedia\/commons\/|commons\.wikimedia\.org\/wiki\/Special:FilePath\/)/i.test(
             rawUrl,
           )
         ) {
-          return sendJson(res, 400, { error: "仅允许代理 Wikimedia Commons 开源图源" });
+          return sendJson(res, 400, { error: "仅允许代理 Wallhaven / Wikimedia 开源壁纸图源" });
         }
         const hash = crypto.createHash("sha1").update(rawUrl).digest("hex");
-        const cachePath = path.join(paths.backgroundsDir, `wm_cache_${hash}`);
+        const cachePath = path.join(paths.backgroundsDir, `wp_cache_${hash}`);
         const metaPath = `${cachePath}.mime`;
         if (fs.existsSync(cachePath) && fs.existsSync(metaPath)) {
           const mime = fs.readFileSync(metaPath, "utf8").trim() || "image/jpeg";
@@ -447,7 +540,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         }
         try {
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 12000);
+          const timer = setTimeout(() => controller.abort(), 14000);
           const upstream = await fetch(rawUrl, {
             headers: { "User-Agent": "OpenCodeStudio/1.0 (+https://github.com/gniygniynus/opencode-studio)" },
             signal: controller.signal,
@@ -466,21 +559,22 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         }
       }
       if (method === "POST" && pathname === "/api/backgrounds/upload") {
-        const body = await readJsonBody(req);
+        const body = await readJsonBody(req, 65 * 1024 * 1024);
         const mediaType = String(body.media_type || "image/png").toLowerCase();
-        const ext = ALLOWED_IMAGE_MIMES[mediaType];
-        if (!ext) return sendJson(res, 400, { ok: false, error: `不支持的图片类型: ${mediaType}` });
+        const ext = ALLOWED_BG_MIMES[mediaType];
+        if (!ext) return sendJson(res, 400, { ok: false, error: `不支持的壁纸格式: ${mediaType}（支持 PNG/JPG/WebP/GIF/MP4/WebM）` });
         const b64 = String(body.data || "").replace(/^data:[^,]+,/, "");
         const buf = Buffer.from(b64, "base64");
-        if (buf.length > 18 * 1024 * 1024) return sendJson(res, 400, { ok: false, error: "背景图不能超过 18MB" });
+        if (buf.length > 50 * 1024 * 1024) return sendJson(res, 400, { ok: false, error: "壁纸文件不能超过 50MB" });
+        const isVideo = mediaType.startsWith("video/");
         const fileName = `bg_${Date.now()}_${crypto.randomBytes(4).toString("hex")}${ext}`;
         fs.writeFileSync(path.join(paths.backgroundsDir, fileName), buf);
         const bg = addCustomBackground({
-          name: String(body.name || "自定义背景").slice(0, 60),
+          name: String(body.name || (isVideo ? "动态视频壁纸" : "自定义背景")).slice(0, 60),
           url: `/api/bg-files/${fileName}`,
-          source: "upload",
+          source: isVideo ? "video" : "upload",
         });
-        return sendJson(res, 200, { ok: true, background: bg, backgrounds: listCustomBackgrounds() });
+        return sendJson(res, 200, { ok: true, is_video: isVideo, background: bg, backgrounds: listCustomBackgrounds() });
       }
       if (method === "DELETE" && pathname.match(/^\/api\/backgrounds\/([^/]+)$/)) {
         const id = pathname.split("/")[3];
@@ -531,6 +625,10 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       if (method === "GET" && pathname === "/api/dirs") {
         const target = urlObj.searchParams.get("path") || "";
         return sendJson(res, 200, listDirectorySafe(target));
+      }
+      if (method === "POST" && pathname === "/api/dirs/pick-native") {
+        const picked = pickNativeDirectoryDialog();
+        return sendJson(res, 200, { ok: Boolean(picked), path: picked });
       }
       if (method === "GET" && pathname === "/api/files") {
         const cwd = urlObj.searchParams.get("cwd") || paths.defaultCwd;
@@ -638,6 +736,14 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           model: msg.model || "",
           thinkingLevel: msg.thinking_level || "",
         });
+      } else if (msg.type === "regenerate_reply") {
+        await orchestrator.regenerateReply({
+          sessionId: msg.session_id,
+          assistantMessageId: msg.assistant_message_id,
+          providerId: msg.provider_id || "",
+          model: msg.model || "",
+          thinkingLevel: msg.thinking_level || "",
+        });
       } else if (msg.type === "stop_turn") {
         orchestrator.stopTurn(msg.session_id);
       } else if (msg.type === "confirm_response") {
@@ -656,6 +762,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
 
   const addr = server.address();
   const actualPort = typeof addr === "object" && addr ? addr.port : port;
+  boundPort = actualPort;
   const url = `http://${host}:${actualPort}`;
   logEvent("INFO", "server", "started", `OpenCode Studio v${appVersion} 启动于 ${url} (data=${paths.dataRoot})`);
 

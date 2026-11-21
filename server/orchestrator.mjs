@@ -22,15 +22,16 @@ import {
   updateSessionMeta,
 } from "./db.mjs";
 import { runApiCompact, runOpenCodeApiTurn } from "./engine_api.mjs";
-import { runClaudeNativeTurn } from "./engine_claude_cli.mjs";
+import { detectClaudeRuntime, runNativeClaudeCodeTurn } from "./claude_runtime.mjs";
 import { classifyError, logEvent, newReqId } from "./logger.mjs";
 
 export class SessionOrchestrator {
-  constructor({ broadcast, mcpManager }) {
+  constructor({ broadcast, mcpManager, getPort }) {
     this.broadcast = broadcast;
     this.mcpManager = mcpManager;
-    this.activeRuns = new Map();       // sessionId -> { controller, reqId, liveBlocks, model, providerName }
-    this.pendingConfirms = new Map();  // confirmId -> { resolve, timer }
+    this.getPort = getPort || (() => 17620);
+    this.activeRuns = new Map();
+    this.pendingConfirms = new Map();
     this.lastError = null;
   }
 
@@ -236,6 +237,50 @@ export class SessionOrchestrator {
     return { ok: true, session_id: sessionId, message_id: newUserMsg.id };
   }
 
+  /**
+   * Regenerate an AI assistant reply for the same user prompt (creates a sibling assistant branch!).
+   */
+  async regenerateReply({
+    sessionId,
+    assistantMessageId,
+    providerId = "",
+    model = "",
+    thinkingLevel = "",
+  }) {
+    const meta = getSessionMeta(sessionId);
+    if (!meta) return { ok: false, error: "会话不存在" };
+
+    if (this.activeRuns.has(sessionId)) {
+      const err = classifyError({
+        message: "该会话正在运行，请先停止后再重新生成。",
+        sessionId,
+        codeHint: "ERR_SESSION_BUSY",
+      });
+      this.broadcast({ type: "turn_error", session_id: sessionId, error: err });
+      return { ok: false, error: err };
+    }
+
+    const origAsst = getMessageById(assistantMessageId);
+    if (!origAsst || origAsst.session_id !== sessionId || origAsst.role !== "assistant" || !origAsst.parent_id) {
+      return { ok: false, error: "未找到对应的历史回复或父级用户提问" };
+    }
+
+    const parentUserId = origAsst.parent_id;
+    updateSessionMeta(sessionId, { claude_cli_sid: "" });
+
+    this._launchExecution({
+      sessionId,
+      userMessageId: parentUserId,
+      providerId: providerId || meta.provider_id,
+      model: model || meta.model,
+      thinkingLevel: thinkingLevel || meta.thinking_level || "auto",
+      forceNoCliResume: true,
+      truncateAfterUserId: parentUserId,
+    });
+
+    return { ok: true, session_id: sessionId, user_message_id: parentUserId };
+  }
+
   async _handleCompact(sessionId, providerId, model) {
     const reqId = newReqId();
     const meta = getSessionMeta(sessionId);
@@ -303,7 +348,7 @@ export class SessionOrchestrator {
     }
   }
 
-  _launchExecution({ sessionId, userMessageId, providerId, model, thinkingLevel, forceNoCliResume }) {
+  _launchExecution({ sessionId, userMessageId, providerId, model, thinkingLevel, forceNoCliResume, truncateAfterUserId = null }) {
     const reqId = newReqId();
     const meta = getSessionMeta(sessionId);
     const provider = (providerId ? getProvider(providerId, true) : null) || getActiveProvider(true);
@@ -350,11 +395,22 @@ export class SessionOrchestrator {
       const t0 = Date.now();
       try {
         const timeline = getSessionTimeline(sessionId);
+        let historyItems = timeline.items;
+        if (truncateAfterUserId) {
+          const cutIdx = historyItems.findIndex((m) => m.id === truncateAfterUserId);
+          if (cutIdx >= 0) historyItems = historyItems.slice(0, cutIdx + 1);
+        }
+
         const settings = getAllSettings();
         const confirmDangerous =
           settings.permission_mode === "confirm_dangerous"
             ? (info) => this._requestConfirm(sessionId, info)
             : null;
+
+        const claudeRt = detectClaudeRuntime(false);
+        const useNativeClaudeCode =
+          provider.kind === "claude_native" ||
+          (settings.engine_mode !== "api_direct" && claudeRt.mode !== "missing" && !process.env.OPENCODE_FORCE_API_DIRECT);
 
         let lastPushTs = 0;
         const pushLive = (force = false) => {
@@ -366,7 +422,7 @@ export class SessionOrchestrator {
             session_id: sessionId,
             model: effectiveModel,
             provider_name: provider.name,
-            engine: provider.kind === "claude_native" ? "claude_native" : "api",
+            engine: useNativeClaudeCode ? "claude_code" : "api",
             blocks: runState.liveBlocks,
           });
         };
@@ -391,20 +447,21 @@ export class SessionOrchestrator {
         };
 
         let result;
-        if (provider.kind === "claude_native") {
-          // Check if the immediate previous assistant turn also came from claude_native
-          const prevAsst = [...timeline.items].reverse().find((m) => m.role === "assistant");
-          const canResumeCli = !forceNoCliResume && Boolean(meta.claude_cli_sid) && prevAsst?.engine === "claude_native";
+        if (useNativeClaudeCode) {
+          const prevAsst = [...historyItems].reverse().find((m) => m.role === "assistant");
+          const canResume = !forceNoCliResume && Boolean(meta.claude_cli_sid) && prevAsst?.engine === "claude_code";
 
-          result = await runClaudeNativeTurn({
+          result = await runNativeClaudeCodeTurn({
             sessionId,
             reqId,
+            provider,
             model: effectiveModel,
             thinkingLevel,
             cwd: meta.cwd,
-            historyItems: timeline.items,
-            existingCliSid: meta.claude_cli_sid,
-            canResumeCli,
+            historyItems,
+            resumeCliSid: canResume ? meta.claude_cli_sid : "",
+            forkSession: false,
+            localServerPort: this.getPort(),
             signal: controller.signal,
             onEvent,
           });
@@ -419,7 +476,7 @@ export class SessionOrchestrator {
             model: effectiveModel,
             thinkingLevel,
             cwd: meta.cwd,
-            historyItems: timeline.items,
+            historyItems,
             mcpManager: this.mcpManager,
             signal: controller.signal,
             onEvent,

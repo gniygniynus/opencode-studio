@@ -62,6 +62,21 @@
     cwdBrowsePath: "",
     activeStoreTab: "mcp",
     activeLogTab: "server",
+
+    // Live wallpaper & pagination
+    liveBgEngine: null,
+    wpCategory: "all",
+    wpPage: 1,
+    wpHasMore: false,
+    wpSearchTimer: null,
+    mcpSearchTimer: null,
+    skillSearchTimer: null,
+  };
+
+  const SVG_ICONS = {
+    edit: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>`,
+    copy: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`,
+    regen: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M21 12a9 9 0 1 1-2.64-6.36"></path><polyline points="21 3 21 9 15 9"></polyline></svg>`,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -187,38 +202,66 @@
     requestAnimationFrame(doScroll);
   }
 
-  // ==================== APPEARANCE & WALLPAPER ====================
+  // ==================== APPEARANCE & WALLPAPER (HD / SUBTLE / LIVE CANVAS / VIDEO) ====================
 
   function applyAppearance(ap = {}) {
     const theme = ap.theme === "dark" ? "dark" : "light";
+    const bgMode = ap.bgMode === "hd" ? "hd" : "subtle";
     document.documentElement.setAttribute("data-theme", theme);
     document.documentElement.style.setProperty("--font-size-base", `${ap.fontSize || 14.5}px`);
-    document.documentElement.style.setProperty("--bg-blur", `${ap.bgBlur ?? 8}px`);
+
+    const blurPx = bgMode === "hd" ? 0 : (ap.bgBlur ?? 10);
+    document.documentElement.style.setProperty("--bg-blur", `${blurPx}px`);
+    document.body.classList.toggle("bg-mode-hd", bgMode === "hd");
 
     const layer = $("wallpaper-layer");
-    const hasBg = ap.bgType && ap.bgType !== "none" && ap.bgUrl;
+    const videoEl = $("wallpaper-video");
+    if (!state.liveBgEngine && window.OpenCodeLiveBg) {
+      state.liveBgEngine = new window.OpenCodeLiveBg($("wallpaper-canvas"));
+    }
+
+    const bgType = ap.bgType || "none";
+    const hasBg = bgType !== "none" && (ap.bgUrl || ap.liveBg);
+
+    // Reset all three layers cleanly first
+    layer.style.backgroundImage = "none";
+    state.liveBgEngine?.setMode("");
+    if (videoEl) {
+      videoEl.pause();
+      videoEl.classList.add("hidden");
+    }
+
     if (hasBg) {
       document.body.classList.add("has-wallpaper");
-      document.documentElement.style.setProperty("--glass-alpha", String(ap.bgOpacity ?? 0.86));
-      if (ap.bgType === "gradient" || ap.bgUrl.startsWith("linear-gradient") || ap.bgUrl.startsWith("radial-gradient")) {
+      const alpha = bgMode === "hd" ? Math.min(ap.bgOpacity ?? 0.72, 0.82) : (ap.bgOpacity ?? 0.88);
+      document.documentElement.style.setProperty("--glass-alpha", String(alpha));
+
+      if (bgType === "live" && ap.liveBg) {
+        state.liveBgEngine?.setMode(ap.liveBg);
+      } else if (bgType === "video" && ap.bgUrl && videoEl) {
+        if (videoEl.getAttribute("src") !== ap.bgUrl) videoEl.setAttribute("src", ap.bgUrl);
+        videoEl.classList.remove("hidden");
+        videoEl.play().catch(() => {});
+      } else if (bgType === "gradient" || String(ap.bgUrl || "").startsWith("linear-gradient") || String(ap.bgUrl || "").startsWith("radial-gradient")) {
         layer.style.backgroundImage = ap.bgUrl;
-      } else {
+      } else if (ap.bgUrl) {
         layer.style.backgroundImage = `url("${ap.bgUrl.replace(/"/g, '\\"')}")`;
       }
     } else {
       document.body.classList.remove("has-wallpaper");
       document.documentElement.style.setProperty("--glass-alpha", "0.98");
-      layer.style.backgroundImage = "none";
     }
 
-    // Sync appearance controls in store modal
+    // Sync controls
     $("ap-theme").value = theme;
+    $("btn-bgmode-hd")?.classList.toggle("active", bgMode === "hd");
+    $("btn-bgmode-subtle")?.classList.toggle("active", bgMode !== "hd");
     $("ap-fontsize").value = String(ap.fontSize || 14.5);
     $("ap-fontsize-val").textContent = `${ap.fontSize || 14.5}px`;
-    $("ap-blur").value = String(ap.bgBlur ?? 8);
-    $("ap-blur-val").textContent = `${ap.bgBlur ?? 8}px`;
-    $("ap-opacity").value = String(ap.bgOpacity ?? 0.86);
-    $("ap-opacity-val").textContent = `${Math.round((ap.bgOpacity ?? 0.86) * 100)}%`;
+    $("ap-blur").value = String(ap.bgBlur ?? 10);
+    $("ap-blur-val").textContent = `${blurPx}px`;
+    $("ap-opacity").value = String(ap.bgOpacity ?? 0.88);
+    $("ap-opacity-val").textContent = `${Math.round((ap.bgOpacity ?? 0.88) * 100)}%`;
   }
 
   let apSaveTimer = null;
@@ -413,11 +456,13 @@
     const capBadge = $("model-cap-badge");
 
     if (prov && $("model-select").value) {
-      $("sidebar-prov-model").textContent = `${info?.display_name || $("model-select").value} · ${fmtTokens(info?.context_window || 128000)} ctx`;
+      const mLabel = info?.display_name || $("model-select").value;
+      const ccTag = state.claudeNative?.installed ? `原生 Claude Code ${state.claudeNative.version}` : "API 直连引擎";
+      $("sidebar-prov-model").textContent = `${mLabel} · ${fmtTokens(info?.context_window || 128000)} ctx`;
       $("composer-engine-note").textContent =
         prov.kind === "claude_native"
-          ? `引擎：Claude 原生登录 (${info?.display_name || $("model-select").value})`
-          : `引擎：OpenCode 开源内核 · ${prov.name} / ${info?.display_name || $("model-select").value}`;
+          ? `${ccTag} · 官方 Auth (${mLabel})`
+          : `${ccTag} · ${prov.name} / ${mLabel}`;
     }
 
     if (!info || !info.thinking_supported || !info.thinking_levels?.length) {
@@ -648,15 +693,15 @@
 
     wrap.innerHTML =
       `<div class="msg-user-header">` +
-        branchBar +
         `<span class="mono">#${item.turn_index || ""}</span>` +
         `<span>${fmtClock(item.created_at)}</span>` +
-        `<span class="msg-user-actions">` +
-          `<button class="msg-mini-btn btn-edit-resend" title="修改此条历史提问并重新发送（原分支保留可切换）">编辑重发</button>` +
-          `<button class="msg-mini-btn btn-copy-u" title="复制">复制</button>` +
-        `</span>` +
       `</div>` +
-      `<div class="msg-user-card">${imgsHtml}<div class="msg-user-text">${escHtml(item.content_text || "")}</div></div>`;
+      `<div class="msg-user-card">${imgsHtml}<div class="msg-user-text">${escHtml(item.content_text || "")}</div></div>` +
+      `<div class="msg-footer-bar">` +
+        branchBar +
+        `<button class="sym-btn btn-edit-resend" title="编辑并重新发送（保留原分支）">${SVG_ICONS.edit}</button>` +
+        `<button class="sym-btn btn-copy-u" title="复制提问">${SVG_ICONS.copy}</button>` +
+      `</div>`;
 
     wrap.querySelector(".btn-copy-u")?.addEventListener("click", () => copyText(item.content_text || ""));
     wrap.querySelector(".btn-edit-resend")?.addEventListener("click", () => {
@@ -684,7 +729,7 @@
 
     const head = document.createElement("div");
     head.className = "msg-assistant-head";
-    const engLabel = item.engine === "claude_native" ? "Claude 原生" : "OpenCode";
+    const engLabel = item.engine === "claude_code" || item.engine === "claude_native" ? "Claude Code" : "OpenCode API";
     head.innerHTML =
       `<span class="asst-badge">${engLabel}</span>` +
       (item.provider_name ? `<span class="asst-tag">${escHtml(item.provider_name)}</span>` : "") +
@@ -697,7 +742,7 @@
       const ph = document.createElement("div");
       ph.className = "md-body streaming-cursor";
       ph.style.color = "var(--text-muted)";
-      ph.textContent = "等待模型响应";
+      ph.textContent = "等待 Claude Code 响应";
       wrap.appendChild(ph);
     }
 
@@ -721,25 +766,60 @@
     if (item.error) {
       wrap.appendChild(createErrorCardEl(item.error));
     }
+
+    // Bottom symbol action bar for completed AI replies (Regenerate + Copy + Branch switcher)
+    if (!isLive && item.id) {
+      const footer = document.createElement("div");
+      footer.className = "msg-footer-bar";
+      const brHtml =
+        item.branch_total > 1
+          ? `<span class="branch-bar">` +
+              `<button class="branch-btn btn-asst-prev" ${item.branch_index <= 1 ? "disabled" : ""} title="上一版回复">◀</button>` +
+              `<span>${item.branch_index}/${item.branch_total}</span>` +
+              `<button class="branch-btn btn-asst-next" ${item.branch_index >= item.branch_total ? "disabled" : ""} title="下一版回复">▶</button>` +
+            `</span>`
+          : "";
+      footer.innerHTML =
+        brHtml +
+        `<button class="sym-btn btn-regen" title="重新回复（保留当前版本为可切换分支）">${SVG_ICONS.regen}</button>` +
+        `<button class="sym-btn btn-copy-a" title="复制完整回复">${SVG_ICONS.copy}</button>`;
+
+      footer.querySelector(".btn-copy-a")?.addEventListener("click", () => {
+        const fullTxt = item.content_text || blocks.filter((b) => b.type === "text").map((b) => b.text).join("\n\n");
+        copyText(fullTxt, "已复制回复");
+      });
+      footer.querySelector(".btn-regen")?.addEventListener("click", () => sendRegenerateReply(item.id));
+      footer.querySelector(".btn-asst-prev")?.addEventListener("click", () => {
+        const targetId = item.sibling_ids?.[item.branch_index - 2];
+        if (targetId) switchToBranch(targetId);
+      });
+      footer.querySelector(".btn-asst-next")?.addEventListener("click", () => {
+        const targetId = item.sibling_ids?.[item.branch_index];
+        if (targetId) switchToBranch(targetId);
+      });
+      wrap.appendChild(footer);
+    }
+
     return wrap;
   }
 
   function renderConversation() {
     const box = $("messages-container");
+    const welcomeEl = $("welcome-view");
     const tl = state.activeTimeline;
     const live = state.activeSessionId ? state.liveStream.get(state.activeSessionId) : null;
+    const hasItems = Boolean(tl?.items?.length);
 
-    if (!tl && !live) {
+    if (!hasItems && !live) {
       box.innerHTML = "";
-      box.appendChild($("welcome-view"));
-      $("welcome-view").classList.remove("hidden");
+      welcomeEl?.classList.remove("hidden");
       $("ctx-pill").classList.add("hidden");
       renderOutline([]);
       renderActivity(null);
       return;
     }
 
-    $("welcome-view").classList.add("hidden");
+    welcomeEl?.classList.add("hidden");
     const frag = document.createDocumentFragment();
     for (const item of tl?.items || []) {
       if (item.role === "user") frag.appendChild(createUserMsgEl(item));
@@ -1054,6 +1134,35 @@
       renderComposerSelectors();
       return;
     }
+    if (t === "claude_status_updated" && msg.claude_native) {
+      state.claudeNative = msg.claude_native;
+      renderClaudeStatusViews();
+      return;
+    }
+    if (t === "claude_auth_progress") {
+      const box = $("claude-auth-output");
+      if (box) {
+        box.classList.remove("hidden");
+        if (msg.stage === "oauth_url" && msg.url) {
+          box.innerHTML =
+            `<b>请在浏览器中完成官方授权：</b><br />` +
+            `<a class="link-btn" href="${escHtml(msg.url)}" target="_blank" rel="noopener noreferrer">${escHtml(msg.url)} ↗</a>` +
+            `<div class="muted-text" style="margin-top:4px;">授权完成后请点击上方「刷新状态」确认已登录。</div>`;
+        } else if (msg.text) {
+          box.textContent = (box.textContent ? box.textContent + "\n" : "") + msg.text;
+        }
+      }
+      return;
+    }
+    if (t === "claude_install_log") {
+      const pre = $("claude-install-log");
+      if (pre && msg.text) {
+        pre.classList.remove("hidden");
+        pre.textContent += msg.text;
+        pre.scrollTop = pre.scrollHeight;
+      }
+      return;
+    }
     if (t === "running_sessions") {
       state.runningIds = new Set(msg.ids || []);
       renderSessionList();
@@ -1179,6 +1288,25 @@
       thinking_level: thinking,
     }));
     toast("已创建新分支并重新发送");
+  }
+
+  function sendRegenerateReply(assistantMessageId) {
+    if (!state.wsConnected || !state.activeSessionId || !assistantMessageId) return;
+    if (state.runningIds.has(state.activeSessionId)) {
+      return toast("当前回复正在生成中，请稍候或先停止");
+    }
+    const prov = getSelectedProvider();
+    const model = $("model-select").value;
+    const thinking = $("thinking-select").classList.contains("hidden") ? "off" : $("thinking-select").value;
+    state.ws.send(JSON.stringify({
+      type: "regenerate_reply",
+      session_id: state.activeSessionId,
+      assistant_message_id: assistantMessageId,
+      provider_id: prov?.id || "",
+      model,
+      thinking_level: thinking,
+    }));
+    toast("正在重新生成回复（旧版本将作为分支保留）…");
   }
 
   async function uploadChatImage(file) {
@@ -1307,16 +1435,68 @@
     closeAutocomplete();
   }
 
-  // ==================== MODAL: PROVIDERS ====================
+  // ==================== MODAL: PROVIDERS & NATIVE CLAUDE AUTH ====================
 
-  async function openProvidersModal() {
+  function renderClaudeStatusViews() {
+    const cn = state.claudeNative;
+    const modeLabel = cn?.mode === "wsl" ? "WSL2 原生内核" : cn?.mode === "native" ? "本机原生内核" : "未安装";
+    const loggedIn = Boolean(cn?.auth?.loggedIn);
+    const authDetailText = !cn || !cn.installed
+      ? "未检测到原生 Claude Code（可前往「设置」一键安装稳定版或最新版）"
+      : loggedIn
+        ? `已登录（${cn.auth.authMethod || "OAuth"}${cn.auth.email ? ` · ${cn.auth.email}` : ""}${cn.auth.subscriptionType ? ` · ${cn.auth.subscriptionType}` : ""}）· 内核 ${cn.version} (${modeLabel})`
+        : `未登录官方账号 · 内核 ${cn.version} (${modeLabel})，点击下方按钮执行官方 OAuth 登录`;
+
+    const statusBox = $("claude-native-status-box");
+    if (statusBox) {
+      statusBox.innerHTML = cn
+        ? `<b>原生 Claude Code 内核：</b>${cn.installed ? `${escHtml(cn.version)} (${modeLabel})` : "未安装"}<br />` +
+          `<b>官方 Auth：</b>${loggedIn ? `<span style="color:var(--ok);">● 已登录</span>` : `<span style="color:var(--muted);">○ 未登录</span>`}<br />` +
+          `${escHtml(cn.note || "")}`
+        : "";
+    }
+    const authDetail = $("claude-auth-detail");
+    if (authDetail) authDetail.textContent = authDetailText;
+    const logoutBtn = $("btn-claude-auth-logout");
+    if (logoutBtn) logoutBtn.disabled = !cn?.installed || !loggedIn;
+
+    const verLine = $("claude-core-ver-line");
+    if (verLine) {
+      verLine.textContent = cn?.installed
+        ? `当前已接入原生 Claude Code ${cn.version}（${modeLabel} · ${cn.binary || ""}）`
+        : "未检测到本机原生 Claude Code，点击右侧按钮自动安装稳定版或最新版";
+    }
+    const engineNote = $("composer-engine-note");
+    if (engineNote) {
+      engineNote.textContent = cn?.installed
+        ? `驱动内核：原生 Claude Code ${cn.version}`
+        : "驱动内核：内置开放 API 引擎（可在设置中安装原生 Claude Code）";
+    }
+  }
+
+  async function refreshClaudeStatus(force = true) {
+    try {
+      const data = await apiJson(`/api/claude/status?refresh=${force ? "1" : "0"}`);
+      state.claudeNative = data;
+      renderClaudeStatusViews();
+      return data;
+    } catch (err) {
+      toast("刷新 Claude Code 状态失败: " + err.message);
+      return null;
+    }
+  }
+
+  async function openProvidersModal(focusProviderId = null) {
     $("modal-providers").classList.remove("hidden");
     const data = await apiJson("/api/providers");
     state.providers = data.providers || [];
     state.claudeNative = data.claude_native;
+    if (focusProviderId) state.selectedProviderId = focusProviderId;
     renderProviderModalList();
+    renderClaudeStatusViews();
     const target = state.selectedProviderId || state.activeProvider?.id || state.providers[0]?.id;
-    if (target) fillProviderForm(state.providers.find((p) => p.id === target));
+    const found = state.providers.find((p) => p.id === target) || state.providers[0];
+    if (found) fillProviderForm(found);
   }
 
   function renderProviderModalList() {
@@ -1327,15 +1507,12 @@
       el.className = "stack-item" + (p.id === state.selectedProviderId ? " active" : "");
       el.innerHTML =
         `<div class="stack-item-head"><span>${escHtml(p.name)}</span>` +
-        `<span class="mini-tag">${p.is_active ? "当前" : p.kind === "claude_native" ? "原生" : p.kind}</span></div>` +
-        `<div class="stack-item-sub">${escHtml(p.default_model || (p.base_url || "本地 CLI OAuth"))}</div>`;
+        `<span class="mini-tag">${p.is_active ? "当前" : p.kind === "claude_native" ? "原生Auth" : p.kind}</span></div>` +
+        `<div class="stack-item-sub">${escHtml(p.default_model || (p.base_url || "官方 OAuth 登录"))}</div>`;
       el.addEventListener("click", () => fillProviderForm(p));
       listEl.appendChild(el);
     }
-    const cn = state.claudeNative;
-    $("claude-native-status-box").innerHTML = cn
-      ? `<b>Claude 原生登录检测：</b>${cn.installed ? `已安装 (${escHtml(cn.version)})` : "未安装"}<br />${escHtml(cn.note)}`
-      : "";
+    renderClaudeStatusViews();
   }
 
   function fillProviderForm(p) {
@@ -1345,7 +1522,7 @@
     $("pf-kind").value = p?.kind || "openai";
     $("pf-baseurl").value = p?.base_url || "";
     $("pf-apikey").value = "";
-    $("pf-apikey").placeholder = p?.has_api_key ? `已加密保存 (${p.api_key_masked})，留空保持不变` : "输入 API Key (sk-...)";
+    $("pf-apikey").placeholder = p?.has_api_key ? `已加密保存 (${p.api_key_masked})，留空保持不变，输入新 Key 即覆盖更新` : "输入 API Key (sk-...)";
     $("pf-default-model").value = p?.default_model || "";
     $("pf-models").value = (p?.models || []).join("\n");
     $("btn-delete-provider").disabled = !p || p.id === "claude-native-oauth";
@@ -1357,6 +1534,43 @@
     const isNative = $("pf-kind").value === "claude_native";
     $("pf-baseurl-wrap").classList.toggle("hidden", isNative);
     $("pf-apikey-wrap").classList.toggle("hidden", isNative);
+    $("claude-auth-panel")?.classList.toggle("hidden", !isNative);
+    if (isNative) renderClaudeStatusViews();
+  }
+
+  async function startClaudeAuthLogin(mode = "claudeai") {
+    const out = $("claude-auth-output");
+    if (out) {
+      out.classList.remove("hidden");
+      out.textContent = `正在启动原生 claude auth login (${mode === "console" ? "Anthropic Console" : "Claude 订阅账号"})…`;
+    }
+    try {
+      const res = await apiJson("/api/claude/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ mode }),
+      });
+      if (!res.ok) {
+        if (out) out.textContent = res.error || "启动登录失败";
+        return toast(res.error || "登录失败", 4000);
+      }
+      if (res.oauth_url) {
+        if (out) {
+          out.innerHTML =
+            `<b>请在官方授权页完成登录：</b><br />` +
+            `<a class="link-btn" href="${escHtml(res.oauth_url)}" target="_blank" rel="noopener noreferrer">${escHtml(res.oauth_url)} ↗</a>` +
+            `<div class="muted-text" style="margin-top:4px;">${escHtml(res.message || "完成后点击上方「刷新状态」")}</div>`;
+        }
+        window.open(res.oauth_url, "_blank", "noopener,noreferrer");
+        toast("已弹出 Claude 官方授权页，完成后请点击刷新状态", 4000);
+      } else {
+        if (out) out.textContent = res.message || res.output || "登录流程已结束";
+        await refreshClaudeStatus(true);
+        toast("原生 Claude 登录状态已更新");
+      }
+    } catch (err) {
+      if (out) out.textContent = "登录请求失败: " + err.message;
+      toast("登录失败: " + err.message, 4000);
+    }
   }
 
   function renderModelCapsPreview(infos) {
@@ -1468,38 +1682,51 @@
     }
   }
 
+  let mcpReqSeq = 0;
   async function searchMcp(q) {
+    const seq = ++mcpReqSeq;
     const el = $("store-mcp-list");
-    el.innerHTML = `<div class="muted-text">${q ? "正在联网搜索 npm & GitHub 开源 MCP…" : "加载精选开源 MCP…"}</div>`;
-    const data = await apiJson(`/api/stores/mcp?q=${encodeURIComponent(q)}`);
-    el.innerHTML = "";
-    for (const m of data.items || []) {
-      const card = document.createElement("div");
-      card.className = "store-card";
-      card.innerHTML =
-        `<div class="store-card-head"><span class="store-card-title">${escHtml(m.title || m.name)}</span>` +
-        `<span class="mini-tag">${escHtml((m.tags || []).slice(0, 2).join(" · ") || "open-source")}</span></div>` +
-        `<div class="store-card-desc">${escHtml(m.description)}</div>` +
-        `<div class="store-card-foot">` +
-          (m.repo_url ? `<a class="link-btn" href="${escHtml(m.repo_url)}" target="_blank">源码仓库 ↗</a>` : `<span></span>`) +
-          `<button class="btn-primary sm btn-install">一键安装启用</button>` +
-        `</div>`;
-      card.querySelector(".btn-install").addEventListener("click", async () => {
-        const args = (m.args || []).map((a) => a.replace("${WORKSPACE_DIR}", state.activeCwd || state.settings.default_cwd || "."));
-        const env = {};
-        for (const k of m.env_hints || []) {
-          const v = window.prompt(`MCP「${m.name}」需要环境变量 ${k}（可先留空稍后配置）：`, "");
-          if (v) env[k] = v;
-        }
-        toast(`正在安装并连接 MCP：${m.name}…`);
-        await apiJson("/api/mcp", {
-          method: "POST",
-          body: JSON.stringify({ name: m.name, source_id: m.id, description: m.description, command: m.command, args, env, enabled: true }),
+    el.innerHTML = `<div class="muted-text">${q ? `正在联网搜索「${escHtml(q)}」开源 MCP (npm & GitHub)…` : "加载精选开源 MCP…"}</div>`;
+    try {
+      const data = await apiJson(`/api/stores/mcp?q=${encodeURIComponent(q)}`);
+      if (seq !== mcpReqSeq) return;
+      el.innerHTML = "";
+      const items = data.items || [];
+      if (!items.length) {
+        el.innerHTML = `<div class="muted-text">未找到匹配的开源 MCP${data.online_error ? `（${escHtml(data.online_error)}）` : "，请换个英文关键词试试"}。</div>`;
+        return;
+      }
+      for (const m of items) {
+        const card = document.createElement("div");
+        card.className = "store-card";
+        card.innerHTML =
+          `<div class="store-card-head"><span class="store-card-title">${escHtml(m.title || m.name)}</span>` +
+          `<span class="mini-tag">${escHtml((m.tags || []).slice(0, 2).join(" · ") || "open-source")}</span></div>` +
+          `<div class="store-card-desc">${escHtml(m.description)}</div>` +
+          `<div class="store-card-foot">` +
+            (m.repo_url ? `<a class="link-btn" href="${escHtml(m.repo_url)}" target="_blank">源码仓库 ↗</a>` : `<span></span>`) +
+            `<button class="btn-primary sm btn-install">一键安装启用</button>` +
+          `</div>`;
+        card.querySelector(".btn-install").addEventListener("click", async () => {
+          const args = (m.args || []).map((a) => a.replace("${WORKSPACE_DIR}", state.activeCwd || state.settings.default_cwd || "."));
+          const env = {};
+          for (const k of m.env_hints || []) {
+            const v = window.prompt(`MCP「${m.name}」需要环境变量 ${k}（可先留空稍后配置）：`, "");
+            if (v) env[k] = v;
+          }
+          toast(`正在安装并连接 MCP：${m.name}…`);
+          await apiJson("/api/mcp", {
+            method: "POST",
+            body: JSON.stringify({ name: m.name, source_id: m.id, description: m.description, command: m.command, args, env, enabled: true }),
+          });
+          loadInstalledMcps();
+          toast(`MCP「${m.name}」已安装！`);
         });
-        loadInstalledMcps();
-        toast(`MCP「${m.name}」已安装！`);
-      });
-      el.appendChild(card);
+        el.appendChild(card);
+      }
+    } catch (err) {
+      if (seq !== mcpReqSeq) return;
+      el.innerHTML = `<div class="muted-text" style="color:var(--err);">MCP 联网搜索失败：${escHtml(err.message)}</div>`;
     }
   }
 
@@ -1535,29 +1762,42 @@
     }
   }
 
+  let skillReqSeq = 0;
   async function searchSkills(q) {
+    const seq = ++skillReqSeq;
     const el = $("store-skills-list");
-    el.innerHTML = `<div class="muted-text">${q ? "正在联网搜索 GitHub 开源 Skills…" : "加载精选 Skills…"}</div>`;
-    const data = await apiJson(`/api/stores/skills?q=${encodeURIComponent(q)}`);
-    el.innerHTML = "";
-    for (const s of data.items || []) {
-      const card = document.createElement("div");
-      card.className = "store-card";
-      card.innerHTML =
-        `<div class="store-card-head"><span class="store-card-title">${escHtml(s.name)}</span>` +
-        `<span class="mini-tag">/${escHtml(s.slug)}</span></div>` +
-        `<div class="store-card-desc">${escHtml(s.description)}</div>` +
-        `<div class="store-card-foot">` +
-          (s.source_url ? `<a class="link-btn" href="${escHtml(s.source_url)}" target="_blank">开源仓库 ↗</a>` : `<span></span>`) +
-          `<button class="btn-primary sm btn-dl">下载并启用</button>` +
-        `</div>`;
-      card.querySelector(".btn-dl").addEventListener("click", async () => {
-        toast(`正在下载 Skill：${s.name}…`);
-        await apiJson("/api/skills", { method: "POST", body: JSON.stringify(s) });
-        loadInstalledSkills();
-        toast(`已安装 Skill /${s.slug}！`);
-      });
-      el.appendChild(card);
+    el.innerHTML = `<div class="muted-text">${q ? `正在联网搜索「${escHtml(q)}」GitHub 开源 Skills…` : "加载精选 Skills…"}</div>`;
+    try {
+      const data = await apiJson(`/api/stores/skills?q=${encodeURIComponent(q)}`);
+      if (seq !== skillReqSeq) return;
+      el.innerHTML = "";
+      const items = data.items || [];
+      if (!items.length) {
+        el.innerHTML = `<div class="muted-text">未找到匹配的开源 Skills${data.online_error ? `（${escHtml(data.online_error)}）` : "，请换个关键词试试"}。</div>`;
+        return;
+      }
+      for (const s of items) {
+        const card = document.createElement("div");
+        card.className = "store-card";
+        card.innerHTML =
+          `<div class="store-card-head"><span class="store-card-title">${escHtml(s.name)}</span>` +
+          `<span class="mini-tag">/${escHtml(s.slug)}</span></div>` +
+          `<div class="store-card-desc">${escHtml(s.description)}</div>` +
+          `<div class="store-card-foot">` +
+            (s.source_url ? `<a class="link-btn" href="${escHtml(s.source_url)}" target="_blank">开源仓库 ↗</a>` : `<span></span>`) +
+            `<button class="btn-primary sm btn-dl">下载并启用</button>` +
+          `</div>`;
+        card.querySelector(".btn-dl").addEventListener("click", async () => {
+          toast(`正在下载 Skill：${s.name}…`);
+          await apiJson("/api/skills", { method: "POST", body: JSON.stringify(s) });
+          loadInstalledSkills();
+          toast(`已安装 Skill /${s.slug}！`);
+        });
+        el.appendChild(card);
+      }
+    } catch (err) {
+      if (seq !== skillReqSeq) return;
+      el.innerHTML = `<div class="muted-text" style="color:var(--err);">Skills 联网搜索失败：${escHtml(err.message)}</div>`;
     }
   }
 
@@ -1572,17 +1812,20 @@
     grid.innerHTML = "";
     const curUrl = state.settings.appearance?.bgUrl || "";
     for (const bg of state.customBackgrounds) {
+      const isVideo = bg.source === "video" || /\.(mp4|webm)$/i.test(bg.url || "");
       const card = document.createElement("div");
       card.className = "wp-card" + (curUrl === bg.url ? " active" : "");
       card.innerHTML =
-        `<div class="wp-thumb" style="background-image:url('${escHtml(bg.url)}')"></div>` +
+        (isVideo
+          ? `<div class="wp-thumb"><video class="wp-thumb-vid" src="${escHtml(bg.url)}" muted loop playsinline autoplay></video><span class="wp-live-badge">🎬 动态视频</span></div>`
+          : `<div class="wp-thumb" style="background-image:url('${escHtml(bg.url)}')"></div>`) +
         `<div class="wp-meta"><div class="wp-name">${escHtml(bg.name)}</div>` +
-        `<div class="wp-sub" style="display:flex;justify-content:space-between;"><span>本地上传</span><button class="link-btn btn-rm-bg" style="padding:0;color:var(--err);">删除</button></div></div>`;
+        `<div class="wp-sub" style="display:flex;justify-content:space-between;"><span>${isVideo ? "动态视频壁纸" : "本地图片"}</span><button class="link-btn btn-rm-bg" style="padding:0;color:var(--err);">删除</button></div></div>`;
       card.addEventListener("click", (e) => {
         if (e.target.closest(".btn-rm-bg")) return;
-        updateAppearance({ bgType: "upload", bgUrl: bg.url, bgName: bg.name });
+        updateAppearance({ bgType: isVideo ? "video" : "upload", bgUrl: bg.url, liveBg: "", bgName: bg.name });
         renderCustomBgs();
-        toast(`已应用背景：${bg.name}`);
+        toast(`已应用${isVideo ? "动态视频" : ""}背景：${bg.name}`);
       });
       card.querySelector(".btn-rm-bg").addEventListener("click", async (e) => {
         e.stopPropagation();
@@ -1594,38 +1837,151 @@
     }
   }
 
-  async function searchWallpapers(q) {
+  let wpReqSeq = 0;
+  function buildWallpaperCard(w, grid) {
+    const ap = state.settings.appearance || {};
+    const isActive =
+      (w.type === "none" && (!ap.bgType || ap.bgType === "none")) ||
+      (w.type === "live" && ap.bgType === "live" && ap.liveBg === w.liveBg) ||
+      (w.url && ap.bgUrl === w.url);
+    const card = document.createElement("div");
+    card.className = "wp-card" + (isActive ? " active" : "");
+    const thumbStyle = w.preview_css ? `background:${w.preview_css}` : `background-image:url('${escHtml(w.thumb || w.url)}')`;
+    const badgeHtml = w.type === "live"
+      ? `<span class="wp-live-badge">✨ 动态 60fps</span>`
+      : w.resolution
+        ? `<span class="wp-res-badge">${escHtml(w.resolution)}</span>`
+        : "";
+    card.innerHTML =
+      `<div class="wp-thumb" style="${thumbStyle}">${badgeHtml}</div>` +
+      `<div class="wp-meta"><div class="wp-name">${escHtml(w.name)}</div><div class="wp-sub">${escHtml(w.license || "Open")} · ${escHtml(w.author || "")}</div></div>`;
+    card.addEventListener("click", () => {
+      if (w.type === "live") {
+        updateAppearance({ bgType: "live", liveBg: w.liveBg, bgUrl: "", bgName: w.name });
+      } else {
+        updateAppearance({ bgType: w.type, bgUrl: w.url || "", liveBg: "", bgName: w.name });
+      }
+      grid.querySelectorAll(".wp-card").forEach((c) => c.classList.remove("active"));
+      card.classList.add("active");
+      toast(`已应用背景：${w.name}`);
+    });
+    return card;
+  }
+
+  async function searchWallpapers(q, page = 1, append = false) {
+    const seq = ++wpReqSeq;
     const grid = $("store-wp-grid");
-    grid.innerHTML = `<div class="muted-text">${q ? "正在联网搜索 Wikimedia 免费开源高清壁纸…" : "加载精选开源壁纸…"}</div>`;
-    const data = await apiJson(`/api/stores/wallpapers?q=${encodeURIComponent(q)}`);
-    grid.innerHTML = "";
-    const curUrl = state.settings.appearance?.bgUrl || "";
-    for (const w of data.items || []) {
-      const card = document.createElement("div");
-      card.className = "wp-card" + ((w.type === "none" && !curUrl) || (w.url && curUrl === w.url) ? " active" : "");
-      const thumbStyle = w.preview_css ? `background:${w.preview_css}` : `background-image:url('${escHtml(w.thumb || w.url)}')`;
-      card.innerHTML =
-        `<div class="wp-thumb" style="${thumbStyle}"></div>` +
-        `<div class="wp-meta"><div class="wp-name">${escHtml(w.name)}</div><div class="wp-sub">${escHtml(w.license || "Open")} · ${escHtml(w.author || "")}</div></div>`;
-      card.addEventListener("click", () => {
-        updateAppearance({ bgType: w.type, bgUrl: w.url, bgName: w.name });
-        grid.querySelectorAll(".wp-card").forEach((c) => c.classList.remove("active"));
-        card.classList.add("active");
-        toast(`已应用背景：${w.name}`);
-      });
-      grid.appendChild(card);
+    const metaEl = $("wp-search-meta");
+    const moreBtn = $("btn-wp-load-more");
+    const cat = state.wpCategory || "all";
+
+    if (!append) {
+      state.wpPage = 1;
+      grid.innerHTML = `<div class="muted-text">${q ? `正在实时联网搜索「${escHtml(q)}」海量 4K 壁纸…` : cat === "live" ? "加载 60fps 动态壁纸…" : "正在加载精选与热门 4K 壁纸…"}</div>`;
+      if (metaEl) metaEl.textContent = "检索中…";
+      moreBtn?.classList.add("hidden");
+    } else if (moreBtn) {
+      moreBtn.disabled = true;
+      moreBtn.textContent = "加载下一页 4K 壁纸中…";
+    }
+
+    try {
+      const data = await apiJson(
+        `/api/stores/wallpapers?q=${encodeURIComponent(q)}&page=${encodeURIComponent(page)}&category=${encodeURIComponent(cat)}`,
+      );
+      if (seq !== wpReqSeq) return;
+      if (!append) grid.innerHTML = "";
+
+      const items = data.items || [];
+      if (!items.length && !append) {
+        grid.innerHTML = `<div class="muted-text">未搜索到匹配壁纸${data.online_error ? `（${escHtml(data.online_error)}）` : "，试试「星空」「动漫」「风景」或英文关键词"}。</div>`;
+      } else {
+        for (const w of items) {
+          grid.appendChild(buildWallpaperCard(w, grid));
+        }
+      }
+
+      state.wpPage = data.page || page;
+      state.wpHasMore = Boolean(data.has_more);
+      if (moreBtn) {
+        moreBtn.disabled = false;
+        moreBtn.textContent = `加载更多 4K 壁纸（第 ${state.wpPage + 1} 页）`;
+        moreBtn.classList.toggle("hidden", !state.wpHasMore);
+      }
+      if (metaEl) {
+        if (cat === "live") {
+          metaEl.textContent = `共 ${items.length} 套 60fps 实时动态壁纸`;
+        } else if (data.total_online > 0) {
+          metaEl.textContent = `在线共 ${Number(data.total_online).toLocaleString()} 张 4K 壁纸（第 ${state.wpPage}/${data.last_page || 1} 页）`;
+        } else if (data.online_error) {
+          metaEl.textContent = data.online_error;
+        } else {
+          metaEl.textContent = `当前展示 ${grid.children.length} 张`;
+        }
+      }
+    } catch (err) {
+      if (seq !== wpReqSeq) return;
+      if (!append) grid.innerHTML = `<div class="muted-text" style="color:var(--err);">壁纸联网搜索失败：${escHtml(err.message)}</div>`;
+      if (metaEl) metaEl.textContent = "联网失败";
+      if (moreBtn) {
+        moreBtn.disabled = false;
+        moreBtn.textContent = "重试加载更多";
+      }
     }
   }
 
-  // ==================== MODAL: SETTINGS & DUAL-CHANNEL UPDATER ====================
+  // ==================== MODAL: SETTINGS & CLAUDE CORE VERSION / SHELL UPDATER ====================
 
   function openSettingsModal() {
     $("modal-settings").classList.remove("hidden");
     $("set-system-prompt").value = state.settings.system_prompt || "";
+    if ($("set-prompt-mode")) $("set-prompt-mode").value = state.settings.prompt_mode || "replace";
     $("set-permission-mode").value = state.settings.permission_mode || "auto";
     $("set-default-cwd").value = state.settings.default_cwd || "";
     $("set-update-channel").value = state.settings.update_channel || "stable";
-    $("updater-current-line").textContent = `当前版本：v${state.version} · 仓库：github.com/gniygniynus/opencode-studio`;
+    $("updater-current-line").textContent = `当前外壳版本：v${state.version} · 仓库：github.com/gniygniynus/opencode-studio`;
+    renderClaudeStatusViews();
+  }
+
+  async function installOrSwitchClaudeCore(channel) {
+    const label = channel === "latest" ? "最新版 (latest)" : "稳定版 (stable)";
+    const pre = $("claude-install-log");
+    const btnS = $("btn-claude-install-stable");
+    const btnL = $("btn-claude-install-latest");
+    if (btnS) btnS.disabled = true;
+    if (btnL) btnL.disabled = true;
+    if (pre) {
+      pre.classList.remove("hidden");
+      pre.textContent = `>>> 正在安装 / 切换原生 Claude Code ${label}，请稍候…\n`;
+    }
+    toast(`正在安装/切换原生 Claude Code ${label}…`, 3500);
+    try {
+      const res = await apiJson("/api/claude/install", {
+        method: "POST",
+        body: JSON.stringify({ channel }),
+      });
+      if (res.runtime) {
+        state.claudeNative = res.runtime;
+        renderClaudeStatusViews();
+      } else {
+        await refreshClaudeStatus(true);
+      }
+      if (pre && res.output && !pre.textContent.includes(res.output.slice(0, 40))) {
+        pre.textContent += "\n" + res.output;
+        pre.scrollTop = pre.scrollHeight;
+      }
+      if (res.ok) {
+        toast(`原生 Claude Code ${label} 已就绪！(${state.claudeNative?.version || ""})`, 4000);
+      } else {
+        toast(`切换失败：${res.error || "请查看下方日志"}`, 5000);
+      }
+    } catch (err) {
+      if (pre) pre.textContent += `\n[ERROR] ${err.message}`;
+      toast("安装/切换失败: " + err.message, 4500);
+    } finally {
+      if (btnS) btnS.disabled = false;
+      if (btnL) btnL.disabled = false;
+    }
   }
 
   async function runUpdateCheck() {
@@ -1814,13 +2170,14 @@
     $("cwd-filter-select").addEventListener("change", refreshSessions);
 
     // Quick welcome cards
-    $("wc-providers")?.addEventListener("click", openProvidersModal);
+    $("wc-providers")?.addEventListener("click", () => openProvidersModal());
     $("wc-stores")?.addEventListener("click", () => openStoresModal("mcp"));
     $("wc-wallpaper")?.addEventListener("click", () => openStoresModal("wallpapers"));
     $("wc-settings")?.addEventListener("click", openSettingsModal);
 
     // Navigation buttons
-    $("btn-open-providers").addEventListener("click", openProvidersModal);
+    $("btn-open-providers").addEventListener("click", () => openProvidersModal());
+    $("btn-edit-cur-provider")?.addEventListener("click", () => openProvidersModal($("provider-select").value || state.activeProvider?.id));
     $("btn-open-stores").addEventListener("click", () => openStoresModal("mcp"));
     $("btn-quick-bg").addEventListener("click", () => openStoresModal("wallpapers"));
     $("btn-open-memory").addEventListener("click", openMemoryModal);
@@ -1927,18 +2284,35 @@
     });
     $("cwd-pill").addEventListener("click", () => {
       $("modal-cwd").classList.remove("hidden");
-      if (window.opencodeDesktop?.pickDirectory) $("btn-cwd-native").classList.remove("hidden");
       browseCwd(state.activeCwd || state.settings.default_cwd || "");
     });
     $("btn-cwd-native").addEventListener("click", async () => {
-      const picked = await window.opencodeDesktop?.pickDirectory();
-      if (picked) applyCwd(picked);
+      const btn = $("btn-cwd-native");
+      btn.disabled = true;
+      const oldTxt = btn.textContent;
+      btn.textContent = "等待选择…";
+      try {
+        let picked = "";
+        if (window.opencodeDesktop?.pickDirectory) {
+          picked = await window.opencodeDesktop.pickDirectory();
+        } else {
+          const res = await apiJson("/api/dirs/pick-native", { method: "POST" });
+          picked = res.path || "";
+        }
+        if (picked) {
+          await applyCwd(picked);
+        }
+      } catch (err) {
+        toast("打开系统目录选择框失败: " + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = oldTxt;
+      }
     });
     $("btn-cwd-browse").addEventListener("click", () => browseCwd($("cwd-manual-input").value.trim()));
     $("btn-cwd-apply").addEventListener("click", () => applyCwd($("cwd-manual-input").value.trim()));
     $("btn-cwd-up").addEventListener("click", () => {
       const cur = state.cwdBrowsePath || "";
-      const sep = cur.includes("\\") ? "\\" : "/";
       const parts = cur.split(/[\\/]+/).filter(Boolean);
       if (parts.length <= 1) return;
       parts.pop();
@@ -1946,14 +2320,14 @@
       browseCwd(parent);
     });
 
-    // Providers modal actions
+    // Providers modal actions & Native Claude Auth
     $("btn-add-provider").addEventListener("click", () => fillProviderForm(null));
     $("pf-kind").addEventListener("change", toggleProviderKindFields);
     $("btn-save-provider").addEventListener("click", saveProviderForm);
     $("btn-activate-provider").addEventListener("click", async () => {
       if (!state.selectedProviderId) return toast("请先保存供应商");
       await apiJson(`/api/providers/${encodeURIComponent(state.selectedProviderId)}/activate`, { method: "POST", body: JSON.stringify({}) });
-      openProvidersModal();
+      openProvidersModal(state.selectedProviderId);
       toast("已切换为当前活跃供应商");
     });
     $("btn-fetch-models").addEventListener("click", fetchModelsForSelected);
@@ -1964,11 +2338,30 @@
       openProvidersModal();
       toast("已删除");
     });
+    $("btn-refresh-claude-auth")?.addEventListener("click", async () => {
+      toast("正在检测原生 Claude Code 登录状态…");
+      const st = await refreshClaudeStatus(true);
+      if (st?.auth?.loggedIn) toast("已确认原生 Claude 账号在线！");
+      else toast("当前尚未登录官方账号");
+    });
+    $("btn-claude-auth-login")?.addEventListener("click", () => startClaudeAuthLogin("claudeai"));
+    $("btn-claude-auth-console")?.addEventListener("click", () => startClaudeAuthLogin("console"));
+    $("btn-claude-auth-logout")?.addEventListener("click", async () => {
+      if (!window.confirm("确定退出本机原生 Claude Code 官方账号登录？")) return;
+      const res = await apiJson("/api/claude/auth/logout", { method: "POST" });
+      if (res.runtime) state.claudeNative = res.runtime;
+      renderClaudeStatusViews();
+      toast(res.ok ? "已退出原生 Claude 账号" : (res.error || "退出失败"));
+    });
 
-    // Stores tabs & searches
+    // Stores tabs & live debounced searches
     document.querySelectorAll("[data-storetab]").forEach((b) => b.addEventListener("click", () => openStoresModal(b.dataset.storetab)));
     $("btn-search-mcp").addEventListener("click", () => searchMcp($("mcp-search-input").value.trim()));
     $("mcp-search-input").addEventListener("keydown", (e) => { if (e.key === "Enter") searchMcp($("mcp-search-input").value.trim()); });
+    $("mcp-search-input").addEventListener("input", () => {
+      clearTimeout(state.mcpSearchTimer);
+      state.mcpSearchTimer = setTimeout(() => searchMcp($("mcp-search-input").value.trim()), 450);
+    });
     $("btn-custom-mcp").addEventListener("click", async () => {
       const name = window.prompt("MCP 名称（如 my-mcp）：");
       if (!name) return;
@@ -1982,6 +2375,10 @@
 
     $("btn-search-skills").addEventListener("click", () => searchSkills($("skills-search-input").value.trim()));
     $("skills-search-input").addEventListener("keydown", (e) => { if (e.key === "Enter") searchSkills($("skills-search-input").value.trim()); });
+    $("skills-search-input").addEventListener("input", () => {
+      clearTimeout(state.skillSearchTimer);
+      state.skillSearchTimer = setTimeout(() => searchSkills($("skills-search-input").value.trim()), 450);
+    });
     $("btn-custom-skill").addEventListener("click", async () => {
       const name = window.prompt("新建 Skill 名称（如 算法刷题教练）：");
       if (!name) return;
@@ -1994,29 +2391,84 @@
       toast(`已创建 Skill /${slug}`);
     });
 
+    // Appearance & Wallpaper controls (HD / Subtle / Live / Video / Massive Search)
     $("ap-theme").addEventListener("change", () => updateAppearance({ theme: $("ap-theme").value }));
+    $("btn-bgmode-hd")?.addEventListener("click", () => {
+      updateAppearance({ bgMode: "hd", bgBlur: 0, bgOpacity: 0.72 });
+      toast("已切换为「高清原版壁纸」模式（0 模糊，清透呈现）");
+    });
+    $("btn-bgmode-subtle")?.addEventListener("click", () => {
+      updateAppearance({ bgMode: "subtle", bgBlur: 10, bgOpacity: 0.88 });
+      toast("已切换为「隐性护眼背景」模式（柔焦防干扰）");
+    });
     $("ap-fontsize").addEventListener("input", () => updateAppearance({ fontSize: Number($("ap-fontsize").value) }));
-    $("ap-blur").addEventListener("input", () => updateAppearance({ bgBlur: Number($("ap-blur").value) }));
+    $("ap-blur").addEventListener("input", () => updateAppearance({ bgMode: "subtle", bgBlur: Number($("ap-blur").value) }));
     $("ap-opacity").addEventListener("input", () => updateAppearance({ bgOpacity: Number($("ap-opacity").value) }));
     $("btn-upload-bg").addEventListener("click", () => $("bg-upload-input").click());
     $("bg-upload-input").addEventListener("change", async () => {
       const file = $("bg-upload-input").files?.[0];
       if (!file) return;
-      const dataUrl = await fileToDataUrl(file);
-      const res = await apiJson("/api/backgrounds/upload", {
-        method: "POST",
-        body: JSON.stringify({ name: file.name, media_type: file.type, data: dataUrl }),
-      });
-      state.customBackgrounds = res.backgrounds || [];
-      updateAppearance({ bgType: "upload", bgUrl: res.background.url, bgName: res.background.name });
-      renderCustomBgs();
-      toast("已上传并应用自定义背景");
-      $("bg-upload-input").value = "";
+      toast(`正在上传${file.type.startsWith("video/") ? "动态视频壁纸" : "壁纸"}…`);
+      try {
+        const dataUrl = await fileToDataUrl(file);
+        const res = await apiJson("/api/backgrounds/upload", {
+          method: "POST",
+          body: JSON.stringify({ name: file.name, media_type: file.type, data: dataUrl }),
+        });
+        state.customBackgrounds = res.backgrounds || [];
+        const isVideo = Boolean(res.is_video || file.type.startsWith("video/"));
+        updateAppearance({ bgType: isVideo ? "video" : "upload", bgUrl: res.background.url, liveBg: "", bgName: res.background.name });
+        renderCustomBgs();
+        toast(`已上传并应用${isVideo ? "动态视频" : "自定义"}背景`);
+      } catch (err) {
+        toast("上传失败: " + err.message, 4000);
+      } finally {
+        $("bg-upload-input").value = "";
+      }
     });
-    $("btn-search-wp").addEventListener("click", () => searchWallpapers($("wp-search-input").value.trim()));
-    $("wp-search-input").addEventListener("keydown", (e) => { if (e.key === "Enter") searchWallpapers($("wp-search-input").value.trim()); });
+    $("btn-search-wp").addEventListener("click", () => {
+      state.wpCategory = "all";
+      document.querySelectorAll(".wp-cat").forEach((c) => c.classList.toggle("active", c.dataset.cat === "all"));
+      searchWallpapers($("wp-search-input").value.trim(), 1, false);
+    });
+    $("wp-search-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        state.wpCategory = "all";
+        searchWallpapers($("wp-search-input").value.trim(), 1, false);
+      }
+    });
+    $("wp-search-input").addEventListener("input", () => {
+      clearTimeout(state.wpSearchTimer);
+      state.wpSearchTimer = setTimeout(() => {
+        const q = $("wp-search-input").value.trim();
+        if (q && state.wpCategory === "live") {
+          state.wpCategory = "all";
+          document.querySelectorAll(".wp-cat").forEach((c) => c.classList.toggle("active", c.dataset.cat === "all"));
+        }
+        searchWallpapers(q, 1, false);
+      }, 450);
+    });
+    document.querySelectorAll(".wp-cat").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".wp-cat").forEach((c) => c.classList.remove("active"));
+        btn.classList.add("active");
+        if (btn.dataset.q) {
+          state.wpCategory = "all";
+          $("wp-search-input").value = btn.dataset.q;
+          searchWallpapers(btn.dataset.q, 1, false);
+        } else {
+          state.wpCategory = btn.dataset.cat || "all";
+          $("wp-search-input").value = "";
+          searchWallpapers("", 1, false);
+        }
+      });
+    });
+    $("btn-wp-load-more")?.addEventListener("click", () => {
+      if (!state.wpHasMore) return;
+      searchWallpapers($("wp-search-input").value.trim(), state.wpPage + 1, true);
+    });
 
-    // Settings & updater
+    // Settings, Claude Code Core Channel (stable/latest) & Shell Updater
     document.querySelectorAll(".prompt-preset").forEach((b) =>
       b.addEventListener("click", () => { $("set-system-prompt").value = PROMPT_PRESETS[b.dataset.preset] || ""; }),
     );
@@ -2025,6 +2477,7 @@
         method: "PUT",
         body: JSON.stringify({
           system_prompt: $("set-system-prompt").value,
+          prompt_mode: $("set-prompt-mode")?.value || "replace",
           permission_mode: $("set-permission-mode").value,
           default_cwd: $("set-default-cwd").value.trim(),
           update_channel: $("set-update-channel").value,
@@ -2033,6 +2486,8 @@
       state.settings = res.settings;
       toast("设置已保存并立即生效");
     });
+    $("btn-claude-install-stable")?.addEventListener("click", () => installOrSwitchClaudeCore("stable"));
+    $("btn-claude-install-latest")?.addEventListener("click", () => installOrSwitchClaudeCore("latest"));
     $("btn-check-update").addEventListener("click", runUpdateCheck);
 
     // Memory modal
@@ -2142,6 +2597,7 @@
 
     applyAppearance(state.settings.appearance || {});
     renderComposerSelectors();
+    renderClaudeStatusViews();
     connectWs();
     await refreshSessions();
     restoreDraft();
