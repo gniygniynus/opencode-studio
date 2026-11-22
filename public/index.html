@@ -56,9 +56,20 @@
           <input id="global-search-input" type="text" placeholder="搜索全部对话标题或正文…" autocomplete="off" />
           <button id="global-search-clear" class="search-clear hidden" title="清除">×</button>
         </div>
-        <select id="cwd-filter-select" class="cwd-filter-select" title="按工作目录筛选">
+        <select id="cwd-filter-select" class="hidden" aria-hidden="true">
           <option value="">全部工作目录</option>
         </select>
+        <div class="glass-dropdown cwd-filter-dd" id="gd-cwd-filter">
+          <button type="button" class="cwd-filter-trigger" id="gd-cwd-filter-btn" title="按工作目录筛选会话">
+            <svg class="cwd-filter-ico" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+            </svg>
+            <span class="gd-label" id="gd-cwd-filter-label">全部工作目录</span>
+            <span class="cwd-filter-count hidden" id="gd-cwd-filter-count"></span>
+            <svg class="gd-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </button>
+          <div class="gd-menu gd-menu-down hidden" id="gd-cwd-filter-menu"></div>
+        </div>
       </div>
 
       <div id="session-list" class="session-list">
@@ -395,14 +406,13 @@
         <button class="modal-tab" data-storetab="skills">Skills 商店与管理</button>
         <button class="modal-tab" data-storetab="wallpapers">背景壁纸与外观</button>
         <div class="tab-spacer"></div>
-        <div class="search-engine-bar" title="切换国内直连全网搜索引擎（免代理）或代理全网搜索引擎">
-          <span class="muted-text">搜索引擎：</span>
-          <select id="store-search-engine" class="compact-select">
-            <option value="auto">🌐 自动探测 (免代理直连 / 代理自动切)</option>
-            <option value="cn">🇨🇳 国内直连引擎 (必应全网 + npmmirror + CDN)</option>
-            <option value="proxy">🚀 代理全网引擎 (Wallhaven + Wikimedia + GitHub)</option>
+        <div class="search-engine-bar" title="选择全网商店搜索线路：自动探测 / 国内直连（免代理）/ 代理全网">
+          <select id="store-search-engine" class="engine-mini-select">
+            <option value="auto">线路：自动</option>
+            <option value="cn">线路：国内直连</option>
+            <option value="proxy">线路：代理全网</option>
           </select>
-          <span id="store-engine-badge" class="mini-tag">检测中</span>
+          <span id="store-engine-badge" class="engine-status-pill">检测中</span>
         </div>
       </div>
       <div class="modal-body">

@@ -693,9 +693,10 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       const method = (req.method || "GET").toUpperCase();
 
       // ==================== BUILT-IN TRANSPARENT API PROXY FOR NATIVE CLAUDE CODE ====================
-      const proxyMatch = pathname.match(/^\/proxy\/provider\/([^/]+)(\/v1\/.*)$/);
+      const proxyMatch = pathname.match(/^\/proxy\/provider\/([^/]+)(?:\/([^/]+))?(\/v1\/.*)$/);
       if (method === "POST" && proxyMatch) {
-        return await handleProviderProxyRequest(req, res, proxyMatch[1], proxyMatch[2]);
+        const thinkingHint = proxyMatch[2] ? decodeURIComponent(proxyMatch[2]) : "";
+        return await handleProviderProxyRequest(req, res, proxyMatch[1], proxyMatch[3], thinkingHint);
       }
 
       // ==================== HEALTH & BOOTSTRAP ====================
@@ -840,6 +841,13 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
             base_url: prov.base_url,
             models: result.models,
             default_model: prov.default_model || result.models[0],
+            extra: {
+              ...(prov.extra || {}),
+              remote_meta: {
+                ...(prov.extra?.remote_meta || {}),
+                ...(result.remote_meta || {}),
+              },
+            },
           });
         }
         const all = listProviders(false).map(enrichProviderForClient);

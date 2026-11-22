@@ -49,10 +49,10 @@ export async function resolveSearchEngine(requested = "") {
   const saved = getAllSettings().search_engine || {};
   const pref = ["cn", "proxy", "auto"].includes(requested) ? requested : (saved.mode || "auto");
   if (pref === "cn") {
-    return { active: "cn", requested: pref, label: "🇨🇳 国内直连全网引擎" };
+    return { active: "cn", requested: pref, label: "国内直连" };
   }
   if (pref === "proxy") {
-    return { active: "proxy", requested: pref, label: "🚀 代理全网引擎" };
+    return { active: "proxy", requested: pref, label: "代理引擎" };
   }
 
   // Auto-probe global network (cached 60s so switching pages is instant)
@@ -65,8 +65,8 @@ export async function resolveSearchEngine(requested = "") {
     }
   }
   return _globalProbeCache.reachable
-    ? { active: "proxy", requested: "auto", label: "🚀 自动 · 代理全网引擎" }
-    : { active: "cn", requested: "auto", label: "🇨🇳 自动 · 国内直连全网引擎" };
+    ? { active: "proxy", requested: "auto", label: "代理引擎" }
+    : { active: "cn", requested: "auto", label: "国内直连" };
 }
 
 // ==================== 1. CURATED OPEN-SOURCE MCP CATALOG ====================
@@ -577,6 +577,40 @@ async function searchBingGithubRepos(querySuffix, q, limit = 10) {
 }
 
 // ==================== ONLINE SEARCH: MCP STORE (OFFICIAL REGISTRY + NPM + GITHUB) ====================
+function buildSmartMcpDescription(rawName, rawDesc, transportTag) {
+  const clean = String(rawDesc || "").replace(/\s+/g, " ").trim();
+  const low = `${rawName || ""} ${clean}`.toLowerCase();
+  const hints = [
+    [/docs|documentation|wiki|readme|guide|academy|learn/, "技术文档检索与知识查询服务"],
+    [/browser|playwright|puppeteer|chrome|selenium|snag|devtools/, "浏览器自动化、网页调试与截图诊断工具"],
+    [/sql|postgres|mysql|sqlite|mongo|redis|database|supabase/, "数据库结构查看与 SQL 查询分析工具"],
+    [/git|github|gitlab|bitbucket|linear|jira/, "代码仓库、Issue 与项目管理协作工具"],
+    [/search|fetch|crawl|scrape|tavily|exa|brave|web/, "联网实时搜索与网页内容抓取工具"],
+    [/memory|graph|knowledge|rag|vector/, "持久化记忆与知识图谱检索工具"],
+    [/file|fs|filesystem|drive|dropbox|s3/, "本地或云端文件读写与目录管理工具"],
+    [/figma|canva|image|video|audio|3d|inference|ai/, "多模态 AI 生成与媒体处理工具"],
+    [/slack|discord|notion|feishu|lark|mail|gmail|calendar/, "办公协作、消息通知与日程文档工具"],
+    [/docker|k8s|kube|aws|cloudflare|vercel|netlify|deploy/, "云原生基础设施与自动化部署工具"],
+  ];
+  const matched = hints.find(([re]) => re.test(low))?.[1] || "公开 MCP 扩展工具服务";
+  const protoNote =
+    transportTag === "HTTP远程" || transportTag === "SSE远程"
+      ? "远程直连"
+      : transportTag === "uvx"
+        ? "Python 本地"
+        : "npx 本地";
+
+  if (!clean || clean.length < 6) {
+    return `${matched}（${protoNote}，一键接入即可供 Claude Code 调用）。`;
+  }
+  // If already contains Chinese, return concise text directly
+  if (/[\u4e00-\u9fa5]/.test(clean)) {
+    return clean.length > 120 ? clean.slice(0, 118) + "…" : clean;
+  }
+  const shortEn = clean.length > 110 ? clean.slice(0, 108) + "…" : clean;
+  return `${matched}：${shortEn}`;
+}
+
 function parseRegistryMcpEntry(entry) {
   const s = entry?.server || entry;
   if (!s?.name) return null;
@@ -591,12 +625,14 @@ function parseRegistryMcpEntry(entry) {
   let command = "npx";
   let args = [];
   let transportTag = "npx";
+  let badge = "npm";
   const envHints = [];
 
   if (npmPkg) {
     command = "npx";
     args = ["-y", npmPkg.identifier];
     transportTag = "npx";
+    badge = "npx";
     for (const ev of npmPkg.environmentVariables || []) {
       if (ev?.name) envHints.push(ev.name);
     }
@@ -604,6 +640,7 @@ function parseRegistryMcpEntry(entry) {
     command = "uvx";
     args = [pyPkg.identifier];
     transportTag = "uvx";
+    badge = "uvx";
     for (const ev of pyPkg.environmentVariables || []) {
       if (ev?.name) envHints.push(ev.name);
     }
@@ -611,6 +648,7 @@ function parseRegistryMcpEntry(entry) {
     command = remote.type === "sse" ? "sse" : "http";
     args = [remote.url];
     transportTag = remote.type === "sse" ? "SSE远程" : "HTTP远程";
+    badge = "远程";
   } else {
     return null;
   }
@@ -618,13 +656,14 @@ function parseRegistryMcpEntry(entry) {
   return {
     id: `reg-${s.name.replace(/[^a-z0-9]/gi, "-")}`,
     name: shortName,
-    title: `${s.name}${s.version ? ` (v${s.version})` : ""}`,
-    description: s.description || `官方 MCP Registry 登记服务 (${transportTag})`,
+    title: `${s.name}${s.version ? ` · v${s.version}` : ""}`,
+    description: buildSmartMcpDescription(s.name, s.description, transportTag),
     command,
     args,
     env_hints: envHints.slice(0, 6),
     repo_url: s.repository?.url || s.websiteUrl || "",
-    tags: ["官方Registry", transportTag],
+    badge,
+    tags: [badge],
     source: "registry",
   };
 }
@@ -656,13 +695,14 @@ export async function searchMcpStore(query = "", enginePref = "") {
             onlineItems.push({
               id: `npmm-${pkg.name.replace(/[^a-z0-9]/gi, "-")}`,
               name: pkg.name.split("/").pop().replace(/^mcp-server-|^server-/, "") || pkg.name,
-              title: `${pkg.name} (v${pkg.version || "latest"})`,
-              description: pkg.description || `公开 npm MCP 包，使用 npx -y ${pkg.name} 一键安装启用。`,
+              title: `${pkg.name} · v${pkg.version || "latest"}`,
+              description: buildSmartMcpDescription(pkg.name, pkg.description, "npx"),
               command: "npx",
               args: ["-y", pkg.name],
               env_hints: [],
               repo_url: pkg.links?.repository || pkg.links?.npm || "",
-              tags: ["国内镜像", "npx"],
+              badge: "npm",
+              tags: ["npm"],
               source: "npmmirror",
             });
           }
@@ -724,13 +764,14 @@ export async function searchMcpStore(query = "", enginePref = "") {
               onlineItems.push({
                 id: `npm-${pkg.name.replace(/[^a-z0-9]/gi, "-")}`,
                 name: pkg.name.split("/").pop().replace(/^mcp-server-|^server-/, "") || pkg.name,
-                title: `${pkg.name} (v${pkg.version || "latest"})`,
-                description: pkg.description || `公开 npm MCP 包，使用 npx -y ${pkg.name} 一键启动。`,
+                title: `${pkg.name} · v${pkg.version || "latest"}`,
+                description: buildSmartMcpDescription(pkg.name, pkg.description, "npx"),
                 command: "npx",
                 args: ["-y", pkg.name],
                 env_hints: [],
                 repo_url: pkg.links?.repository || pkg.links?.npm || "",
-                tags: ["npm", "npx"],
+                badge: "npm",
+                tags: ["npm"],
                 source: "npm",
               });
             }
@@ -749,13 +790,14 @@ export async function searchMcpStore(query = "", enginePref = "") {
               onlineItems.push({
                 id: `gh-${repo.id}`,
                 name: repo.name.replace(/[^a-z0-9_-]/gi, "-").toLowerCase(),
-                title: `${repo.full_name} (★ ${repo.stargazers_count || 0})`,
-                description: repo.description || `GitHub 公开 MCP 仓库 (${repo.language || "开源"})`,
+                title: repo.full_name,
+                description: buildSmartMcpDescription(repo.full_name, repo.description, isPy ? "uvx" : "npx"),
                 command: isPy ? "uvx" : "npx",
                 args: isPy ? [repo.name] : ["-y", repo.name],
                 env_hints: [],
                 repo_url: repo.html_url,
-                tags: ["GitHub", isPy ? "uvx" : "npx", `★${repo.stargazers_count || 0}`],
+                badge: `★${repo.stargazers_count || 0}`,
+                tags: ["GitHub"],
                 source: "github",
               });
             }
@@ -885,6 +927,52 @@ function parseSkillFrontmatter(mdText) {
   return out;
 }
 
+const OFFICIAL_SKILL_DESC_ZH = {
+  "algorithmic-art": "使用 p5.js 创作生成式算法艺术、参数化视觉图案与交互式代码画作。",
+  "brand-guidelines": "按统一品牌视觉规范自动整理配色、字体层级与排版设计标准。",
+  "canvas-design": "面向海报、封面、信息图与视觉排版的高水准设计创作技能。",
+  "claude-api": "基于最新 Anthropic / Claude API、Tool Use 与流式 SDK 编写规范应用。",
+  "doc-coauthoring": "结构化协作撰写技术方案、PRD 需求文档与长篇报告。",
+  "docx": "专业创建、修改、审阅与格式化 Word (.docx) 文档（支持批注与修订）。",
+  "frontend-design": "打造高完成度、拒绝模板味的现代前端界面、微动效与响应式布局。",
+  "internal-comms": "高效起草团队周报、项目同步、发布公告与内部沟通文档。",
+  "mcp-builder": "按最佳实践设计、开发并调试自定义 Model Context Protocol (MCP) 服务端。",
+  "pdf": "提取、合并、拆分、填表与精排版生成 PDF 文档的专业处理技能。",
+  "pptx": "自动规划页面结构、排版视觉并生成高质量 PowerPoint (.pptx) 演示文稿。",
+  "skill-creator": "快速设计、编写、验证与打磨自定义 Agent SKILL.md 技能包。",
+  "slack-gif-creator": "编写代码生成循环流畅、适合聊天分享的精致动态 GIF 动图。",
+  "theme-factory": "一键为网页、幻灯片或文档套用风格统一的精选视觉主题方案。",
+  "web-artifacts-builder": "构建包含 React/Tailwind/状态交互的独立单页交互式 Web 应用。",
+  "webapp-testing": "使用 Playwright 自动启动、操作、截图并端到端测试本地 Web 应用。",
+  "xlsx": "专业读取、建模、公式计算、图表可视化并生成 Excel (.xlsx) 电子表格。",
+};
+
+function buildSmartSkillDescription(slug, name, rawDesc) {
+  const key = String(slug || "").toLowerCase();
+  if (OFFICIAL_SKILL_DESC_ZH[key]) return OFFICIAL_SKILL_DESC_ZH[key];
+  const clean = String(rawDesc || "").replace(/\s+/g, " ").trim();
+  const low = `${slug || ""} ${name || ""} ${clean}`.toLowerCase();
+  const hints = [
+    [/review|lint|audit|security/, "代码质量审查、安全隐患排查与重构建议技能"],
+    [/test|qa|playwright|jest|vitest|pytest/, "自动化测试生成与端到端回归验证技能"],
+    [/doc|readme|markdown|write|blog|note/, "技术文档、说明手册与结构化写作技能"],
+    [/ui|ux|css|frontend|design|react|vue|tailwind/, "前端界面设计、样式美化与组件开发技能"],
+    [/git|pr|commit|release|ci|deploy/, "Git 工作流、发布流程与工程自动化技能"],
+    [/debug|fix|bug|trace|log|perf/, "系统化问题定位、日志分析与性能优化技能"],
+    [/pdf|docx|pptx|xlsx|csv|excel|word/, "办公文档解析、排版与数据表格处理技能"],
+    [/data|sql|chart|plot|python|ml|ai/, "数据分析、脚本处理与可视化建模技能"],
+  ];
+  const matched = hints.find(([re]) => re.test(low))?.[1] || "公开 Agent 扩展技能（安装后支持 /命令 调用）";
+  if (!clean || clean.length < 6) {
+    return `${matched}，点击下载 SKILL.md 并立即启用。`;
+  }
+  if (/[\u4e00-\u9fa5]/.test(clean)) {
+    return clean.length > 110 ? clean.slice(0, 108) + "…" : clean;
+  }
+  const shortEn = clean.length > 100 ? clean.slice(0, 98) + "…" : clean;
+  return `${matched}：${shortEn}`;
+}
+
 async function fetchAnthropicOfficialSkills(engineActive = "cn") {
   if (_cachedOfficialSkills && Date.now() - _cachedOfficialAt < 30 * 60 * 1000) {
     return _cachedOfficialSkills;
@@ -895,18 +983,22 @@ async function fetchAnthropicOfficialSkills(engineActive = "cn") {
     const skillsDir = (jsd.files || []).find((f) => f.type === "directory" && f.name === "skills");
     const dirs = (skillsDir?.files || []).filter((f) => f.type === "directory" && f.name);
     if (dirs.length) {
-      const list = dirs.slice(0, 20).map((d) => ({
-        id: `anth-skill-${d.name}`,
-        slug: d.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"),
-        name: `${d.name} (Anthropic 官方开源)`,
-        description: `来自官方开源仓库 anthropics/skills 的 /${d.name} 技能，免代理经 CDN 直连下载 SKILL.md 并启用。`,
-        source_url: `https://github.com/anthropics/skills/tree/main/skills/${d.name}`,
-        raw_skill_url: `https://cdn.jsdelivr.net/gh/anthropics/skills@main/skills/${d.name}/SKILL.md`,
-        github_full_name: "anthropics/skills",
-        default_branch: "main",
-        tags: ["官方开源", "CDN直连"],
-        content: "",
-      }));
+      const list = dirs.slice(0, 20).map((d) => {
+        const slug = d.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+        return {
+          id: `anth-skill-${d.name}`,
+          slug,
+          name: d.name,
+          description: buildSmartSkillDescription(slug, d.name, ""),
+          source_url: `https://github.com/anthropics/skills/tree/main/skills/${d.name}`,
+          raw_skill_url: `https://cdn.jsdelivr.net/gh/anthropics/skills@main/skills/${d.name}/SKILL.md`,
+          github_full_name: "anthropics/skills",
+          default_branch: "main",
+          badge: "官方",
+          tags: ["官方"],
+          content: "",
+        };
+      });
       _cachedOfficialSkills = list;
       _cachedOfficialAt = Date.now();
       return list;
@@ -920,18 +1012,22 @@ async function fetchAnthropicOfficialSkills(engineActive = "cn") {
         const list = dirs
           .filter((d) => d.type === "dir" && d.name)
           .slice(0, 20)
-          .map((d) => ({
-            id: `anth-skill-${d.name}`,
-            slug: d.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"),
-            name: `${d.name} (Anthropic 官方开源)`,
-            description: `来自官方开源仓库 anthropics/skills 的 /${d.name} 技能，点击即可下载完整 SKILL.md 并启用。`,
-            source_url: d.html_url || `https://github.com/anthropics/skills/tree/main/skills/${d.name}`,
-            raw_skill_url: `https://raw.githubusercontent.com/anthropics/skills/main/skills/${d.name}/SKILL.md`,
-            github_full_name: "anthropics/skills",
-            default_branch: "main",
-            tags: ["官方开源", "SKILL.md"],
-            content: "",
-          }));
+          .map((d) => {
+            const slug = d.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+            return {
+              id: `anth-skill-${d.name}`,
+              slug,
+              name: d.name,
+              description: buildSmartSkillDescription(slug, d.name, ""),
+              source_url: d.html_url || `https://github.com/anthropics/skills/tree/main/skills/${d.name}`,
+              raw_skill_url: `https://raw.githubusercontent.com/anthropics/skills/main/skills/${d.name}/SKILL.md`,
+              github_full_name: "anthropics/skills",
+              default_branch: "main",
+              badge: "官方",
+              tags: ["官方"],
+              content: "",
+            };
+          });
         _cachedOfficialSkills = list;
         _cachedOfficialAt = Date.now();
         return list;
@@ -980,12 +1076,13 @@ export async function searchSkillsStore(query = "", enginePref = "") {
         onlineItems.push({
           id: `npmm-sk-${pkg.name.replace(/[^a-z0-9]/gi, "-")}`,
           slug,
-          name: `${pkg.name} (v${pkg.version || "latest"})`,
-          description: pkg.description || `公开 Skill 包 (${pkg.name})，点击下载说明与指令并启用。`,
+          name: `${pkg.name} · v${pkg.version || "latest"}`,
+          description: buildSmartSkillDescription(slug, pkg.name, pkg.description),
           source_url: repoUrl,
           github_full_name: ghMatch ? ghMatch[1].replace(/\.git$/i, "") : "",
           default_branch: "main",
-          tags: ["国内镜像", "公开Skill"],
+          badge: "npm",
+          tags: ["npm"],
           content: "",
         });
       }
@@ -1000,12 +1097,13 @@ export async function searchSkillsStore(query = "", enginePref = "") {
         onlineItems.push({
           id: `gh-skill-${repo.id}`,
           slug: repo.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"),
-          name: `${repo.name} (★ ${repo.stargazers_count || 0})`,
-          description: repo.description || `来自 ${repo.full_name} 的 GitHub 公开 Skill，安装时自动拉取 SKILL.md 与说明。`,
+          name: repo.name,
+          description: buildSmartSkillDescription(repo.name, repo.full_name, repo.description),
           source_url: repo.html_url,
           github_full_name: repo.full_name,
           default_branch: repo.default_branch || "main",
-          tags: ["GitHub", `★${repo.stargazers_count || 0}`],
+          badge: `★${repo.stargazers_count || 0}`,
+          tags: ["GitHub"],
           content: "",
         });
       }

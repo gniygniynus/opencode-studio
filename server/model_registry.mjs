@@ -14,10 +14,12 @@ import { logEvent } from "./logger.mjs";
 
 export const THINKING_BUDGETS = {
   off: 0,
+  on: 12000,
   low: 4000,
   medium: 10000,
   high: 24000,
-  max: 48000,
+  xhigh: 36000,
+  max: 56000,
 };
 
 function parseExplicitContext(modelId) {
@@ -53,31 +55,38 @@ export function detectModelCapabilities(modelId, providerKind = "openai", remote
     source: "heuristic",
   };
 
-  // --- Claude family ---
+  // --- Claude family (Anthropic 3.7 / 4 / 4.5 / 4.6 / 4.7) ---
   if (/claude|sonnet|opus|haiku/.test(low)) {
     cap.family = "claude";
     cap.vision = true;
-    const isLegacyHaiku = /haiku-3(?:\.5)?|claude-3-haiku|claude-3-5-haiku/.test(low);
-    const is35Sonnet = /claude-3-5-sonnet|3\.5-sonnet/.test(low);
-    cap.context_window = explicitCtx || (/4-6|4\.6|1m/.test(low) ? 1_000_000 : 200_000);
-    if (!isLegacyHaiku && !is35Sonnet) {
+    const isLegacyNoThink =
+      /claude-3-haiku|claude-3-5-haiku|3\.5-haiku|claude-3-5-sonnet|3\.5-sonnet|claude-3-opus|claude-2/.test(low);
+    const is47Opus = /opus[-_.]?4[-_.]?7|4[-_.]?7[-_.]?opus/.test(low);
+    const is46OrNewer = /4[-_.]?[6789]|1m/.test(low);
+    cap.context_window = explicitCtx || (is46OrNewer ? 1_000_000 : 200_000);
+    if (!isLegacyNoThink) {
       cap.thinking_supported = true;
       cap.thinking_mode = providerKind === "openai" ? "openai_effort" : "anthropic_budget";
-      cap.thinking_levels =
-        cap.thinking_mode === "anthropic_budget"
-          ? ["off", "low", "medium", "high", "max"]
-          : ["off", "low", "medium", "high"];
+      cap.thinking_levels = is47Opus
+        ? ["off", "low", "medium", "high", "xhigh", "max"]
+        : ["off", "low", "medium", "high", "max"];
       cap.default_thinking = /thinking|opus/.test(low) ? "high" : "medium";
     }
   }
   // --- OpenAI o-series / GPT-5 / Codex ---
-  else if (/\b(o1|o3|o4)\b|^o[134]-|gpt-5|codex/.test(low)) {
+  else if (/\b(o1|o3|o4)\b|^o[134]-|\/o[134](?:-|$)|gpt-5|codex/.test(low)) {
     cap.family = "openai-reasoning";
-    cap.vision = true;
-    cap.context_window = explicitCtx || (/gpt-5/.test(low) ? 400_000 : 200_000);
+    cap.vision = !/o3-mini|o1-mini/.test(low);
+    cap.context_window = explicitCtx || (/gpt-5|codex/.test(low) ? 400_000 : 200_000);
     cap.thinking_supported = true;
     cap.thinking_mode = "openai_effort";
-    cap.thinking_levels = /gpt-5|codex/.test(low) ? ["low", "medium", "high", "xhigh"] : ["low", "medium", "high"];
+    if (/gpt-5\.[12345]|gpt-5-codex|codex/.test(low)) {
+      cap.thinking_levels = ["off", "low", "medium", "high", "xhigh"];
+    } else if (/gpt-5/.test(low)) {
+      cap.thinking_levels = ["low", "medium", "high", "xhigh"];
+    } else {
+      cap.thinking_levels = ["low", "medium", "high"];
+    }
     cap.default_thinking = "medium";
   }
   // --- OpenAI GPT-4o / 4.1 ---
@@ -90,28 +99,28 @@ export function detectModelCapabilities(modelId, providerKind = "openai", remote
     cap.vision = true;
     cap.context_window = explicitCtx || 128_000;
   }
-  // --- DeepSeek family ---
+  // --- DeepSeek family (R1 / Reasoner / V3.1 / V3.2 / V4) ---
   else if (/deepseek/.test(low)) {
     cap.family = "deepseek";
     cap.vision = /vl|v4/.test(low);
     cap.context_window = explicitCtx || (/v4/.test(low) ? 256_000 : 128_000);
-    if (/r1|reasoner|think|v3\.2|v4/.test(low)) {
+    if (/r1|reasoner|think|v3\.1|v3\.2|v4/.test(low)) {
       cap.thinking_supported = true;
-      cap.thinking_mode = providerKind === "anthropic" ? "anthropic_budget" : "toggle";
-      cap.thinking_levels =
-        cap.thinking_mode === "anthropic_budget" ? ["off", "low", "medium", "high"] : ["off", "on"];
-      cap.default_thinking = /r1|reasoner|think/.test(low) ? (cap.thinking_mode === "toggle" ? "on" : "high") : "off";
+      cap.thinking_mode = "toggle";
+      cap.thinking_levels = ["off", "on"];
+      cap.default_thinking = /r1|reasoner|think/.test(low) ? "on" : "off";
     }
   }
-  // --- Gemini family ---
+  // --- Gemini family (2.5 / 3 / Thinking) ---
   else if (/gemini/.test(low)) {
     cap.family = "gemini";
     cap.vision = true;
     cap.context_window = explicitCtx || 1_000_000;
-    if (/2\.5|3|4|thinking|pro/.test(low) && !/1\.5/.test(low)) {
+    const isThinkingGemini = /2\.5|gemini-3|gemini-4|thinking/.test(low) && !/1\.5|2\.0-flash(?!-thinking)/.test(low);
+    if (isThinkingGemini) {
       cap.thinking_supported = true;
       cap.thinking_mode = "openai_effort";
-      cap.thinking_levels = ["off", "low", "medium", "high"];
+      cap.thinking_levels = /flash/.test(low) ? ["off", "low", "medium", "high"] : ["low", "medium", "high"];
       cap.default_thinking = "medium";
     }
   }
@@ -119,32 +128,46 @@ export function detectModelCapabilities(modelId, providerKind = "openai", remote
   else if (/grok/.test(low)) {
     cap.family = "grok";
     cap.vision = true;
-    cap.context_window = explicitCtx || (/4\./.test(low) ? 240_000 : 131_072);
+    cap.context_window = explicitCtx || (/grok-4/.test(low) ? 256_000 : 131_072);
     if (/grok-3-mini|grok-4|think|reason/.test(low)) {
       cap.thinking_supported = true;
-      cap.thinking_mode = providerKind === "anthropic" ? "anthropic_budget" : "openai_effort";
-      cap.thinking_levels = ["off", "low", "medium", "high"];
+      cap.thinking_mode = "openai_effort";
+      cap.thinking_levels = /grok-3-mini/.test(low) ? ["low", "high"] : ["off", "low", "medium", "high"];
       cap.default_thinking = "medium";
     }
   }
-  // --- Qwen / QwQ / GLM / Kimi / MiniMax ---
-  else if (/qwq|qwen3|qwen-3/.test(low)) {
+  // --- Qwen / QwQ ---
+  else if (/qwq|qwen3|qwen-3|qwen2\.5-thinking/.test(low)) {
     cap.family = "qwen";
-    cap.vision = /vl/.test(low);
-    cap.context_window = explicitCtx || 131_072;
+    cap.vision = /vl|omni/.test(low);
+    cap.context_window = explicitCtx || (/qwen3|qwen-3/.test(low) ? 256_000 : 131_072);
     cap.thinking_supported = true;
     cap.thinking_mode = "toggle";
     cap.thinking_levels = ["off", "on"];
     cap.default_thinking = /qwq|thinking/.test(low) ? "on" : "off";
-  } else if (/glm-4\.5|glm-4\.6|glm-5|kimi-k2|minimax/.test(low)) {
+  }
+  // --- Doubao Seed (1.5 / 1.6 thinking levels) ---
+  else if (/doubao|seed-1/.test(low)) {
     cap.family = "cn-flagship";
-    cap.vision = /v|vision|4\.5v|5/.test(low);
+    cap.vision = /vision|seed-1\.6|1\.6|2\.0/.test(low);
+    cap.context_window = explicitCtx || 256_000;
+    if (/thinking|seed-1\.[56]|seed-2/.test(low)) {
+      cap.thinking_supported = true;
+      cap.thinking_mode = "openai_effort";
+      cap.thinking_levels = ["off", "low", "medium", "high"];
+      cap.default_thinking = "medium";
+    }
+  }
+  // --- GLM / Kimi / MiniMax / Step / Hunyuan ---
+  else if (/glm-4\.5|glm-4\.6|glm-5|kimi-k2|minimax-m|step-r|hunyuan-t1/.test(low)) {
+    cap.family = "cn-flagship";
+    cap.vision = /v|vision|4\.5v|5|k2\.5/.test(low);
     cap.context_window = explicitCtx || 200_000;
-    if (/think|glm-4\.5|glm-5|k2-thinking/.test(low)) {
+    if (/think|glm-4\.[56]|glm-5|kimi-k2|minimax-m|step-r|t1/.test(low)) {
       cap.thinking_supported = true;
       cap.thinking_mode = "toggle";
       cap.thinking_levels = ["off", "on"];
-      cap.default_thinking = /think/.test(low) ? "on" : "off";
+      cap.default_thinking = /think|step-r|t1/.test(low) ? "on" : "off";
     }
   } else if (/think|reason|r1/.test(low)) {
     cap.thinking_supported = true;
@@ -162,7 +185,13 @@ export function detectModelCapabilities(modelId, providerKind = "openai", remote
       cap.source = "provider-api";
     }
     const params = Array.isArray(remoteMeta.supported_parameters) ? remoteMeta.supported_parameters : [];
-    if (params.includes("reasoning") || params.includes("include_reasoning")) {
+    const efforts = Array.isArray(remoteMeta.reasoning_efforts) ? remoteMeta.reasoning_efforts : [];
+    if (efforts.length) {
+      cap.thinking_supported = true;
+      cap.thinking_mode = "openai_effort";
+      cap.thinking_levels = efforts;
+      cap.source = "provider-api";
+    } else if (params.includes("reasoning") || params.includes("include_reasoning") || params.includes("reasoning_effort")) {
       cap.thinking_supported = true;
       if (cap.thinking_mode === "none") {
         cap.thinking_mode = "openai_effort";
@@ -172,7 +201,7 @@ export function detectModelCapabilities(modelId, providerKind = "openai", remote
       cap.source = "provider-api";
     }
     const archMod = String(remoteMeta.architecture?.modality || "").toLowerCase();
-    if (archMod.includes("image")) cap.vision = true;
+    if (archMod.includes("image") || remoteMeta.vision === true) cap.vision = true;
   }
 
   // User manual overrides take highest precedence
@@ -241,6 +270,7 @@ export async function fetchProviderModels(provider) {
     const rawList = Array.isArray(json.data) ? json.data : Array.isArray(json.models) ? json.models : [];
     const models = [];
     const capabilities = [];
+    const remoteMetaMap = {};
     const seen = new Set();
 
     for (const item of rawList) {
@@ -248,6 +278,21 @@ export async function fetchProviderModels(provider) {
       if (!id || seen.has(id)) continue;
       seen.add(id);
       models.push(id);
+      if (item && typeof item === "object") {
+        const slim = {};
+        if (item.context_length || item.max_context_tokens || item.input_token_limit) {
+          slim.context_length = Number(item.context_length || item.max_context_tokens || item.input_token_limit);
+        }
+        if (Array.isArray(item.supported_parameters) && item.supported_parameters.length) {
+          slim.supported_parameters = item.supported_parameters.slice(0, 24);
+        }
+        if (Array.isArray(item.reasoning_efforts) && item.reasoning_efforts.length) {
+          slim.reasoning_efforts = item.reasoning_efforts.slice(0, 8);
+        }
+        if (item.architecture?.modality) slim.architecture = { modality: item.architecture.modality };
+        if (typeof item.vision === "boolean") slim.vision = item.vision;
+        if (Object.keys(slim).length) remoteMetaMap[id] = slim;
+      }
       capabilities.push(
         detectModelCapabilities(id, provider.kind, typeof item === "object" ? item : null, provider.model_overrides?.[id]),
       );
@@ -255,7 +300,7 @@ export async function fetchProviderModels(provider) {
 
     models.sort((a, b) => a.localeCompare(b));
     logEvent("INFO", "models", "fetched", `从 ${provider.name} 拉取到 ${models.length} 个模型`);
-    return { ok: true, models, capabilities, endpoint: url };
+    return { ok: true, models, capabilities, remote_meta: remoteMetaMap, endpoint: url };
   } catch (err) {
     logEvent("WARN", "models", "fetch_failed", `拉取 ${provider.name} 模型列表失败: ${err.message}`);
     return { ok: false, error: err.message, endpoint: url, models: [], capabilities: [] };
@@ -268,8 +313,9 @@ export function enrichProviderForClient(provider) {
   if (!provider) return null;
   const models = Array.isArray(provider.models) ? provider.models : [];
   const allIds = [...new Set([...(provider.default_model ? [provider.default_model] : []), ...models])];
+  const remoteMetaMap = provider.extra?.remote_meta || {};
   const modelInfos = allIds.map((m) =>
-    detectModelCapabilities(m, provider.kind, null, provider.model_overrides?.[m]),
+    detectModelCapabilities(m, provider.kind, remoteMetaMap[m] || null, provider.model_overrides?.[m]),
   );
   return {
     ...provider,

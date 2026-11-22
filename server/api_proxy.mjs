@@ -17,7 +17,7 @@ function sendSse(res, eventName, dataObj) {
   res.write(`event: ${eventName}\ndata: ${JSON.stringify(dataObj)}\n\n`);
 }
 
-function anthropicToOpenAiBody(antBody, provider) {
+function anthropicToOpenAiBody(antBody, provider, thinkingHint = "") {
   let model = antBody.model || provider.default_model || "";
   // If Claude Code internally issues an auxiliary request for a haiku/claude model that this
   // OpenAI-compatible provider doesn't host, cleanly fall back to the provider's selected default model.
@@ -29,7 +29,12 @@ function anthropicToOpenAiBody(antBody, provider) {
   ) {
     model = provider.default_model;
   }
-  const cap = detectModelCapabilities(model, "openai", null, provider.model_overrides?.[model]);
+  const cap = detectModelCapabilities(
+    model,
+    "openai",
+    provider.extra?.remote_meta?.[model] || null,
+    provider.model_overrides?.[model],
+  );
   const messages = [];
 
   // System prompt (string or block array) — strip Claude's internal billing header lines
@@ -143,13 +148,32 @@ function anthropicToOpenAiBody(antBody, provider) {
       }));
   }
 
-  // Forward thinking intent when supported by target OpenAI-compatible model
-  if (cap.thinking_supported && antBody.thinking?.type === "enabled") {
-    if (cap.thinking_mode === "openai_effort") {
-      const b = Number(antBody.thinking.budget_tokens || 10000);
-      out.reasoning_effort = b >= 20000 ? "high" : b >= 8000 ? "medium" : "low";
-    } else if (cap.thinking_mode === "toggle" && (cap.family === "qwen" || cap.family === "cn-flagship")) {
-      out.enable_thinking = true;
+  // Forward thinking intent accurately based on UI-selected thinkingHint & model capability
+  if (cap.thinking_supported) {
+    const lvl = thinkingHint && thinkingHint !== "auto" ? thinkingHint : "";
+    if (lvl === "off") {
+      if (cap.thinking_mode === "toggle") {
+        out.enable_thinking = false;
+      }
+    } else if (lvl === "on") {
+      if (cap.thinking_mode === "toggle") {
+        out.enable_thinking = true;
+      } else {
+        out.reasoning_effort = "medium";
+      }
+    } else if (["low", "medium", "high", "xhigh", "max"].includes(lvl)) {
+      if (cap.thinking_mode === "toggle") {
+        out.enable_thinking = true;
+      } else {
+        out.reasoning_effort = lvl === "max" ? (cap.thinking_levels.includes("xhigh") ? "xhigh" : "high") : lvl;
+      }
+    } else if (antBody.thinking?.type === "enabled") {
+      if (cap.thinking_mode === "openai_effort") {
+        const b = Number(antBody.thinking.budget_tokens || 10000);
+        out.reasoning_effort = b >= 30000 && cap.thinking_levels.includes("xhigh") ? "xhigh" : b >= 20000 ? "high" : b >= 8000 ? "medium" : "low";
+      } else if (cap.thinking_mode === "toggle") {
+        out.enable_thinking = true;
+      }
     }
   }
 
@@ -195,9 +219,9 @@ async function handleAnthropicPassthrough(req, res, provider, rawBody, subpath) 
   }
 }
 
-async function handleOpenAiTranslated(res, provider, antBody) {
+async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "") {
   const url = buildApiEndpoint(provider.base_url, "openai", "/chat/completions");
-  const oaiBody = anthropicToOpenAiBody(antBody, provider);
+  const oaiBody = anthropicToOpenAiBody(antBody, provider, thinkingHint);
   const headers = { "Content-Type": "application/json" };
   if (provider.api_key) headers["Authorization"] = `Bearer ${provider.api_key}`;
 
@@ -420,7 +444,7 @@ async function handleOpenAiTranslated(res, provider, antBody) {
 /**
  * Main HTTP handler for `/proxy/provider/:providerId/v1/...`
  */
-export async function handleProviderProxyRequest(req, res, providerId, subpath) {
+export async function handleProviderProxyRequest(req, res, providerId, subpath, thinkingHint = "") {
   const provider = getProvider(providerId, true);
   if (!provider) {
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -447,10 +471,20 @@ export async function handleProviderProxyRequest(req, res, providerId, subpath) 
 
   try {
     if (provider.kind === "anthropic") {
-      return await handleAnthropicPassthrough(req, res, provider, rawBody, "/messages");
+      let bodyToSend = rawBody;
+      if (thinkingHint === "off" && rawBody) {
+        try {
+          const parsed = JSON.parse(rawBody);
+          if (parsed && typeof parsed === "object" && parsed.thinking) {
+            delete parsed.thinking;
+            bodyToSend = JSON.stringify(parsed);
+          }
+        } catch {}
+      }
+      return await handleAnthropicPassthrough(req, res, provider, bodyToSend, "/messages");
     }
     const antBody = JSON.parse(rawBody || "{}");
-    return await handleOpenAiTranslated(res, provider, antBody);
+    return await handleOpenAiTranslated(res, provider, antBody, thinkingHint);
   } catch (err) {
     logEvent("ERROR", "proxy", "upstream_error", `内置代理转发至 ${provider.name} 失败: ${err.message}`, {
       layer: "upstream-api",

@@ -136,6 +136,15 @@ describe("OpenCode Studio Core Suite", () => {
     assert.equal(claude.thinking_mode, "anthropic_budget");
     assert.equal(claude.context_window, 1_000_000);
     assert.equal(claude.display_name, "claude-sonnet-4-6");
+    assert.deepEqual(claude.thinking_levels, ["off", "low", "medium", "high", "max"]);
+
+    // Claude 4.6 via OpenAI-compatible relay must still expose full 5 levels (including max!)
+    const claudeOai = detectModelCapabilities("claude-opus-4-6-thinking", "openai");
+    assert.deepEqual(claudeOai.thinking_levels, ["off", "low", "medium", "high", "max"]);
+
+    // Claude Opus 4.7 supports 6 levels including xhigh & max
+    const opus47 = detectModelCapabilities("claude-opus-4-7", "openai");
+    assert.deepEqual(opus47.thinking_levels, ["off", "low", "medium", "high", "xhigh", "max"]);
 
     const gpt4o = detectModelCapabilities("gpt-4o", "openai");
     assert.equal(gpt4o.thinking_supported, false);
@@ -147,9 +156,30 @@ describe("OpenCode Studio Core Suite", () => {
     assert.equal(gpt5.thinking_mode, "openai_effort");
     assert.ok(gpt5.thinking_levels.includes("xhigh"));
 
+    const o3 = detectModelCapabilities("o3", "openai");
+    assert.deepEqual(o3.thinking_levels, ["low", "medium", "high"]);
+
+    const ds = detectModelCapabilities("deepseek-v4.1-flash", "openai");
+    assert.deepEqual(ds.thinking_levels, ["off", "on"]);
+    assert.equal(ds.context_window, 256_000);
+
+    const gemFlash = detectModelCapabilities("gemini-2.5-flash", "openai");
+    assert.deepEqual(gemFlash.thinking_levels, ["off", "low", "medium", "high"]);
+
     const grok = detectModelCapabilities("grok-4.7", "openai");
-    assert.equal(grok.context_window, 240_000);
+    assert.equal(grok.context_window, 256_000);
     assert.equal(grok.thinking_supported, true);
+
+    // Unknown brand-new model enriched via provider /v1/models remote metadata
+    const futureModel = detectModelCapabilities("acme-future-9", "openai", {
+      context_length: 512_000,
+      reasoning_efforts: ["low", "medium", "high"],
+      vision: true,
+    });
+    assert.equal(futureModel.context_window, 512_000);
+    assert.deepEqual(futureModel.thinking_levels, ["low", "medium", "high"]);
+    assert.equal(futureModel.vision, true);
+    assert.equal(futureModel.source, "provider-api");
   });
 
   it("supports non-destructive Edit & Resend branching and branch switching", () => {

@@ -906,8 +906,72 @@
       if (c.cwd === prev) opt.selected = true;
       sel.appendChild(opt);
     }
+    renderCwdFilterDropdown();
     renderSessionList();
     updateRunningButtons();
+  }
+
+  function shortDirName(fullPath) {
+    const clean = String(fullPath || "").replace(/[\\/]+$/, "");
+    if (!clean) return "全部工作目录";
+    const parts = clean.split(/[\\/]/).filter(Boolean);
+    return parts[parts.length - 1] || clean;
+  }
+
+  function renderCwdFilterDropdown() {
+    const sel = $("cwd-filter-select");
+    const menu = $("gd-cwd-filter-menu");
+    const lbl = $("gd-cwd-filter-label");
+    const cntEl = $("gd-cwd-filter-count");
+    if (!sel || !menu || !lbl) return;
+
+    const current = sel.value || "";
+    const totalCount = (state.cwds || []).reduce((sum, c) => sum + (Number(c.count) || 0), 0);
+    const activeItem = (state.cwds || []).find((c) => c.cwd === current);
+
+    lbl.textContent = current ? shortDirName(current) : "全部工作目录";
+    lbl.title = current || "显示全部工作目录的会话";
+    if (cntEl) {
+      const n = current ? (activeItem?.count ?? 0) : totalCount;
+      cntEl.textContent = String(n);
+      cntEl.classList.toggle("hidden", n <= 0);
+    }
+
+    const pick = (val) => {
+      if (sel.value !== val) {
+        sel.value = val;
+        refreshSessions();
+      }
+      closeAllGlassDropdowns();
+    };
+
+    menu.innerHTML = "";
+    const allBtn = document.createElement("button");
+    allBtn.type = "button";
+    allBtn.className = "gd-item" + (!current ? " active" : "");
+    allBtn.innerHTML =
+      `<div class="cwd-opt-main">` +
+        `<span class="cwd-opt-name">全部工作目录</span>` +
+        `<span class="cwd-opt-path">显示所有项目与目录会话</span>` +
+      `</div>` +
+      (totalCount > 0 ? `<span class="cwd-opt-badge">${totalCount}</span>` : "");
+    allBtn.addEventListener("click", (e) => { e.stopPropagation(); pick(""); });
+    menu.appendChild(allBtn);
+
+    for (const c of state.cwds || []) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "gd-item" + (c.cwd === current ? " active" : "");
+      btn.title = c.cwd;
+      btn.innerHTML =
+        `<div class="cwd-opt-main">` +
+          `<span class="cwd-opt-name">${escHtml(shortDirName(c.cwd))}</span>` +
+          `<span class="cwd-opt-path">${escHtml(c.cwd)}</span>` +
+        `</div>` +
+        `<span class="cwd-opt-badge">${c.count || 0}</span>`;
+      btn.addEventListener("click", (e) => { e.stopPropagation(); pick(c.cwd); });
+      menu.appendChild(btn);
+    }
   }
 
   // ==================== TOOL CARDS & MESSAGE RENDERING ====================
@@ -2040,9 +2104,19 @@
     for (const p of state.providers) {
       const el = document.createElement("div");
       el.className = "stack-item" + (p.id === state.selectedProviderId ? " active" : "");
+      const badgeClass = p.is_active ? "is-current" : p.kind === "claude_native" ? "is-native" : "is-api";
+      const badgeText = p.is_active
+        ? "当前"
+        : p.kind === "claude_native"
+          ? "原生 Auth"
+          : p.kind === "anthropic"
+            ? "Anthropic"
+            : "OpenAI";
       el.innerHTML =
-        `<div class="stack-item-head"><span>${escHtml(p.name)}</span>` +
-        `<span class="mini-tag">${p.is_active ? "当前" : p.kind === "claude_native" ? "原生Auth" : p.kind}</span></div>` +
+        `<div class="stack-item-head">` +
+          `<span class="stack-item-title" title="${escHtml(p.name)}">${escHtml(p.name)}</span>` +
+          `<span class="prov-badge ${badgeClass}">${badgeText}</span>` +
+        `</div>` +
         `<div class="stack-item-sub">${escHtml(p.default_model || (p.base_url || "官方 OAuth 登录"))}</div>`;
       el.addEventListener("click", () => fillProviderForm(p));
       listEl.appendChild(el);
@@ -2150,16 +2224,26 @@
       grid.innerHTML = `<div class="muted-text">保存或拉取模型后，此处会展示每个模型自动识别的思考等级与上下文窗口。</div>`;
       return;
     }
-    grid.innerHTML = infos.slice(0, 24).map((m) =>
-      `<div class="cap-card">` +
-        `<div class="cap-card-name">${escHtml(m.display_name)}</div>` +
-        `<div class="cap-tags">` +
-          `<span class="mini-tag">${fmtTokens(m.context_window)} ctx</span>` +
-          (m.thinking_supported ? `<span class="mini-tag think">思考: ${m.thinking_levels.join("/")}</span>` : `<span class="mini-tag">无思考档</span>`) +
-          (m.vision ? `<span class="mini-tag">识图</span>` : "") +
-        `</div>` +
-      `</div>`,
-    ).join("");
+    const zhMap = { off: "关", on: "开", low: "低", medium: "中", high: "高", xhigh: "极高", max: "极致" };
+    grid.innerHTML = infos.slice(0, 60).map((m) => {
+      const lvls = m.thinking_levels || [];
+      const zhLevels = lvls.map((l) => zhMap[l] || l).join("/");
+      const thinkTitle = m.thinking_supported
+        ? `共 ${lvls.length} 个档位 (${lvls.join(" / ")}) · 识别方式: ${m.source === "provider-api" ? "供应商接口元数据" : "模型家族规则"}`
+        : "该模型为标准非推理模型";
+      return (
+        `<div class="cap-card">` +
+          `<div class="cap-card-name" title="${escHtml(m.id || m.display_name)}">${escHtml(m.display_name)}</div>` +
+          `<div class="cap-tags">` +
+            `<span class="mini-tag">${fmtTokens(m.context_window)} 上下文</span>` +
+            (m.thinking_supported
+              ? `<span class="mini-tag think" title="${escHtml(thinkTitle)}">${lvls.length}档思考: ${escHtml(zhLevels)}</span>`
+              : `<span class="mini-tag" title="${escHtml(thinkTitle)}">标准无思考档</span>`) +
+            (m.vision ? `<span class="mini-tag vision">识图</span>` : "") +
+          `</div>` +
+        `</div>`
+      );
+    }).join("");
   }
 
   async function saveProviderForm() {
@@ -2209,7 +2293,10 @@
 
   function syncSearchEngineBadge(eng) {
     const badge = $("store-engine-badge");
-    if (badge && eng?.label) badge.textContent = eng.label;
+    if (!badge || !eng) return;
+    const isProxy = eng.active === "proxy";
+    badge.textContent = eng.label || (isProxy ? "代理引擎" : "国内直连");
+    badge.classList.toggle("is-proxy", isProxy);
   }
 
   function openStoresModal(tab = "mcp") {
@@ -2244,8 +2331,8 @@
       const card = document.createElement("div");
       card.className = "store-card";
       card.innerHTML =
-        `<div class="store-card-head"><span class="store-card-title">${escHtml(m.name)}</span>` +
-        `<span class="mini-tag">${escHtml(m.runtime_status)} · ${m.tools_count || 0} 工具</span></div>` +
+        `<div class="store-card-head"><span class="store-card-title" title="${escHtml(m.name)}">${escHtml(m.name)}</span>` +
+        `<span class="store-badge ${m.runtime_status === "connected" ? "is-remote" : ""}">${escHtml(m.runtime_status)} · ${m.tools_count || 0} 工具</span></div>` +
         `<div class="store-card-desc mono" style="font-size:11.5px;">${escHtml(m.command)} ${escHtml((m.args || []).join(" "))}${m.last_error ? `<br /><span style="color:var(--err);">${escHtml(m.last_error)}</span>` : ""}</div>` +
         `<div class="store-card-foot">` +
           `<button class="btn-secondary sm btn-toggle">${m.enabled ? "停用" : "启用"}</button>` +
@@ -2287,10 +2374,23 @@
       for (const m of items) {
         const card = document.createElement("div");
         card.className = "store-card";
+        const isOfficial = Boolean(m.featured || (m.tags || []).includes("official"));
+        const isRemote = m.command === "http" || m.command === "sse" || m.badge === "远程";
+        const badgeText = isOfficial
+          ? "官方精选"
+          : isRemote
+            ? "远程直连"
+            : m.badge || (m.tags || [])[0] || "开源";
+        const badgeCls = isOfficial ? "is-official" : isRemote ? "is-remote" : "";
+        const descText =
+          (m.description && m.description.trim()) ||
+          `公开 MCP 扩展工具服务（${m.command === "http" || m.command === "sse" ? "远程直连" : m.command}），一键安装后即可供 Claude Code 调用。`;
         card.innerHTML =
-          `<div class="store-card-head"><span class="store-card-title">${escHtml(m.title || m.name)}</span>` +
-          `<span class="mini-tag">${escHtml((m.tags || []).slice(0, 2).join(" · ") || "open-source")}</span></div>` +
-          `<div class="store-card-desc">${escHtml(m.description)}</div>` +
+          `<div class="store-card-head">` +
+            `<span class="store-card-title" title="${escHtml(m.title || m.name)}">${escHtml(m.title || m.name)}</span>` +
+            `<span class="store-badge ${badgeCls}">${escHtml(badgeText)}</span>` +
+          `</div>` +
+          `<div class="store-card-desc" title="${escHtml(descText)}">${escHtml(descText)}</div>` +
           `<div class="store-card-foot">` +
             (m.repo_url ? `<a class="link-btn" href="${escHtml(m.repo_url)}" target="_blank">源码仓库 ↗</a>` : `<span></span>`) +
             `<button class="btn-primary sm btn-install">一键安装启用</button>` +
@@ -2331,8 +2431,8 @@
       const card = document.createElement("div");
       card.className = "store-card";
       card.innerHTML =
-        `<div class="store-card-head"><span class="store-card-title">/${escHtml(s.slug)} · ${escHtml(s.name)}</span>` +
-        `<span class="mini-tag">${s.enabled ? "已启用" : "已停用"}</span></div>` +
+        `<div class="store-card-head"><span class="store-card-title" title="/${escHtml(s.slug)} · ${escHtml(s.name)}">/${escHtml(s.slug)} · ${escHtml(s.name)}</span>` +
+        `<span class="store-badge ${s.enabled ? "is-remote" : ""}">${s.enabled ? "已启用" : "已停用"}</span></div>` +
         `<div class="store-card-desc">${escHtml(s.description || s.content.slice(0, 90))}</div>` +
         `<div class="store-card-foot">` +
           `<button class="btn-secondary sm btn-toggle">${s.enabled ? "停用" : "启用"}</button>` +
@@ -2368,10 +2468,18 @@
       for (const s of items) {
         const card = document.createElement("div");
         card.className = "store-card";
+        const isOfficial = s.badge === "官方" || String(s.id || "").startsWith("anth-skill-") || String(s.id || "").startsWith("skill-");
+        const badgeText = isOfficial ? "官方" : s.badge || `/${(s.slug || "skill").slice(0, 12)}`;
+        const badgeCls = isOfficial ? "is-official" : "";
+        const descText =
+          (s.description && s.description.trim()) ||
+          `公开 Agent 扩展技能（安装后支持 /${s.slug || "skill"} 调用），点击自动拉取 SKILL.md 并启用。`;
         card.innerHTML =
-          `<div class="store-card-head"><span class="store-card-title">${escHtml(s.name)}</span>` +
-          `<span class="mini-tag">/${escHtml(s.slug)}</span></div>` +
-          `<div class="store-card-desc">${escHtml(s.description)}</div>` +
+          `<div class="store-card-head">` +
+            `<span class="store-card-title" title="${escHtml(s.name)}">${escHtml(s.name)}</span>` +
+            `<span class="store-badge ${badgeCls}" title="/${escHtml(s.slug)}">${escHtml(badgeText)}</span>` +
+          `</div>` +
+          `<div class="store-card-desc" title="${escHtml(descText)}">${escHtml(descText)}</div>` +
           `<div class="store-card-foot">` +
             (s.source_url ? `<a class="link-btn" href="${escHtml(s.source_url)}" target="_blank">开源仓库 ↗</a>` : `<span></span>`) +
             `<button class="btn-primary sm btn-dl">下载并启用</button>` +
@@ -3104,8 +3212,9 @@
     $("btn-open-settings").addEventListener("click", openSettingsModal);
     $("btn-open-logs").addEventListener("click", () => openLogsModal("server"));
 
-    // Custom Glass Popover Dropdown triggers
+    // Custom Glass Popover Dropdown triggers (composer + sidebar workdir filter)
     for (const [ddId, btnId, menuId] of [
+      ["gd-cwd-filter", "gd-cwd-filter-btn", "gd-cwd-filter-menu"],
       ["gd-provider", "gd-provider-btn", "gd-provider-menu"],
       ["gd-model", "gd-model-btn", "gd-model-menu"],
       ["gd-thinking", "gd-thinking-btn", "gd-thinking-menu"],

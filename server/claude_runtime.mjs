@@ -1070,7 +1070,14 @@ export async function runNativeClaudeCodeTurn({
   }
 
   const latestUser = historyItems[historyItems.length - 1];
-  const cap = detectModelCapabilities(model, provider.kind === "claude_native" ? "anthropic" : provider.kind, null, provider.model_overrides?.[model]);
+  const cap = detectModelCapabilities(
+    model,
+    provider.kind === "claude_native" ? "anthropic" : provider.kind,
+    provider.extra?.remote_meta?.[model] || null,
+    provider.model_overrides?.[model],
+  );
+  const effectiveThinking =
+    thinkingLevel && thinkingLevel !== "auto" ? thinkingLevel : (cap.thinking_supported ? cap.default_thinking : "off");
   const { promptMode, promptText, mcpConfigPath } = buildCustomPromptAndMcp(cwd, rt.mode);
 
   // Build strictly isolated environment so native auth & API providers NEVER collide
@@ -1100,7 +1107,8 @@ export async function runNativeClaudeCodeTurn({
     env.https_proxy = null;
     env.ALL_PROXY = null;
     env.all_proxy = null;
-    env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${localServerPort}/proxy/provider/${provider.id}`;
+    const proxyBase = `http://127.0.0.1:${localServerPort}/proxy/provider/${provider.id}/${encodeURIComponent(effectiveThinking || "auto")}`;
+    env.ANTHROPIC_BASE_URL = proxyBase;
     env.ANTHROPIC_AUTH_TOKEN = "OPENCODE_STUDIO_PROXY";
     env.ANTHROPIC_API_KEY = null;
     env.ANTHROPIC_MODEL = model;
@@ -1132,7 +1140,7 @@ export async function runNativeClaudeCodeTurn({
     CLAUDE_CODE_MAX_RETRIES: "3",
   };
   if (provider.kind !== "claude_native") {
-    inlineSettingsEnv.ANTHROPIC_BASE_URL = `http://127.0.0.1:${localServerPort}/proxy/provider/${provider.id}`;
+    inlineSettingsEnv.ANTHROPIC_BASE_URL = `http://127.0.0.1:${localServerPort}/proxy/provider/${provider.id}/${encodeURIComponent(effectiveThinking || "auto")}`;
     inlineSettingsEnv.ANTHROPIC_AUTH_TOKEN = "OPENCODE_STUDIO_PROXY";
     if (model) {
       inlineSettingsEnv.ANTHROPIC_MODEL = model;
@@ -1154,8 +1162,10 @@ export async function runNativeClaudeCodeTurn({
   if (model) {
     args.push("--model", model);
   }
-  if (["low", "medium", "high", "xhigh", "max"].includes(thinkingLevel)) {
-    args.push("--effort", thinkingLevel);
+  if (["low", "medium", "high", "xhigh", "max"].includes(effectiveThinking)) {
+    args.push("--effort", effectiveThinking);
+  } else if (effectiveThinking === "on") {
+    args.push("--effort", "high");
   }
   if (promptMode === "replace") {
     const safePrompt = rt.isCmd ? promptText.replace(/\r?\n/g, " ") : promptText;
