@@ -217,13 +217,92 @@ export function getClaudeRuntimeAndAuth(force = false) {
   };
 }
 
+const CLAUDE_DIST_BASE = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases";
+let _activeAuthSession = null; // { proc, oauthUrl, timer }
+
+function parseSemverString(raw) {
+  const m = String(raw || "").match(/(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)/);
+  return m ? m[1] : "";
+}
+
+function openExternalUrlInHost(url) {
+  if (!/^https:\/\//i.test(url || "")) return;
+  try {
+    if (process.platform === "win32") {
+      spawn("cmd.exe", ["/c", "start", "", url], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    } else if (process.platform === "darwin") {
+      spawn("open", [url], { detached: true, stdio: "ignore" }).unref();
+    } else {
+      spawn("xdg-open", [url], { detached: true, stdio: "ignore" }).unref();
+    }
+  } catch {
+    // frontend link button also opens it
+  }
+}
+
 /**
- * Start real `claude auth login` flow and capture OAuth URL + live output.
+ * Ensure native Claude Code can run direct-API mode WITHOUT hanging on first-run onboarding
+ * (especially for students on fresh machines without any VPN/proxy).
+ * Only merges `"hasCompletedOnboarding": true` if missing — never overwrites existing auth/keys!
+ */
+export function ensureClaudeDirectReady(rt) {
+  try {
+    if (!rt || rt.mode === "missing") return;
+    if (rt.mode === "wsl") {
+      const script = `python3 - <<'PY'
+import json, os
+p = os.path.expanduser("~/.claude.json")
+data = {}
+if os.path.exists(p):
+    try:
+        data = json.load(open(p, "r", encoding="utf-8"))
+    except Exception:
+        data = {}
+if not data.get("hasCompletedOnboarding"):
+    data["hasCompletedOnboarding"] = True
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+PY`;
+      spawnSync("wsl.exe", wslScriptArgs(script), { encoding: "utf8", timeout: 5000, windowsHide: true });
+      return;
+    }
+    const cfgPath = path.join(os.homedir(), ".claude.json");
+    let data = {};
+    if (fs.existsSync(cfgPath)) {
+      try {
+        data = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+      } catch {
+        data = {};
+      }
+    }
+    if (!data.hasCompletedOnboarding) {
+      data.hasCompletedOnboarding = true;
+      fs.writeFileSync(cfgPath, JSON.stringify(data, null, 2), "utf8");
+    }
+  } catch {
+    // non-fatal
+  }
+}
+
+/**
+ * Start real `claude auth login` flow:
+ *  - Captures OAuth URL across platform.claude.com / claude.ai / console.anthropic.com
+ *  - Immediately launches the host browser to that URL
+ *  - Keeps stdin open so users can paste the authorization code if prompted!
  */
 export async function runClaudeAuthLogin({ mode = "claudeai", email = "", onProgress } = {}) {
   const rt = detectClaudeRuntime(true);
   if (rt.mode === "missing") {
-    return { ok: false, error: "本机尚未安装原生 Claude Code，请先在设置中点击「安装 Claude Code」。" };
+    return { ok: false, error: "本机尚未安装原生 Claude Code，请先在「设置 → 版本管理」中安装原生 Claude Code。" };
+  }
+
+  // Terminate any stale previous login process
+  if (_activeAuthSession?.proc) {
+    try {
+      clearTimeout(_activeAuthSession.timer);
+      _activeAuthSession.proc.kill();
+    } catch {}
+    _activeAuthSession = null;
   }
 
   const args = ["auth", "login", mode === "console" ? "--console" : "--claudeai"];
@@ -240,20 +319,53 @@ export async function runClaudeAuthLogin({ mode = "claudeai", email = "", onProg
         ANTHROPIC_API_KEY: null,
         DISABLE_TELEMETRY: "1",
       },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
+
+    const expireTimer = setTimeout(() => {
+      if (_activeAuthSession?.proc === proc) {
+        try { proc.kill(); } catch {}
+        _activeAuthSession = null;
+      }
+    }, 10 * 60 * 1000);
+
+    _activeAuthSession = { proc, oauthUrl: "", timer: expireTimer, combined: "" };
 
     let combined = "";
     let oauthUrl = "";
     let resolved = false;
+    let browserOpened = false;
+
+    const finishEarlyWithUrl = () => {
+      if (resolved || !oauthUrl) return;
+      resolved = true;
+      resolve({
+        ok: true,
+        pending_browser: true,
+        needs_code_input: true,
+        oauth_url: oauthUrl,
+        output: combined.trim(),
+        message: "已为您打开官方授权页面。完成网页登录后，如页面显示授权码 (Code)，请粘贴到下方输入框点击提交；如自动跳转成功，直接点击「刷新状态」即可。",
+      });
+    };
 
     const inspectChunk = (chunk) => {
       const txt = chunk.toString("utf8");
       combined += txt;
-      const m = txt.match(/https:\/\/(?:claude\.ai|console\.anthropic\.com)\/[^\s"'<>]+/i);
+      if (_activeAuthSession?.proc === proc) _activeAuthSession.combined = combined;
+
+      // Match platform.claude.com, claude.ai, console.anthropic.com OAuth links cleanly
+      const m = combined.match(/https:\/\/(?:platform\.claude\.com|claude\.ai|console\.anthropic\.com)\/oauth\/[^\s"'<>]+/i)
+        || combined.match(/https:\/\/(?:platform\.claude\.com|claude\.ai|console\.anthropic\.com)\/[^\s"'<>]+/i);
       if (m && !oauthUrl) {
-        oauthUrl = m[0];
-        onProgress?.({ stage: "oauth_url", url: oauthUrl, text: txt });
+        oauthUrl = m[0].replace(/[.,;)]+$/, "");
+        if (_activeAuthSession?.proc === proc) _activeAuthSession.oauthUrl = oauthUrl;
+        if (!browserOpened) {
+          browserOpened = true;
+          openExternalUrlInHost(oauthUrl);
+        }
+        onProgress?.({ stage: "oauth_url", url: oauthUrl, needs_code_input: true, text: txt });
+        setTimeout(finishEarlyWithUrl, 600);
       } else {
         onProgress?.({ stage: "output", text: txt });
       }
@@ -262,22 +374,14 @@ export async function runClaudeAuthLogin({ mode = "claudeai", email = "", onProg
     proc.stdout?.on("data", inspectChunk);
     proc.stderr?.on("data", inspectChunk);
 
-    // If process stays open waiting for user to complete browser OAuth, resolve quickly once URL is captured
     const urlTimer = setTimeout(() => {
-      if (!resolved && oauthUrl) {
-        resolved = true;
-        resolve({
-          ok: true,
-          pending_browser: true,
-          oauth_url: oauthUrl,
-          output: combined.trim(),
-          message: "请在打开的官方页面完成 Claude 账号授权登录，完成后点击「刷新登录状态」。",
-        });
-      }
-    }, 3500);
+      if (!resolved && oauthUrl) finishEarlyWithUrl();
+    }, 4500);
 
     proc.on("close", (code) => {
       clearTimeout(urlTimer);
+      clearTimeout(expireTimer);
+      if (_activeAuthSession?.proc === proc) _activeAuthSession = null;
       clearRuntimeCache();
       const status = getClaudeRuntimeAndAuth(true);
       onProgress?.({ stage: "done", code, auth: status.auth });
@@ -288,6 +392,7 @@ export async function runClaudeAuthLogin({ mode = "claudeai", email = "", onProg
           oauth_url: oauthUrl,
           output: combined.trim(),
           auth: status.auth,
+          runtime: status,
           message: status.auth?.loggedIn ? "Claude 官方账号登录成功！" : combined.trim() || `登录命令退出码 ${code}`,
         });
       }
@@ -295,7 +400,51 @@ export async function runClaudeAuthLogin({ mode = "claudeai", email = "", onProg
   });
 }
 
+/**
+ * Submit pasted OAuth authorization code back to the waiting `claude auth login` process!
+ */
+export async function submitClaudeAuthCode(codeText) {
+  const clean = String(codeText || "").trim();
+  if (!clean) return { ok: false, error: "授权码不能为空" };
+  const sess = _activeAuthSession;
+  if (!sess?.proc || sess.proc.killed || sess.proc.exitCode !== null) {
+    return { ok: false, error: "当前没有等待输入授权码的登录会话，请先重新点击登录按钮。" };
+  }
+
+  return await new Promise((resolve) => {
+    let settled = false;
+    const done = (ok, msg) => {
+      if (settled) return;
+      settled = true;
+      clearRuntimeCache();
+      const runtime = getClaudeRuntimeAndAuth(true);
+      resolve({
+        ok: ok || Boolean(runtime.auth?.loggedIn),
+        message: runtime.auth?.loggedIn ? "官方账号授权登录成功！" : msg,
+        runtime,
+      });
+    };
+
+    const timer = setTimeout(() => done(false, "已提交授权码，请点击「刷新状态」确认结果。"), 12000);
+    sess.proc.once("close", (rc) => {
+      clearTimeout(timer);
+      done(rc === 0, rc === 0 ? "登录完成" : `授权进程退出码 ${rc}，请检查授权码是否有效或已过期。`);
+    });
+
+    try {
+      sess.proc.stdin.write(clean + "\n");
+    } catch (err) {
+      clearTimeout(timer);
+      done(false, `提交授权码失败: ${err.message}`);
+    }
+  });
+}
+
 export function runClaudeAuthLogout() {
+  if (_activeAuthSession?.proc) {
+    try { _activeAuthSession.proc.kill(); } catch {}
+    _activeAuthSession = null;
+  }
   const rt = detectClaudeRuntime(true);
   if (rt.mode === "missing") return { ok: false, error: "未安装 Claude Code" };
   const res = runClaudeSync(rt, ["auth", "logout"], 8000);
@@ -308,62 +457,285 @@ export function runClaudeAuthLogout() {
 }
 
 /**
- * Install or switch Claude Code between `stable` and `latest` channels!
+ * Check installed Claude Code version vs official `stable` and `latest` channels!
+ */
+export async function checkClaudeVersions() {
+  const runtime = getClaudeRuntimeAndAuth(true);
+  const currentVer = parseSemverString(runtime.version);
+
+  let stableVer = "";
+  let latestVer = "";
+  let source = "";
+  let error = "";
+
+  const fetchText = async (url, timeoutMs = 6000) => {
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(), timeoutMs);
+    try {
+      const r = await fetch(url, { headers: { "User-Agent": "OpenCodeStudio/1.1" }, signal: c.signal });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return (await r.text()).trim();
+    } finally {
+      clearTimeout(t);
+    }
+  };
+
+  try {
+    const [s, l] = await Promise.all([
+      fetchText(`${CLAUDE_DIST_BASE}/stable`),
+      fetchText(`${CLAUDE_DIST_BASE}/latest`),
+    ]);
+    stableVer = parseSemverString(s);
+    latestVer = parseSemverString(l);
+    source = "official-gcs";
+  } catch (e1) {
+    // Fallback to npm registry (works cleanly even on restricted networks)
+    try {
+      const raw = await fetchText("https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags", 7000);
+      const tags = JSON.parse(raw);
+      stableVer = parseSemverString(tags.stable || tags.latest);
+      latestVer = parseSemverString(tags.latest || tags.next);
+      source = "npm-registry";
+    } catch (e2) {
+      error = `无法联网查询官方版本通道: ${e2.message || e1.message}`;
+    }
+  }
+
+  let status = "not_installed";
+  let statusText = "本机尚未安装原生 Claude Code（未安装时会自动使用内置直连引擎，也可一键安装原生内核）";
+  if (runtime.installed && currentVer) {
+    if (latestVer && currentVer === latestVer && stableVer && currentVer === stableVer) {
+      status = "both";
+      statusText = `当前 v${currentVer} 已同时是最新稳定版与最新版`;
+    } else if (latestVer && currentVer === latestVer) {
+      status = "latest";
+      statusText = `当前已是最新版 (latest: v${latestVer})；官方稳定版为 v${stableVer || "-"}`;
+    } else if (stableVer && currentVer === stableVer) {
+      status = "stable";
+      statusText = `当前已是官方稳定版 (stable: v${stableVer})；官方最新版为 v${latestVer || "-"}`;
+    } else {
+      status = "outdated";
+      statusText = `当前版本 v${currentVer}（可切换至稳定版 v${stableVer || "-"} 或最新版 v${latestVer || "-"}）`;
+    }
+  }
+
+  return {
+    ok: !error,
+    installed: runtime.installed,
+    mode: runtime.mode,
+    binary: runtime.binary,
+    current_version: currentVer || null,
+    stable_version: stableVer || null,
+    latest_version: latestVer || null,
+    channel_status: status,
+    status_text: statusText,
+    source,
+    error: error || null,
+    runtime,
+  };
+}
+
+/**
+ * After switching Claude Code versions, preserve user config & credentials and clean up
+ * older unused binaries under `~/.local/share/claude/versions/` to prevent disk bloat.
+ */
+function cleanupOldClaudeVersions(rt) {
+  try {
+    if (!rt || rt.mode === "missing") return { removed: 0, freed_mb: 0 };
+    if (rt.mode === "wsl") {
+      const script = `python3 - <<'PY'
+import os, json, shutil
+bin_link = os.path.expanduser("~/.local/bin/claude")
+ver_dir = os.path.expanduser("~/.local/share/claude/versions")
+active = os.path.realpath(bin_link) if os.path.exists(bin_link) else ""
+removed = 0
+freed = 0
+if os.path.isdir(ver_dir):
+    for name in os.listdir(ver_dir):
+        full = os.path.join(ver_dir, name)
+        if active and os.path.realpath(full) == active:
+            continue
+        try:
+            if os.path.isfile(full) or os.path.islink(full):
+                freed += os.path.getsize(full) if not os.path.islink(full) else 0
+                os.unlink(full)
+                removed += 1
+            elif os.path.isdir(full):
+                for r, _, fs in os.walk(full):
+                    for fn in fs:
+                        fp = os.path.join(r, fn)
+                        if os.path.isfile(fp): freed += os.path.getsize(fp)
+                shutil.rmtree(full, ignore_errors=True)
+                removed += 1
+        except Exception:
+            pass
+print(json.dumps({"removed": removed, "freed_mb": round(freed / (1024*1024), 1)}))
+PY`;
+      const r = spawnSync("wsl.exe", wslScriptArgs(script), { encoding: "utf8", timeout: 8000, windowsHide: true });
+      const m = (r.stdout || "").match(/\{.*\}/);
+      return m ? JSON.parse(m[0]) : { removed: 0, freed_mb: 0 };
+    }
+    const verDir = path.join(os.homedir(), ".local", "share", "claude", "versions");
+    const activeReal = rt.binary && fs.existsSync(rt.binary) ? fs.realpathSync(rt.binary) : "";
+    let removed = 0;
+    let freed = 0;
+    if (fs.existsSync(verDir)) {
+      for (const name of fs.readdirSync(verDir)) {
+        const full = path.join(verDir, name);
+        try {
+          if (activeReal && fs.realpathSync(full) === activeReal) continue;
+          const st = fs.statSync(full);
+          freed += st.size || 0;
+          fs.rmSync(full, { recursive: true, force: true });
+          removed += 1;
+        } catch {}
+      }
+    }
+    return { removed, freed_mb: Math.round((freed / (1024 * 1024)) * 10) / 10 };
+  } catch {
+    return { removed: 0, freed_mb: 0 };
+  }
+}
+
+/**
+ * Clean up native Claude CLI `.jsonl` session files associated with deleted Studio sessions
+ * so repeated branching never leaves stray files behind.
+ */
+export function cleanupClaudeSessionFiles(cliSessionIds = []) {
+  const sids = [...new Set((cliSessionIds || []).filter((s) => typeof s === "string" && /^[a-z0-9-]{8,}$/i.test(s)))];
+  if (!sids.length) return 0;
+  let removed = 0;
+  const rt = detectClaudeRuntime(false);
+
+  if (rt.mode === "wsl") {
+    const script = `python3 - <<'PY'
+import os, glob
+sids = ${JSON.stringify(sids)}
+root = os.path.expanduser("~/.claude/projects")
+n = 0
+if os.path.isdir(root):
+    for sid in sids:
+        for p in glob.glob(os.path.join(root, "*", f"{sid}.jsonl")):
+            try:
+                os.unlink(p)
+                n += 1
+            except Exception:
+                pass
+print(n)
+PY`;
+    const r = spawnSync("wsl.exe", wslScriptArgs(script), { encoding: "utf8", timeout: 5000, windowsHide: true });
+    return Number((r.stdout || "").trim()) || 0;
+  }
+
+  const projRoot = path.join(os.homedir(), ".claude", "projects");
+  if (fs.existsSync(projRoot)) {
+    for (const dir of fs.readdirSync(projRoot)) {
+      const sub = path.join(projRoot, dir);
+      for (const sid of sids) {
+        const fp = path.join(sub, `${sid}.jsonl`);
+        if (fs.existsSync(fp)) {
+          try {
+            fs.unlinkSync(fp);
+            removed += 1;
+          } catch {}
+        }
+      }
+    }
+  }
+  return removed;
+}
+
+/**
+ * Install or switch Claude Code between `stable` and `latest` channels,
+ * preserve config/auth migration, and automatically clean up unused old versions!
  */
 export async function installOrSwitchClaudeVersion({ channel = "stable", forceNativeWin = false, onProgress } = {}) {
   const target = channel === "latest" ? "latest" : "stable";
   const rt = detectClaudeRuntime(true);
 
   logEvent("INFO", "claude_install", "start", `安装/切换原生 Claude Code -> ${target} (current=${rt.mode})`);
-  onProgress?.(`正在准备安装/切换原生 Claude Code (${target})…\n`);
+  onProgress?.(`正在准备安装/切换原生 Claude Code (${target})，将保留您的账号与配置…\n`);
 
-  let proc;
+  const runCmd = (spawnFn) =>
+    new Promise((resolve) => {
+      let output = "";
+      const proc = spawnFn();
+      const push = (chunk) => {
+        const s = chunk.toString("utf8");
+        output += s;
+        onProgress?.(s);
+      };
+      proc.stdout?.on("data", push);
+      proc.stderr?.on("data", push);
+      proc.on("error", (err) => resolve({ code: 1, output: output + `\n${err.message}` }));
+      proc.on("close", (code) => resolve({ code: code ?? 1, output }));
+    });
+
+  let runRes;
   if (rt.mode !== "missing" && !(forceNativeWin && rt.mode === "wsl")) {
-    // Already installed -> use official `claude install stable|latest`
-    proc = spawnClaudeProcess(rt, ["install", target, "--force"], {
-      cwd: os.homedir(),
-      env: {},
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    runRes = await runCmd(() =>
+      spawnClaudeProcess(rt, ["install", target, "--force"], {
+        cwd: os.homedir(),
+        env: {},
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    );
   } else if (process.platform === "win32") {
-    // Fresh native Windows installation via official Anthropic installer script
-    const psCmd = `irm https://claude.ai/install.ps1 | iex`;
-    proc = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd], {
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    onProgress?.("正在调用官方 Windows 安装脚本（若无代理受限将自动回退 npm 安装）…\n");
+    runRes = await runCmd(() =>
+      spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", `irm https://claude.ai/install.ps1 | iex`], {
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    );
+    if (runRes.code !== 0) {
+      onProgress?.(`\n官方直连安装未成功，正在自动回退 npm 安装 @anthropic-ai/claude-code@${target}…\n`);
+      runRes = await runCmd(() =>
+        spawn("cmd.exe", ["/c", "npm", "install", "-g", `@anthropic-ai/claude-code@${target}`], {
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        }),
+      );
+    }
   } else {
-    // Fresh macOS / Linux native installation
-    proc = spawn("bash", ["-lc", `curl -fsSL https://claude.ai/install.sh | bash -s ${target}`], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    onProgress?.("正在调用官方安装脚本（若无代理受限将自动回退 npm 安装）…\n");
+    runRes = await runCmd(() =>
+      spawn("bash", ["-lc", `curl -fsSL https://claude.ai/install.sh | bash -s ${target}`], {
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    );
+    if (runRes.code !== 0) {
+      onProgress?.(`\n官方直连安装未成功，正在自动回退 npm 安装 @anthropic-ai/claude-code@${target}…\n`);
+      runRes = await runCmd(() =>
+        spawn("npm", ["install", "-g", `@anthropic-ai/claude-code@${target}`], {
+          stdio: ["ignore", "pipe", "pipe"],
+        }),
+      );
+    }
   }
 
-  return await new Promise((resolve) => {
-    let output = "";
-    const push = (chunk) => {
-      const s = chunk.toString("utf8");
-      output += s;
-      onProgress?.(s);
-    };
-    proc.stdout?.on("data", push);
-    proc.stderr?.on("data", push);
-    proc.on("error", (err) => {
-      resolve({ ok: false, error: err.message, output });
-    });
-    proc.on("close", (code) => {
-      clearRuntimeCache();
-      const nextRt = getClaudeRuntimeAndAuth(true);
-      logEvent("INFO", "claude_install", "done", `Claude Code (${target}) 安装/切换结束 rc=${code}, version=${nextRt.version}`);
-      resolve({
-        ok: code === 0 && nextRt.installed,
-        code,
-        channel: target,
-        output: output.slice(-4000),
-        runtime: nextRt,
-      });
-    });
-  });
+  clearRuntimeCache();
+  const nextRt = getClaudeRuntimeAndAuth(true);
+  let cleanup = { removed: 0, freed_mb: 0 };
+  if (runRes.code === 0 && nextRt.installed) {
+    ensureClaudeDirectReady(nextRt);
+    cleanup = cleanupOldClaudeVersions(nextRt);
+    if (cleanup.removed > 0) {
+      onProgress?.(`\n[自动清理] 已保留现有配置完成迁移，并清理 ${cleanup.removed} 个旧版本二进制，释放约 ${cleanup.freed_mb} MB 空间。\n`);
+    } else {
+      onProgress?.("\n[迁移完成] 已保留原有账号与配置，无冗余旧版本残留。\n");
+    }
+  }
+
+  logEvent("INFO", "claude_install", "done", `Claude Code (${target}) 切换结束 rc=${runRes.code}, version=${nextRt.version}, cleaned=${cleanup.removed}`);
+  return {
+    ok: runRes.code === 0 && nextRt.installed,
+    code: runRes.code,
+    channel: target,
+    cleanup,
+    output: runRes.output.slice(-4000),
+    runtime: nextRt,
+  };
 }
 
 function buildCustomPromptAndMcp(cwd, rtMode) {
@@ -389,17 +761,36 @@ function buildCustomPromptAndMcp(cwd, rtMode) {
 
   const combined = [base, ...extraSections].filter(Boolean).join("\n\n");
 
-  // Materialize enabled installed MCPs into a temporary MCP config JSON for native Claude Code
+  // Sync enabled Skills into managed SKILL.md folder for full portability
+  const skillsDir = getPaths().skillsDir;
+  for (const s of skills) {
+    try {
+      const safeSlug = String(s.slug || s.id || "skill").replace(/[^a-z0-9_-]/gi, "-");
+      const dir = path.join(skillsDir, safeSlug);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "SKILL.md"), s.content || `# ${s.name}\n\n${s.description || ""}`, "utf8");
+    } catch {}
+  }
+
+  // Materialize enabled installed MCPs (both local stdio AND remote http/sse!) into active_mcp_config.json
   const mcps = listInstalledMcps().filter((m) => m.enabled);
   let mcpConfigPath = null;
   if (mcps.length) {
     const mcpObj = { mcpServers: {} };
     for (const m of mcps) {
-      mcpObj.mcpServers[m.name] = {
-        command: m.command,
-        args: m.args || [],
-        env: m.env || {},
-      };
+      if ((m.command === "http" || m.command === "sse" || m.command === "streamable-http") && m.args?.[0]) {
+        mcpObj.mcpServers[m.name] = {
+          type: m.command === "sse" ? "sse" : "http",
+          url: m.args[0],
+          ...(m.env && Object.keys(m.env).length ? { headers: m.env } : {}),
+        };
+      } else {
+        mcpObj.mcpServers[m.name] = {
+          command: m.command,
+          args: m.args || [],
+          env: m.env || {},
+        };
+      }
     }
     const fp = path.join(getPaths().mcpDir, "active_mcp_config.json");
     fs.writeFileSync(fp, JSON.stringify(mcpObj, null, 2), "utf8");
@@ -450,6 +841,10 @@ export async function runNativeClaudeCodeTurn({
     });
   }
 
+  if (provider.kind !== "claude_native") {
+    ensureClaudeDirectReady(rt);
+  }
+
   const latestUser = historyItems[historyItems.length - 1];
   const cap = detectModelCapabilities(model, provider.kind === "claude_native" ? "anthropic" : provider.kind, null, provider.model_overrides?.[model]);
   const { promptMode, promptText, mcpConfigPath } = buildCustomPromptAndMcp(cwd, rt.mode);
@@ -497,6 +892,8 @@ export async function runNativeClaudeCodeTurn({
     "--verbose",
     "--include-partial-messages",
     "--dangerously-skip-permissions",
+    // Ensure custom system prompt changes take effect immediately even on resumed sessions!
+    "--system-prompt-snapshot", "off",
     // Isolate from any legacy CC Switch / ~/.claude/settings.json overrides WITHOUT modifying user's files!
     "--setting-sources", "",
   ];

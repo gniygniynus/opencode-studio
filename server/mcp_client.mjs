@@ -22,6 +22,12 @@ class StdioMcpConnection {
   async start() {
     if (this.status === "ready" && this.proc) return;
     this.stop();
+    if (["http", "sse", "streamable-http"].includes(String(this.config.command || "").toLowerCase())) {
+      this.status = "remote_ready";
+      this.lastError = "";
+      logEvent("INFO", "mcp", "remote_ready", `远程 MCP [${this.config.name}] 已挂载 (${this.config.args?.[0] || ""})`);
+      return;
+    }
     this.status = "starting";
     this.lastError = "";
 

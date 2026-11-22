@@ -5,7 +5,7 @@
  * Can run standalone (`npm start`) or embedded inside Electron (`electron/main.mjs`).
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -15,10 +15,13 @@ import { WebSocketServer } from "ws";
 
 import { handleProviderProxyRequest } from "./api_proxy.mjs";
 import {
+  checkClaudeVersions,
+  cleanupClaudeSessionFiles,
   getClaudeRuntimeAndAuth,
   installOrSwitchClaudeVersion,
   runClaudeAuthLogin,
   runClaudeAuthLogout,
+  submitClaudeAuthCode,
 } from "./claude_runtime.mjs";
 import {
   activateProvider,
@@ -34,6 +37,7 @@ import {
   getAllSettings,
   getDb,
   getProvider,
+  getSessionMeta,
   getSessionTimeline,
   listCustomBackgrounds,
   listInstalledMcps,
@@ -63,6 +67,8 @@ import { SessionOrchestrator } from "./orchestrator.mjs";
 import { getPaths, PUBLIC_DIR } from "./paths.mjs";
 import {
   downloadRemoteSkillContent,
+  importPublicSkillFromUrl,
+  resolvePublicMcpImport,
   searchMcpStore,
   searchSkillsStore,
   searchWallpaperStore,
@@ -100,42 +106,83 @@ const ALLOWED_BG_MIMES = {
   "video/webm": ".webm",
 };
 
-function pickNativeDirectoryDialog() {
+function spawnAsyncStdout(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    const proc = spawn(cmd, args, { ...opts, stdio: ["ignore", "pipe", "pipe"] });
+    const timer = setTimeout(() => {
+      try { proc.kill(); } catch {}
+      resolve({ status: -1, stdout, stderr: stderr + " timeout" });
+    }, opts.timeout || 180000);
+    proc.stdout?.on("data", (d) => { stdout += d.toString("utf8"); });
+    proc.stderr?.on("data", (d) => { stderr += d.toString("utf8"); });
+    proc.on("error", (err) => { clearTimeout(timer); resolve({ status: -1, stdout, stderr: err.message }); });
+    proc.on("close", (code) => { clearTimeout(timer); resolve({ status: code ?? 0, stdout, stderr }); });
+  });
+}
+
+/**
+ * Async, non-blocking, ALWAYS-ON-TOP native OS directory picker dialog.
+ * Windows PowerShell 5.1 compatible (UTF-16LE -EncodedCommand, zero property crash, TopMost foreground owner).
+ */
+async function pickNativeDirectoryDialog(initialDir = "") {
   if (process.platform === "win32") {
+    const safeInit = String(initialDir || "").replace(/'/g, "''");
     const ps = `
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName System.Windows.Forms
-$f = New-Object System.Windows.Forms.Form
-$f.TopMost = $true
-$d = New-Object System.Windows.Forms.FolderBrowserDialog
-$d.Description = "选择 OpenCode Studio 工作目录"
-$d.UseDescriptionForTitle = $true
-$d.ShowNewFolderButton = $true
-if ($d.ShowDialog($f) -eq [System.Windows.Forms.DialogResult]::OK) {
-  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-  Write-Output $d.SelectedPath
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
+$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$owner.Show()
+$owner.Activate()
+$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+$dlg.Description = '选择 OpenCode Studio 工作目录'
+$dlg.ShowNewFolderButton = $true
+if ('${safeInit}' -and (Test-Path -LiteralPath '${safeInit}')) { $dlg.SelectedPath = '${safeInit}' }
+$res = $dlg.ShowDialog($owner)
+$owner.Close()
+$owner.Dispose()
+if ($res -eq [System.Windows.Forms.DialogResult]::OK -and $dlg.SelectedPath) {
+  Write-Output $dlg.SelectedPath
 }
 `;
-    const res = spawnSync("powershell.exe", ["-NoProfile", "-STA", "-Command", ps], {
-      encoding: "utf8",
-      timeout: 120000,
-      windowsHide: false,
+    const encoded = Buffer.from(ps, "utf16le").toString("base64");
+    const res = await spawnAsyncStdout("powershell.exe", ["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-EncodedCommand", encoded], {
+      windowsHide: true,
     });
-    return (res.stdout || "").trim() || null;
+    if (res.stderr.trim()) {
+      logEvent("WARN", "dirs", "pick_native_stderr", res.stderr.trim().slice(0, 300));
+    }
+    return res.stdout.trim() || null;
   }
   if (process.platform === "darwin") {
-    const res = spawnSync("osascript", ["-e", 'POSIX path of (choose folder with prompt "选择工作目录")'], {
-      encoding: "utf8",
-      timeout: 120000,
-    });
-    return (res.stdout || "").trim() || null;
+    const res = await spawnAsyncStdout("osascript", ["-e", 'POSIX path of (choose folder with prompt "选择工作目录")']);
+    return res.stdout.trim() || null;
   }
-  const z = spawnSync("zenity", ["--file-selection", "--directory", "--title=选择工作目录"], {
-    encoding: "utf8",
-    timeout: 120000,
-  });
+  const z = await spawnAsyncStdout("zenity", ["--file-selection", "--directory", "--title=选择工作目录"]);
   if (z.status === 0 && z.stdout.trim()) return z.stdout.trim();
-  const k = spawnSync("kdialog", ["--getexistingdirectory"], { encoding: "utf8", timeout: 120000 });
+  const k = await spawnAsyncStdout("kdialog", ["--getexistingdirectory"]);
   return k.status === 0 ? k.stdout.trim() || null : null;
+}
+
+function listAvailableDrives() {
+  const home = os.homedir();
+  if (process.platform === "win32") {
+    const drives = [];
+    for (let code = 67; code <= 90; code++) {
+      const root = `${String.fromCharCode(code)}:\\`;
+      try {
+        if (fs.existsSync(root)) drives.push(root);
+      } catch {}
+    }
+    return { platform: "win32", home, drives: drives.length ? drives : ["C:\\"] };
+  }
+  return { platform: process.platform, home, drives: [home, "/"] };
 }
 
 function sendJson(res, status, data) {
@@ -307,6 +354,9 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         const force = urlObj.searchParams.get("refresh") === "1";
         return sendJson(res, 200, getClaudeRuntimeAndAuth(force));
       }
+      if (method === "GET" && pathname === "/api/claude/versions") {
+        return sendJson(res, 200, await checkClaudeVersions());
+      }
       if (method === "POST" && pathname === "/api/claude/auth/login") {
         const body = await readJsonBody(req);
         const result = await runClaudeAuthLogin({
@@ -315,6 +365,12 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           onProgress: (ev) => broadcast({ type: "claude_auth_progress", ...ev }),
         });
         broadcast({ type: "claude_status_updated", claude_native: getClaudeRuntimeAndAuth(true) });
+        return sendJson(res, 200, result);
+      }
+      if (method === "POST" && pathname === "/api/claude/auth/submit-code") {
+        const body = await readJsonBody(req);
+        const result = await submitClaudeAuthCode(body.code || "");
+        if (result.runtime) broadcast({ type: "claude_status_updated", claude_native: result.runtime });
         return sendJson(res, 200, result);
       }
       if (method === "POST" && pathname === "/api/claude/auth/logout") {
@@ -427,7 +483,9 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       }
       if (method === "DELETE" && pathname.match(/^\/api\/sessions\/([^/]+)$/)) {
         const sid = pathname.split("/")[3];
+        const meta = getSessionMeta(sid);
         orchestrator.stopTurn(sid);
+        if (meta?.claude_cli_sid) cleanupClaudeSessionFiles([meta.claude_cli_sid]);
         deleteSession(sid);
         broadcast({ type: "session_deleted", session_id: sid });
         return sendJson(res, 200, { ok: true });
@@ -468,6 +526,15 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       if (method === "GET" && pathname === "/api/mcp") {
         return sendJson(res, 200, { items: mcpManager.getStatusList() });
       }
+      if (method === "POST" && pathname === "/api/mcp/import") {
+        const body = await readJsonBody(req);
+        const parsed = await resolvePublicMcpImport(body.input || "");
+        const saved = saveInstalledMcp({ ...parsed, enabled: true });
+        await mcpManager.restartServer(saved.id);
+        const items = mcpManager.getStatusList();
+        broadcast({ type: "mcp_updated", items });
+        return sendJson(res, 200, { ok: true, item: saved, items });
+      }
       if (method === "POST" && pathname === "/api/mcp") {
         const body = await readJsonBody(req);
         const saved = saveInstalledMcp(body);
@@ -498,6 +565,14 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       if (method === "GET" && pathname === "/api/skills") {
         return sendJson(res, 200, { items: listInstalledSkills() });
       }
+      if (method === "POST" && pathname === "/api/skills/import-url") {
+        const body = await readJsonBody(req);
+        const imported = await importPublicSkillFromUrl(body.url || "");
+        const saved = saveInstalledSkill(imported);
+        const items = listInstalledSkills();
+        broadcast({ type: "skills_updated", items });
+        return sendJson(res, 200, { ok: true, item: saved, items });
+      }
       if (method === "POST" && pathname === "/api/skills") {
         const body = await readJsonBody(req);
         const content = body.content || (await downloadRemoteSkillContent(body));
@@ -522,40 +597,66 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       }
       if (method === "GET" && pathname === "/api/wallpaper-proxy") {
         const rawUrl = urlObj.searchParams.get("url") || "";
-        // Strict open wallpaper allowlist: Wallhaven + Wikimedia Commons (prevents SSRF)
+        // Strict open wallpaper allowlist: Wallhaven + Wikimedia Commons (images + loop videos, prevents SSRF)
         if (
-          !/^https:\/\/(th\.wallhaven\.cc\/|w\.wallhaven\.cc\/|upload\.wikimedia\.org\/wikipedia\/commons\/|commons\.wikimedia\.org\/wiki\/Special:FilePath\/)/i.test(
+          !/^https:\/\/(th\.wallhaven\.cc\/|w\.wallhaven\.cc\/|upload\.wikimedia\.org\/wikipedia\/commons\/|thumb\.wikimedia\.org\/wikipedia\/commons\/|commons\.wikimedia\.org\/wiki\/Special:FilePath\/)/i.test(
             rawUrl,
           )
         ) {
-          return sendJson(res, 400, { error: "仅允许代理 Wallhaven / Wikimedia 开源壁纸图源" });
+          return sendJson(res, 400, { error: "仅允许代理 Wallhaven / Wikimedia 开源壁纸与动态视频源" });
         }
         const hash = crypto.createHash("sha1").update(rawUrl).digest("hex");
         const cachePath = path.join(paths.backgroundsDir, `wp_cache_${hash}`);
         const metaPath = `${cachePath}.mime`;
-        if (fs.existsSync(cachePath) && fs.existsSync(metaPath)) {
-          const mime = fs.readFileSync(metaPath, "utf8").trim() || "image/jpeg";
-          res.writeHead(200, { "Content-Type": mime, "Cache-Control": "public, max-age=86400" });
+
+        const serveCachedFile = () => {
+          const mime = fs.readFileSync(metaPath, "utf8").trim() || "application/octet-stream";
+          const total = fs.statSync(cachePath).size;
+          const range = req.headers.range;
+          if (range && mime.startsWith("video/")) {
+            const m = range.match(/bytes=(\d*)-(\d*)/);
+            const start = m && m[1] ? Number(m[1]) : 0;
+            const end = m && m[2] ? Math.min(Number(m[2]), total - 1) : total - 1;
+            res.writeHead(206, {
+              "Content-Type": mime,
+              "Content-Range": `bytes ${start}-${end}/${total}`,
+              "Accept-Ranges": "bytes",
+              "Content-Length": end - start + 1,
+              "Cache-Control": "public, max-age=86400",
+            });
+            return fs.createReadStream(cachePath, { start, end }).pipe(res);
+          }
+          res.writeHead(200, {
+            "Content-Type": mime,
+            "Content-Length": total,
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=86400",
+          });
           return fs.createReadStream(cachePath).pipe(res);
+        };
+
+        if (fs.existsSync(cachePath) && fs.existsSync(metaPath)) {
+          return serveCachedFile();
         }
         try {
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 14000);
+          const timer = setTimeout(() => controller.abort(), 25000);
           const upstream = await fetch(rawUrl, {
-            headers: { "User-Agent": "OpenCodeStudio/1.0 (+https://github.com/gniygniynus/opencode-studio)" },
+            headers: { "User-Agent": "OpenCodeStudio/1.1 (+https://github.com/gniygniynus/opencode-studio)" },
             signal: controller.signal,
           });
           clearTimeout(timer);
           if (!upstream.ok) return sendJson(res, 502, { error: `上游图源 HTTP ${upstream.status}` });
           const mime = (upstream.headers.get("content-type") || "image/jpeg").split(";")[0];
-          if (!mime.startsWith("image/")) return sendJson(res, 502, { error: "上游返回的不是图片" });
+          if (!mime.startsWith("image/") && !mime.startsWith("video/")) {
+            return sendJson(res, 502, { error: `上游媒体类型不支持: ${mime}` });
+          }
           const buf = Buffer.from(await upstream.arrayBuffer());
           fs.writeFileSync(cachePath, buf);
           fs.writeFileSync(metaPath, mime, "utf8");
-          res.writeHead(200, { "Content-Type": mime, "Cache-Control": "public, max-age=86400" });
-          return res.end(buf);
+          return serveCachedFile();
         } catch (err) {
-          return sendJson(res, 502, { error: `拉取壁纸失败: ${err.message}` });
+          return sendJson(res, 502, { error: `拉取壁纸资源失败: ${err.message}` });
         }
       }
       if (method === "POST" && pathname === "/api/backgrounds/upload") {
@@ -626,8 +727,27 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         const target = urlObj.searchParams.get("path") || "";
         return sendJson(res, 200, listDirectorySafe(target));
       }
+      if (method === "GET" && pathname === "/api/dirs/drives") {
+        return sendJson(res, 200, listAvailableDrives());
+      }
+      if (method === "POST" && pathname === "/api/dirs/ensure") {
+        const body = await readJsonBody(req);
+        const drive = String(body.drive || "").trim();
+        const subpath = String(body.subpath || "").trim().replace(/^[\\/]+/, "");
+        const fullRaw = String(body.full_path || "").trim();
+        let target = fullRaw || (drive ? path.join(drive, subpath) : subpath);
+        if (!target) return sendJson(res, 400, { ok: false, error: "请输入文件夹名称或路径" });
+        target = path.resolve(target);
+        const existed = fs.existsSync(target);
+        if (existed && !fs.statSync(target).isDirectory()) {
+          return sendJson(res, 400, { ok: false, error: "该路径已存在同名文件，无法作为文件夹" });
+        }
+        fs.mkdirSync(target, { recursive: true });
+        return sendJson(res, 200, { ok: true, path: target, created: !existed });
+      }
       if (method === "POST" && pathname === "/api/dirs/pick-native") {
-        const picked = pickNativeDirectoryDialog();
+        const body = await readJsonBody(req).catch(() => ({}));
+        const picked = await pickNativeDirectoryDialog(body.initial_dir || "");
         return sendJson(res, 200, { ok: Boolean(picked), path: picked });
       }
       if (method === "GET" && pathname === "/api/files") {

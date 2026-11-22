@@ -171,65 +171,149 @@ function proxyImageUrl(raw) {
   return `/api/wallpaper-proxy?url=${encodeURIComponent(raw)}`;
 }
 
-// Built-in 60fps Canvas live wallpapers (zero bandwidth, super smooth, optional pause)
+// Built-in 60fps Canvas live wallpapers (12 curated themes, zero bandwidth, searchable by Chinese & English)
 export const LIVE_WALLPAPERS = [
   {
     id: "live-aurora",
     name: "动态 · 极光流影",
+    description: "60fps 北极光柔和丝带流动",
     author: "Live Canvas",
-    license: "MIT",
+    license: "60fps 动态",
     type: "live",
     liveBg: "live-aurora",
+    tags: ["极光", "夜空", "aurora", "渐变"],
     url: "",
     preview_css: "linear-gradient(135deg, #0f2027 0%, #203a43 45%, #2c5364 100%)",
   },
   {
     id: "live-starfield",
     name: "动态 · 深空星河",
+    description: "60fps 深空穿梭星尘与流星",
     author: "Live Canvas",
-    license: "MIT",
+    license: "60fps 动态",
     type: "live",
     liveBg: "live-starfield",
+    tags: ["星空", "宇宙", "stars", "galaxy", "暗黑"],
     url: "",
     preview_css: "radial-gradient(circle at 30% 30%, #1b2845 0%, #090c14 75%)",
   },
   {
+    id: "live-sakura",
+    name: "动态 · 落樱微风",
+    description: "60fps 温柔粉色樱花花瓣飘落",
+    author: "Live Canvas",
+    license: "60fps 动态",
+    type: "live",
+    liveBg: "live-sakura",
+    tags: ["樱花", "治愈", "动漫", "sakura", "粉色", "春季"],
+    url: "",
+    preview_css: "linear-gradient(135deg, #fde2e4 0%, #fad2e1 48%, #e2ece9 100%)",
+  },
+  {
+    id: "live-rain",
+    name: "动态 · 细雨涟漪",
+    description: "60fps 宁静雨滴与水面波纹",
+    author: "Live Canvas",
+    license: "60fps 动态",
+    type: "live",
+    liveBg: "live-rain",
+    tags: ["雨", "治愈", "护眼", "rain", "蓝调"],
+    url: "",
+    preview_css: "linear-gradient(160deg, #1d3557 0%, #2b4c7e 55%, #162447 100%)",
+  },
+  {
+    id: "live-nebula",
+    name: "动态 · 紫金星云",
+    description: "60fps 绚丽宇宙星云流体粒子",
+    author: "Live Canvas",
+    license: "60fps 动态",
+    type: "live",
+    liveBg: "live-nebula",
+    tags: ["星云", "星空", "宇宙", "nebula", "科幻"],
+    url: "",
+    preview_css: "radial-gradient(circle at 25% 30%, #4c1d95 0%, #1e1b4b 50%, #090a1a 100%)",
+  },
+  {
     id: "live-mesh",
     name: "动态 · 莫兰迪柔雾",
+    description: "60fps 浅色护眼呼吸流光渐变",
     author: "Live Canvas",
-    license: "MIT",
+    license: "60fps 动态",
     type: "live",
     liveBg: "live-mesh",
+    tags: ["极简", "浅色", "护眼", "minimal", "治愈"],
     url: "",
     preview_css: "linear-gradient(125deg, #dfe9f3 0%, #f3e7e9 50%, #e3eeff 100%)",
   },
   {
+    id: "live-ink",
+    name: "动态 · 水墨山岚",
+    description: "60fps 国风远山云雾缓缓流淌",
+    author: "Live Canvas",
+    license: "60fps 动态",
+    type: "live",
+    liveBg: "live-ink",
+    tags: ["水墨", "古风", "山水", "风景", "浅色", "护眼"],
+    url: "",
+    preview_css: "linear-gradient(180deg, #eef2f3 0%, #cfd8dc 55%, #78909c 100%)",
+  },
+  {
     id: "live-waves",
     name: "动态 · 深海光波",
+    description: "60fps 幽蓝海浪层叠律动",
     author: "Live Canvas",
-    license: "MIT",
+    license: "60fps 动态",
     type: "live",
     liveBg: "live-waves",
+    tags: ["海洋", "海浪", "ocean", "蓝色"],
     url: "",
     preview_css: "linear-gradient(160deg, #134e5e 0%, #1a2a6c 60%, #0f172a 100%)",
   },
   {
+    id: "live-sunset",
+    name: "动态 · 日落霓虹波浪",
+    description: "60fps 蒸汽波落日与赛博网格",
+    author: "Live Canvas",
+    license: "60fps 动态",
+    type: "live",
+    liveBg: "live-sunset",
+    tags: ["日落", "赛博", "赛博朋克", "cyberpunk", "sunset"],
+    url: "",
+    preview_css: "linear-gradient(180deg, #2b1055 0%, #753a88 45%, #f2709c 80%, #ff9472 100%)",
+  },
+  {
+    id: "live-snow",
+    name: "动态 · 静谧雪夜",
+    description: "60fps 柔光冬夜雪花轻飘",
+    author: "Live Canvas",
+    license: "60fps 动态",
+    type: "live",
+    liveBg: "live-snow",
+    tags: ["雪", "雪山", "冬日", "snow", "夜空"],
+    url: "",
+    preview_css: "linear-gradient(180deg, #0f172a 0%, #1e293b 55%, #334155 100%)",
+  },
+  {
     id: "live-constellation",
     name: "动态 · 几何呼吸星网",
+    description: "60fps 极简科技感动态连线星阵",
     author: "Live Canvas",
-    license: "MIT",
+    license: "60fps 动态",
     type: "live",
     liveBg: "live-constellation",
+    tags: ["极简", "科技", "科幻", "几何", "minimal"],
     url: "",
     preview_css: "linear-gradient(135deg, #16222a 0%, #3a6073 100%)",
   },
   {
     id: "live-matrix",
     name: "动态 · 赛博微光代码雨",
+    description: "60fps 经典黑客帝国翠绿代码雨",
     author: "Live Canvas",
-    license: "MIT",
+    license: "60fps 动态",
     type: "live",
     liveBg: "live-matrix",
+    tags: ["赛博", "代码", "暗黑", "matrix", "编程"],
     url: "",
     preview_css: "linear-gradient(180deg, #07140d 0%, #0d2b1d 60%, #050a08 100%)",
   },
@@ -352,136 +436,363 @@ async function fetchJsonWithTimeout(url, timeoutMs = 10000) {
   }
 }
 
-// ==================== ONLINE SEARCH: MCP STORE ====================
-export async function searchMcpStore(query = "") {
-  const q = String(query || "").trim();
-  if (!q) {
-    return { ok: true, mode: "curated", items: CURATED_MCPS, online_note: "输入关键词可联网搜索 npm 与 GitHub 开源 MCP 服务" };
-  }
+// ==================== ONLINE SEARCH: MCP STORE (OFFICIAL REGISTRY + NPM + GITHUB) ====================
+function parseRegistryMcpEntry(entry) {
+  const s = entry?.server || entry;
+  if (!s?.name) return null;
+  const shortName = s.name.split("/").pop().replace(/[^a-z0-9_-]/gi, "-").toLowerCase() || "mcp";
 
-  const localHits = CURATED_MCPS.filter((m) =>
-    `${m.name} ${m.title} ${m.description} ${(m.tags || []).join(" ")}`.toLowerCase().includes(q.toLowerCase()),
-  );
+  // 1) Remote Streamable-HTTP / SSE MCP
+  const remote = (s.remotes || []).find((r) => r?.url);
+  // 2) Local npm / pypi package
+  const npmPkg = (s.packages || []).find((p) => p?.registryType === "npm" && p?.identifier);
+  const pyPkg = (s.packages || []).find((p) => p?.registryType === "pypi" && p?.identifier);
 
-  const onlineItems = [];
-  let onlineError = "";
+  let command = "npx";
+  let args = [];
+  let transportTag = "npx";
+  const envHints = [];
 
-  // Search npm registry for open-source MCP servers (fast, no auth needed, directly npx-installable!)
-  try {
-    const npmUrl = `https://registry.npmjs.org/-/v1/search?text=${encodeURIComponent(`mcp ${q}`)}&size=14`;
-    const npmData = await fetchJsonWithTimeout(npmUrl, 9000);
-    for (const obj of npmData.objects || []) {
-      const pkg = obj.package || {};
-      if (!pkg.name) continue;
-      onlineItems.push({
-        id: `npm-${pkg.name.replace(/[^a-z0-9]/gi, "-")}`,
-        name: pkg.name.split("/").pop().replace(/^mcp-server-|^server-/, "") || pkg.name,
-        title: `${pkg.name} (v${pkg.version || "latest"})`,
-        description: pkg.description || "开源 npm MCP 包",
-        command: "npx",
-        args: ["-y", pkg.name],
-        env_hints: [],
-        repo_url: pkg.links?.repository || pkg.links?.npm || "",
-        tags: ["npm", "online"],
-        source: "npm",
-      });
+  if (npmPkg) {
+    command = "npx";
+    args = ["-y", npmPkg.identifier];
+    transportTag = "npx";
+    for (const ev of npmPkg.environmentVariables || []) {
+      if (ev?.name) envHints.push(ev.name);
     }
-  } catch (err) {
-    onlineError = `npm 联网搜索失败: ${err.message}`;
-    logEvent("WARN", "stores", "mcp_npm_search_err", onlineError);
-  }
-
-  // Also search GitHub open-source MCP repos
-  try {
-    const ghUrl = `https://api.github.com/search/repositories?q=${encodeURIComponent(`${q} mcp server`)}&sort=stars&per_page=8`;
-    const ghData = await fetchJsonWithTimeout(ghUrl, 9000);
-    for (const repo of ghData.items || []) {
-      onlineItems.push({
-        id: `gh-${repo.id}`,
-        name: repo.name.replace(/[^a-z0-9_-]/gi, "-").toLowerCase(),
-        title: `${repo.full_name} (★ ${repo.stargazers_count || 0})`,
-        description: repo.description || "GitHub 开源 MCP 仓库",
-        command: "npx",
-        args: ["-y", repo.name],
-        env_hints: [],
-        repo_url: repo.html_url,
-        tags: ["github", `★${repo.stargazers_count || 0}`],
-        source: "github",
-      });
+  } else if (pyPkg) {
+    command = "uvx";
+    args = [pyPkg.identifier];
+    transportTag = "uvx";
+    for (const ev of pyPkg.environmentVariables || []) {
+      if (ev?.name) envHints.push(ev.name);
     }
-  } catch (err) {
-    if (!onlineError) onlineError = `GitHub 联网搜索受限: ${err.message}`;
+  } else if (remote) {
+    command = remote.type === "sse" ? "sse" : "http";
+    args = [remote.url];
+    transportTag = remote.type === "sse" ? "SSE远程" : "HTTP远程";
+  } else {
+    return null;
   }
 
-  const dedup = new Map();
-  for (const item of [...localHits, ...onlineItems]) {
-    if (!dedup.has(item.id)) dedup.set(item.id, item);
-  }
   return {
-    ok: true,
-    mode: "online",
-    query: q,
-    items: [...dedup.values()].slice(0, 24),
-    online_error: onlineError,
+    id: `reg-${s.name.replace(/[^a-z0-9]/gi, "-")}`,
+    name: shortName,
+    title: `${s.name}${s.version ? ` (v${s.version})` : ""}`,
+    description: s.description || `官方 MCP Registry 登记服务 (${transportTag})`,
+    command,
+    args,
+    env_hints: envHints.slice(0, 6),
+    repo_url: s.repository?.url || s.websiteUrl || "",
+    tags: ["官方Registry", transportTag],
+    source: "registry",
   };
 }
 
-// ==================== ONLINE SEARCH: SKILLS STORE ====================
-export async function searchSkillsStore(query = "") {
+export async function searchMcpStore(query = "") {
   const q = String(query || "").trim();
-  if (!q) {
-    return { ok: true, mode: "curated", items: CURATED_SKILLS, online_note: "输入关键词可联网搜索 GitHub 开源 Agent Skills" };
+  const localHits = q
+    ? CURATED_MCPS.filter((m) =>
+        `${m.name} ${m.title} ${m.description} ${(m.tags || []).join(" ")}`.toLowerCase().includes(q.toLowerCase()),
+      )
+    : CURATED_MCPS;
+
+  const onlineItems = [];
+  const errors = [];
+
+  // Run Official MCP Registry + npm + GitHub in parallel for maximum public coverage!
+  const tasks = [
+    // 1. Official MCP Registry (covers thousands of public stdio + remote HTTP/SSE MCPs)
+    (async () => {
+      try {
+        const regUrl = q
+          ? `https://registry.modelcontextprotocol.io/v0/servers?search=${encodeURIComponent(q)}&limit=18`
+          : `https://registry.modelcontextprotocol.io/v0/servers?limit=12`;
+        const data = await fetchJsonWithTimeout(regUrl, 8500);
+        for (const entry of data.servers || []) {
+          const parsed = parseRegistryMcpEntry(entry);
+          if (parsed) onlineItems.push(parsed);
+        }
+      } catch (err) {
+        errors.push(`官方Registry: ${err.message}`);
+      }
+    })(),
+  ];
+
+  if (q) {
+    // 2. npm Registry (all public JS/TS MCP packages)
+    tasks.push(
+      (async () => {
+        try {
+          const npmUrl = `https://registry.npmjs.org/-/v1/search?text=${encodeURIComponent(`mcp ${q}`)}&size=14`;
+          const npmData = await fetchJsonWithTimeout(npmUrl, 8500);
+          for (const obj of npmData.objects || []) {
+            const pkg = obj.package || {};
+            if (!pkg.name) continue;
+            onlineItems.push({
+              id: `npm-${pkg.name.replace(/[^a-z0-9]/gi, "-")}`,
+              name: pkg.name.split("/").pop().replace(/^mcp-server-|^server-/, "") || pkg.name,
+              title: `${pkg.name} (v${pkg.version || "latest"})`,
+              description: pkg.description || `公开 npm MCP 包，使用 npx -y ${pkg.name} 一键启动。`,
+              command: "npx",
+              args: ["-y", pkg.name],
+              env_hints: [],
+              repo_url: pkg.links?.repository || pkg.links?.npm || "",
+              tags: ["npm", "npx"],
+              source: "npm",
+            });
+          }
+        } catch (err) {
+          errors.push(`npm: ${err.message}`);
+        }
+      })(),
+    );
+
+    // 3. GitHub open-source MCP repos (auto-detect Python uvx vs Node npx!)
+    tasks.push(
+      (async () => {
+        try {
+          const ghUrl = `https://api.github.com/search/repositories?q=${encodeURIComponent(`${q} mcp server`)}&sort=stars&per_page=10`;
+          const ghData = await fetchJsonWithTimeout(ghUrl, 8500);
+          for (const repo of ghData.items || []) {
+            const isPy = String(repo.language || "").toLowerCase() === "python";
+            onlineItems.push({
+              id: `gh-${repo.id}`,
+              name: repo.name.replace(/[^a-z0-9_-]/gi, "-").toLowerCase(),
+              title: `${repo.full_name} (★ ${repo.stargazers_count || 0})`,
+              description: repo.description || `GitHub 公开 MCP 仓库 (${repo.language || "开源"})`,
+              command: isPy ? "uvx" : "npx",
+              args: isPy ? [repo.name] : ["-y", repo.name],
+              env_hints: [],
+              repo_url: repo.html_url,
+              tags: ["GitHub", isPy ? "uvx" : "npx", `★${repo.stargazers_count || 0}`],
+              source: "github",
+            });
+          }
+        } catch (err) {
+          errors.push(`GitHub: ${err.message}`);
+        }
+      })(),
+    );
   }
 
-  const localHits = CURATED_SKILLS.filter((s) =>
+  await Promise.all(tasks);
+
+  const dedup = new Map();
+  for (const item of [...localHits, ...onlineItems]) {
+    const key = item.name + "::" + item.command + "::" + (item.args || []).join(" ");
+    if (!dedup.has(key)) dedup.set(key, item);
+  }
+  return {
+    ok: true,
+    mode: q ? "online" : "curated+registry",
+    query: q,
+    items: [...dedup.values()].slice(0, 36),
+    online_error: errors.length && !onlineItems.length ? errors.join("；") : "",
+  };
+}
+
+/**
+ * Parse ANY public MCP input: Remote HTTP/SSE URL, npm package, uvx/PyPI package,
+ * GitHub repo URL, or pasted JSON (`{"mcpServers": ...}`).
+ */
+export async function resolvePublicMcpImport(rawInput) {
+  const raw = String(rawInput || "").trim();
+  if (!raw) throw new Error("请输入公开 MCP 的包名、URL、GitHub 地址或 JSON 配置");
+
+  // 1) JSON config block
+  if (raw.startsWith("{")) {
+    const obj = JSON.parse(raw);
+    const map = obj.mcpServers || obj;
+    const [firstName, cfg] = Object.entries(map)[0] || [];
+    if (!firstName || !cfg) throw new Error("JSON 中未找到有效的 MCP 配置对象");
+    if (cfg.url) {
+      return {
+        name: firstName,
+        description: `JSON 导入远程 MCP (${cfg.url})`,
+        command: cfg.type === "sse" ? "sse" : "http",
+        args: [cfg.url],
+        env: cfg.headers || cfg.env || {},
+      };
+    }
+    return {
+      name: firstName,
+      description: `JSON 导入本地 MCP (${cfg.command || "npx"})`,
+      command: cfg.command || "npx",
+      args: Array.isArray(cfg.args) ? cfg.args : [],
+      env: cfg.env || {},
+    };
+  }
+
+  // 2) Remote HTTP/SSE MCP endpoint (not github.com)
+  if (/^https?:\/\//i.test(raw) && !/github\.com\//i.test(raw)) {
+    const u = new URL(raw);
+    const name = u.hostname.replace(/^mcp\./, "").split(".")[0] || "remote-mcp";
+    const isSse = /sse/i.test(u.pathname);
+    return {
+      name,
+      description: `远程公开 MCP 服务 (${raw})`,
+      command: isSse ? "sse" : "http",
+      args: [raw],
+      env: {},
+    };
+  }
+
+  // 3) GitHub repository URL -> inspect package.json / pyproject.toml
+  const ghMatch = raw.match(/github\.com\/([^/]+)\/([^/#?]+)/i);
+  if (ghMatch) {
+    const owner = ghMatch[1];
+    const repo = ghMatch[2].replace(/\.git$/i, "");
+    let description = `GitHub 公开 MCP (${owner}/${repo})`;
+    let command = "npx";
+    let args = ["-y", repo];
+    try {
+      const meta = await fetchJsonWithTimeout(`https://api.github.com/repos/${owner}/${repo}`, 6000);
+      if (meta.description) description = meta.description;
+      const br = meta.default_branch || "main";
+      try {
+        const pkg = await fetchJsonWithTimeout(`https://raw.githubusercontent.com/${owner}/${repo}/${br}/package.json`, 5000);
+        if (pkg?.name) {
+          command = "npx";
+          args = ["-y", pkg.name];
+        }
+      } catch {
+        if (String(meta.language || "").toLowerCase() === "python") {
+          command = "uvx";
+          args = [repo];
+        }
+      }
+    } catch {}
+    return { name: repo.toLowerCase(), description, command, args, env: {} };
+  }
+
+  // 4) Direct command line (e.g. `npx -y @org/pkg` or `uvx mcp-server-git`)
+  if (/^(npx|uvx|node|python|python3|docker)\s+/i.test(raw)) {
+    const parts = raw.split(/\s+/);
+    const name = parts[parts.length - 1].split("/").pop().replace(/@.*$/, "").replace(/[^a-z0-9_-]/gi, "-") || "custom-mcp";
+    return { name, description: `命令行 MCP: ${raw}`, command: parts[0], args: parts.slice(1), env: {} };
+  }
+
+  // 5) Plain npm package name (e.g. `@modelcontextprotocol/server-postgres`)
+  const name = raw.split("/").pop().replace(/@.*$/, "").replace(/^mcp-server-|^server-/, "") || "mcp";
+  return { name, description: `公开 npm MCP 包 (${raw})`, command: "npx", args: ["-y", raw], env: {} };
+}
+
+// ==================== ONLINE SEARCH: SKILLS STORE (OFFICIAL ANTHROPIC + GITHUB + ANY PUBLIC URL) ====================
+let _cachedOfficialSkills = null;
+let _cachedOfficialAt = 0;
+
+function parseSkillFrontmatter(mdText) {
+  const m = String(mdText || "").match(/^---\s*\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return {};
+  const out = {};
+  for (const line of m[1].split(/\r?\n/)) {
+    const kv = line.match(/^([a-zA-Z0-9_-]+)\s*:\s*(.+)$/);
+    if (kv) out[kv[1].trim().toLowerCase()] = kv[2].trim().replace(/^["']|["']$/g, "");
+  }
+  return out;
+}
+
+async function fetchAnthropicOfficialSkills() {
+  if (_cachedOfficialSkills && Date.now() - _cachedOfficialAt < 30 * 60 * 1000) {
+    return _cachedOfficialSkills;
+  }
+  try {
+    const dirs = await fetchJsonWithTimeout("https://api.github.com/repos/anthropics/skills/contents/skills", 8000);
+    if (!Array.isArray(dirs)) return [];
+    const list = dirs
+      .filter((d) => d.type === "dir" && d.name)
+      .slice(0, 16)
+      .map((d) => ({
+        id: `anth-skill-${d.name}`,
+        slug: d.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"),
+        name: `${d.name} (Anthropic 官方开源)`,
+        description: `来自官方开源仓库 anthropics/skills 的 /${d.name} 技能，点击即可下载完整 SKILL.md 并启用。`,
+        source_url: d.html_url || `https://github.com/anthropics/skills/tree/main/skills/${d.name}`,
+        raw_skill_url: `https://raw.githubusercontent.com/anthropics/skills/main/skills/${d.name}/SKILL.md`,
+        github_full_name: "anthropics/skills",
+        default_branch: "main",
+        tags: ["官方开源", "SKILL.md"],
+        content: "",
+      }));
+    _cachedOfficialSkills = list;
+    _cachedOfficialAt = Date.now();
+    return list;
+  } catch {
+    return [];
+  }
+}
+
+export async function searchSkillsStore(query = "") {
+  const q = String(query || "").trim();
+  const official = await fetchAnthropicOfficialSkills();
+  const baseCatalog = [...CURATED_SKILLS, ...official];
+
+  if (!q) {
+    return {
+      ok: true,
+      mode: "curated+official",
+      items: baseCatalog,
+      online_note: "已加载精选与官方开源 Skills，输入关键词可实时搜索全网 GitHub 公开 Skills，或直接粘贴任意公开链接导入",
+    };
+  }
+
+  const localHits = baseCatalog.filter((s) =>
     `${s.name} ${s.slug} ${s.description} ${(s.tags || []).join(" ")}`.toLowerCase().includes(q.toLowerCase()),
   );
 
   const onlineItems = [];
   let onlineError = "";
   try {
-    const ghUrl = `https://api.github.com/search/repositories?q=${encodeURIComponent(`${q} claude skill OR agent skill`)}&sort=stars&per_page=10`;
+    const ghUrl = `https://api.github.com/search/repositories?q=${encodeURIComponent(`${q} (claude-skill OR agent-skill OR "SKILL.md" OR claude skill)`)}&sort=stars&per_page=14`;
     const ghData = await fetchJsonWithTimeout(ghUrl, 9000);
     for (const repo of ghData.items || []) {
       onlineItems.push({
         id: `gh-skill-${repo.id}`,
         slug: repo.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"),
         name: `${repo.name} (★ ${repo.stargazers_count || 0})`,
-        description: repo.description || `来自 ${repo.full_name} 的开源 Skill 仓库`,
+        description: repo.description || `来自 ${repo.full_name} 的 GitHub 公开 Skill，安装时自动拉取 SKILL.md 与说明。`,
         source_url: repo.html_url,
         github_full_name: repo.full_name,
         default_branch: repo.default_branch || "main",
-        tags: ["github", "online"],
-        content: "", // fetched live upon install
+        tags: ["GitHub", `★${repo.stargazers_count || 0}`],
+        content: "",
       });
     }
   } catch (err) {
-    onlineError = `GitHub Skills 联网搜索失败: ${err.message}`;
+    onlineError = `GitHub Skills 联网搜索受限: ${err.message}`;
     logEvent("WARN", "stores", "skills_search_err", onlineError);
   }
 
+  const dedup = new Map();
+  for (const it of [...localHits, ...onlineItems]) {
+    if (!dedup.has(it.slug)) dedup.set(it.slug, it);
+  }
   return {
     ok: true,
     mode: "online",
     query: q,
-    items: [...localHits, ...onlineItems].slice(0, 20),
+    items: [...dedup.values()].slice(0, 28),
     online_error: onlineError,
   };
 }
 
 /**
- * Download SKILL.md (or README.md fallback) from an open-source GitHub repo when user clicks Install.
+ * Download SKILL.md (or README.md fallback) from ANY public GitHub repo or direct SKILL.md URL!
  */
 export async function downloadRemoteSkillContent(item) {
   if (item.content && item.content.trim()) return item.content;
-  if (!item.github_full_name) return `# ${item.name}\n\n${item.description || ""}`;
-
-  const branch = item.default_branch || "main";
-  const candidates = [
-    `https://raw.githubusercontent.com/${item.github_full_name}/${branch}/SKILL.md`,
-    `https://raw.githubusercontent.com/${item.github_full_name}/${branch}/skill.md`,
-    `https://raw.githubusercontent.com/${item.github_full_name}/${branch}/README.md`,
-  ];
+  const candidates = [];
+  if (item.raw_skill_url) candidates.push(item.raw_skill_url);
+  if (item.github_full_name) {
+    const branch = item.default_branch || "main";
+    candidates.push(
+      `https://raw.githubusercontent.com/${item.github_full_name}/${branch}/SKILL.md`,
+      `https://raw.githubusercontent.com/${item.github_full_name}/${branch}/skill.md`,
+      `https://raw.githubusercontent.com/${item.github_full_name}/${branch}/skills/${item.slug}/SKILL.md`,
+      `https://raw.githubusercontent.com/${item.github_full_name}/${branch}/README.md`,
+    );
+  }
   for (const url of candidates) {
     try {
       const controller = new AbortController();
@@ -490,25 +801,163 @@ export async function downloadRemoteSkillContent(item) {
       clearTimeout(timer);
       if (res.ok) {
         const text = await res.text();
-        if (text.trim().length > 20) return text.slice(0, 20000);
+        if (text.trim().length > 20) return text.slice(0, 24000);
       }
     } catch {
       // try next candidate
     }
   }
-  return `# ${item.name}\n\n来源: ${item.source_url}\n\n${item.description || ""}`;
+  return `# ${item.name}\n\n来源: ${item.source_url || ""}\n\n${item.description || ""}`;
 }
 
-// ==================== ONLINE SEARCH: MASSIVE OPEN WALLPAPER STORE (WALLHAVEN 4K + WIKIMEDIA + LIVE) ====================
+export async function importPublicSkillFromUrl(rawUrl) {
+  const clean = String(rawUrl || "").trim();
+  if (!/^https?:\/\//i.test(clean)) throw new Error("请输入以 http:// 或 https:// 开头的公开 GitHub 仓库或 SKILL.md 链接");
+
+  let fetchUrls = [clean];
+  let fallbackSlug = "imported-skill";
+
+  // Convert github.com/owner/repo/blob/branch/path -> raw.githubusercontent.com
+  const blobMatch = clean.match(/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)/i);
+  const treeMatch = clean.match(/github\.com\/([^/]+)\/([^/]+)\/tree\/([^/]+)\/(.+)/i);
+  const repoMatch = clean.match(/github\.com\/([^/]+)\/([^/#?]+)\/?$/i);
+
+  if (blobMatch) {
+    fetchUrls = [`https://raw.githubusercontent.com/${blobMatch[1]}/${blobMatch[2]}/${blobMatch[3]}/${blobMatch[4]}`];
+    fallbackSlug = blobMatch[4].split("/").slice(-2, -1)[0] || blobMatch[2];
+  } else if (treeMatch) {
+    const sub = treeMatch[4].replace(/\/$/, "");
+    fetchUrls = [
+      `https://raw.githubusercontent.com/${treeMatch[1]}/${treeMatch[2]}/${treeMatch[3]}/${sub}/SKILL.md`,
+      `https://raw.githubusercontent.com/${treeMatch[1]}/${treeMatch[2]}/${treeMatch[3]}/${sub}/README.md`,
+    ];
+    fallbackSlug = sub.split("/").pop() || treeMatch[2];
+  } else if (repoMatch) {
+    const [, owner, repoRaw] = repoMatch;
+    const repo = repoRaw.replace(/\.git$/i, "");
+    fallbackSlug = repo;
+    fetchUrls = [
+      `https://raw.githubusercontent.com/${owner}/${repo}/main/SKILL.md`,
+      `https://raw.githubusercontent.com/${owner}/${repo}/master/SKILL.md`,
+      `https://raw.githubusercontent.com/${owner}/${repo}/main/README.md`,
+    ];
+  }
+
+  let content = "";
+  for (const u of fetchUrls) {
+    try {
+      const c = new AbortController();
+      const t = setTimeout(() => c.abort(), 8000);
+      const r = await fetch(u, { headers: { "User-Agent": USER_AGENT }, signal: c.signal });
+      clearTimeout(t);
+      if (r.ok) {
+        const txt = await r.text();
+        if (txt.trim().length > 15) {
+          content = txt.slice(0, 24000);
+          break;
+        }
+      }
+    } catch {}
+  }
+  if (!content) throw new Error("未能从该链接读取到 SKILL.md 或 Markdown 说明，请确认链接公开可访问");
+
+  const fm = parseSkillFrontmatter(content);
+  const h1 = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
+  const slug = String(fm.name || fallbackSlug).toLowerCase().replace(/[^a-z0-9_-]+/g, "-").slice(0, 40) || "custom-skill";
+  const name = fm.title || h1 || fm.name || fallbackSlug;
+  const description = fm.description || content.replace(/^---[\s\S]*?---/, "").replace(/[#>*`\n]+/g, " ").trim().slice(0, 140);
+
+  return { slug, name, description, source_url: clean, content, enabled: true };
+}
+
+// ==================== ONLINE SEARCH: MASSIVE OPEN WALLPAPER + LIVE VIDEO STORE ====================
+async function searchOnlineLiveVideos(q, translated, pageNum) {
+  const words = String(translated || q || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  // Wikimedia treats spaces as strict AND; use focused OR/single term so video hits are plentiful!
+  const searchTerms = !words.length
+    ? "timelapse"
+    : words.length === 1
+      ? words[0]
+      : `(${words.slice(0, 3).join(" OR ")})`;
+  const offset = (pageNum - 1) * 12;
+  const url =
+    `https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*` +
+    `&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(`${searchTerms} filetype:video`)}` +
+    `&gsrlimit=14&gsroffset=${offset}` +
+    `&prop=videoinfo&viprop=url|size|mime&viurlwidth=480`;
+  const data = await fetchJsonWithTimeout(url, 9000);
+  const items = [];
+  for (const pg of Object.values(data?.query?.pages || {})) {
+    const info = pg.videoinfo?.[0];
+    if (!info?.url || !/webm|mp4|ogv|ogg/i.test(info.mime || info.url)) continue;
+    // Prefer modern webm/mp4 playable directly in Chrome/Edge/Electron <video>
+    if (!/webm|mp4/i.test(info.mime || info.url)) continue;
+    if (info.size && info.size > 65 * 1024 * 1024) continue;
+    const cleanUrl = info.url.split("?")[0];
+    const cleanThumb = (info.thumburl || "").split("?")[0];
+    const cleanName = String(pg.title || "")
+      .replace(/^File:/i, "")
+      .replace(/\.[^.]+$/, "")
+      .replace(/_/g, " ")
+      .slice(0, 46);
+    const dur = info.duration ? `${Math.round(info.duration)}s` : "";
+    const resStr = info.width && info.height ? `${info.width}×${info.height}` : "动态视频";
+    items.push({
+      id: `wmvid-${pg.pageid}`,
+      name: cleanName || "在线动态壁纸",
+      author: "Wikimedia Video",
+      license: [dur, resStr].filter(Boolean).join(" · ") || "CC",
+      type: "video",
+      thumb: cleanThumb ? proxyImageUrl(cleanThumb) : "",
+      url: proxyImageUrl(cleanUrl),
+      resolution: resStr,
+    });
+  }
+  return {
+    items,
+    hasMore: Boolean(data?.continue?.gsroffset),
+  };
+}
+
 export async function searchWallpaperStore(query = "", page = 1, category = "all") {
   const q = String(query || "").trim();
   const pageNum = Math.max(1, Number(page) || 1);
   const translated = translateWallpaperQuery(q);
 
-  // Category filter for live wallpapers only
+  // Category filter for LIVE wallpapers: 12 built-in 60fps Canvas + massive online Wikimedia open-source loop videos!
   if (category === "live") {
-    const liveList = LIVE_WALLPAPERS.filter((w) => !q || w.name.toLowerCase().includes(q.toLowerCase()));
-    return { ok: true, mode: "live", page: 1, has_more: false, items: liveList };
+    const ql = q.toLowerCase();
+    const localLive =
+      pageNum === 1
+        ? LIVE_WALLPAPERS.filter(
+            (w) =>
+              !ql ||
+              `${w.name} ${w.description || ""} ${(w.tags || []).join(" ")}`.toLowerCase().includes(ql),
+          )
+        : [];
+    let onlineVideos = [];
+    let hasMore = false;
+    let onlineError = "";
+    try {
+      const vres = await searchOnlineLiveVideos(q, translated, pageNum);
+      onlineVideos = vres.items;
+      hasMore = vres.hasMore;
+    } catch (err) {
+      onlineError = `在线动态视频搜索失败: ${err.message}`;
+    }
+    return {
+      ok: true,
+      mode: "live+video",
+      page: pageNum,
+      last_page: hasMore ? pageNum + 1 : pageNum,
+      total_online: localLive.length + onlineVideos.length,
+      has_more: hasMore,
+      items: [...localLive, ...onlineVideos],
+      online_error: onlineError,
+    };
   }
 
   const onlineItems = [];

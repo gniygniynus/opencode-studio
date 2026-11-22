@@ -233,7 +233,7 @@
 
     if (hasBg) {
       document.body.classList.add("has-wallpaper");
-      const alpha = bgMode === "hd" ? Math.min(ap.bgOpacity ?? 0.72, 0.82) : (ap.bgOpacity ?? 0.88);
+      const alpha = bgMode === "hd" ? Math.min(ap.bgOpacity ?? 0.64, 0.85) : (ap.bgOpacity ?? 0.88);
       document.documentElement.style.setProperty("--glass-alpha", String(alpha));
 
       if (bgType === "live" && ap.liveBg) {
@@ -392,6 +392,56 @@
     return prov?.model_infos?.find((m) => m.id === mid) || null;
   }
 
+  // ==================== CUSTOM GLASS DROPDOWNS & CONTEXT DISPLAY ====================
+
+  function closeAllGlassDropdowns() {
+    document.querySelectorAll(".glass-dropdown.open").forEach((dd) => {
+      dd.classList.remove("open");
+      dd.querySelector(".gd-menu")?.classList.add("hidden");
+    });
+  }
+
+  function renderGlassMenu(ddId, menuId, labelId, items, currentValue, onPick) {
+    const dd = $(ddId);
+    const menu = $(menuId);
+    const lbl = $(labelId);
+    if (!dd || !menu || !lbl) return;
+    const cur = items.find((i) => i.value === currentValue) || items[0];
+    lbl.textContent = cur ? cur.triggerLabel || cur.label : "未选择";
+    menu.innerHTML = "";
+    for (const it of items) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "gd-item" + (it.value === currentValue ? " active" : "");
+      btn.innerHTML =
+        `<span class="gd-item-main">${escHtml(it.label)}</span>` +
+        (it.sub ? `<span class="gd-item-sub">${escHtml(it.sub)}</span>` : "");
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        closeAllGlassDropdowns();
+        onPick(it.value);
+      });
+      menu.appendChild(btn);
+    }
+  }
+
+  function updateContextDisplay() {
+    const info = getSelectedModelInfo();
+    const maxCtx = info?.context_window || 128000;
+    const usedCtx = state.activeTimeline?.activity?.context_tokens || 0;
+    const ctxPill = $("ctx-pill");
+    if (!ctxPill) return;
+    if (state.activeTimeline?.items?.length) {
+      const pct = maxCtx > 0 ? Math.min(100, (usedCtx / maxCtx) * 100) : 0;
+      const pctText = pct > 0 && pct < 0.1 ? "<0.1%" : `${pct.toFixed(pct >= 10 ? 0 : 1)}%`;
+      ctxPill.textContent = `上下文 ${usedCtx > 0 ? fmtTokens(usedCtx) : "0"}/${fmtTokens(maxCtx)} (${pctText})`;
+      ctxPill.title = `当前会话已用约 ${usedCtx.toLocaleString()} Tokens / 模型上限 ${maxCtx.toLocaleString()} Tokens`;
+      ctxPill.classList.remove("hidden");
+    } else {
+      ctxPill.classList.add("hidden");
+    }
+  }
+
   function renderComposerSelectors(preferredProviderId = "", preferredModel = "", preferredThinking = "") {
     const pSel = $("provider-select");
     pSel.innerHTML = "";
@@ -421,23 +471,56 @@
       $("sidebar-prov-kind").textContent = "去添加";
     }
 
-    // Populate models directly showing the chosen provider's real model names + context window
+    // Custom glass dropdown for providers
+    renderGlassMenu(
+      "gd-provider",
+      "gd-provider-menu",
+      "gd-provider-label",
+      state.providers.map((p) => ({
+        value: p.id,
+        label: p.name,
+        triggerLabel: p.name,
+        sub: p.kind === "claude_native" ? "原生Auth" : p.kind.toUpperCase(),
+      })),
+      pSel.value,
+      async (pid) => {
+        pSel.value = pid;
+        renderComposerSelectors(pid);
+        try {
+          await apiJson(`/api/providers/${encodeURIComponent(pid)}/activate`, {
+            method: "POST",
+            body: JSON.stringify({ model: $("model-select").value }),
+          });
+        } catch {}
+      },
+    );
+
+    // Populate models directly showing real model names (clean & untruncated)
     const mSel = $("model-select");
     mSel.innerHTML = "";
     const infos = prov?.model_infos || [];
+    const modelItems = [];
     if (!infos.length) {
+      const val = prov?.default_model || "";
       const opt = document.createElement("option");
-      opt.value = prov?.default_model || "";
-      opt.textContent = prov?.default_model || "请先在供应商管理拉取/添加模型";
+      opt.value = val;
+      opt.textContent = val || "请在左侧供应商拉取模型";
       mSel.appendChild(opt);
+      modelItems.push({ value: val, label: val || "请在左侧供应商拉取模型", triggerLabel: val || "未配置模型", sub: "" });
     } else {
       for (const info of infos) {
         const opt = document.createElement("option");
         opt.value = info.id;
-        const ctxTag = fmtTokens(info.context_window);
-        const thinkMark = info.thinking_supported ? " · 思考" : "";
-        opt.textContent = `${info.display_name}${ctxTag ? ` [${ctxTag}]` : ""}${thinkMark}`;
+        opt.textContent = info.display_name;
         mSel.appendChild(opt);
+        const ctxTag = fmtTokens(info.context_window);
+        const subParts = [ctxTag, info.thinking_supported ? "思考" : "", info.vision ? "识图" : ""].filter(Boolean);
+        modelItems.push({
+          value: info.id,
+          label: info.display_name,
+          triggerLabel: info.display_name,
+          sub: subParts.join(" · "),
+        });
       }
       const targetModel =
         (preferredModel && infos.some((i) => i.id === preferredModel) ? preferredModel : null) ||
@@ -446,6 +529,18 @@
       mSel.value = targetModel;
     }
 
+    renderGlassMenu("gd-model", "gd-model-menu", "gd-model-label", modelItems, mSel.value, (mid) => {
+      mSel.value = mid;
+      updateThinkingSelector();
+      const pid = pSel.value;
+      if (pid) {
+        apiJson(`/api/providers/${encodeURIComponent(pid)}/activate`, {
+          method: "POST",
+          body: JSON.stringify({ model: mid }),
+        }).catch(() => {});
+      }
+    });
+
     updateThinkingSelector(preferredThinking);
   }
 
@@ -453,48 +548,66 @@
     const prov = getSelectedProvider();
     const info = getSelectedModelInfo();
     const tSel = $("thinking-select");
+    const gdThink = $("gd-thinking");
     const capBadge = $("model-cap-badge");
 
     if (prov && $("model-select").value) {
       const mLabel = info?.display_name || $("model-select").value;
-      const ccTag = state.claudeNative?.installed ? `原生 Claude Code ${state.claudeNative.version}` : "API 直连引擎";
-      $("sidebar-prov-model").textContent = `${mLabel} · ${fmtTokens(info?.context_window || 128000)} ctx`;
+      const engMode = state.settings.engine_mode || "auto";
+      const ccTag =
+        engMode === "api_direct"
+          ? "内置直连引擎"
+          : state.claudeNative?.installed
+            ? `原生 Claude Code ${state.claudeNative.version}`
+            : "内置直连引擎（未装 CLI 自动接管）";
+      $("sidebar-prov-model").textContent = `${mLabel} · ${fmtTokens(info?.context_window || 128000)} 上下文`;
       $("composer-engine-note").textContent =
         prov.kind === "claude_native"
           ? `${ccTag} · 官方 Auth (${mLabel})`
           : `${ccTag} · ${prov.name} / ${mLabel}`;
+      // Keep model button label synced
+      const ml = $("gd-model-label");
+      if (ml) ml.textContent = mLabel;
     }
+
+    if (info) {
+      capBadge.textContent = `${fmtTokens(info.context_window)} 上下文${info.vision ? " · 识图" : ""}`;
+      capBadge.classList.remove("hidden");
+    } else {
+      capBadge.classList.add("hidden");
+    }
+    updateContextDisplay();
 
     if (!info || !info.thinking_supported || !info.thinking_levels?.length) {
       tSel.classList.add("hidden");
       tSel.innerHTML = "";
-      if (info) {
-        capBadge.textContent = `${fmtTokens(info.context_window)} ctx${info.vision ? " · 识图" : ""}`;
-        capBadge.classList.remove("hidden");
-      } else {
-        capBadge.classList.add("hidden");
-      }
+      gdThink?.classList.add("hidden");
       return;
     }
 
     const labelMap = { off: "关闭", on: "开启", low: "低", medium: "中", high: "高", xhigh: "极高", max: "极致" };
     const prefix = info.thinking_mode === "openai_effort" ? "推理" : "思考";
     tSel.innerHTML = "";
+    const thinkItems = [];
     for (const lvl of info.thinking_levels) {
+      const txt = `${prefix}: ${labelMap[lvl] || lvl}`;
       const opt = document.createElement("option");
       opt.value = lvl;
-      opt.textContent = `${prefix}: ${labelMap[lvl] || lvl}`;
+      opt.textContent = txt;
       tSel.appendChild(opt);
+      thinkItems.push({ value: lvl, label: txt, triggerLabel: txt, sub: lvl });
     }
     const chosen =
       preferredThinking && info.thinking_levels.includes(preferredThinking)
         ? preferredThinking
         : info.default_thinking || info.thinking_levels[0];
     tSel.value = chosen;
-    tSel.classList.remove("hidden");
-
-    capBadge.textContent = `${fmtTokens(info.context_window)} ctx${info.vision ? " · 识图" : ""}`;
-    capBadge.classList.remove("hidden");
+    gdThink?.classList.remove("hidden");
+    const onPickThink = (val) => {
+      tSel.value = val;
+      renderGlassMenu("gd-thinking", "gd-thinking-menu", "gd-thinking-label", thinkItems, val, onPickThink);
+    };
+    renderGlassMenu("gd-thinking", "gd-thinking-menu", "gd-thinking-label", thinkItems, chosen, onPickThink);
   }
 
   // ==================== SESSION LIST ====================
@@ -691,13 +804,11 @@
       ? `<div class="msg-images">${item.images.map((im) => `<img src="${escHtml(im.url)}" alt="图片" />`).join("")}</div>`
       : "";
 
+    const clockStr = fmtClock(item.created_at);
     wrap.innerHTML =
-      `<div class="msg-user-header">` +
-        `<span class="mono">#${item.turn_index || ""}</span>` +
-        `<span>${fmtClock(item.created_at)}</span>` +
-      `</div>` +
       `<div class="msg-user-card">${imgsHtml}<div class="msg-user-text">${escHtml(item.content_text || "")}</div></div>` +
       `<div class="msg-footer-bar">` +
+        (clockStr ? `<span class="msg-footer-time">${clockStr}</span>` : "") +
         branchBar +
         `<button class="sym-btn btn-edit-resend" title="编辑并重新发送（保留原分支）">${SVG_ICONS.edit}</button>` +
         `<button class="sym-btn btn-copy-u" title="复制提问">${SVG_ICONS.copy}</button>` +
@@ -845,13 +956,7 @@
       box.appendChild(createAssistantMsgEl(live, true));
     }
 
-    const ctxTok = tl?.activity?.context_tokens || 0;
-    if (ctxTok > 0) {
-      $("ctx-pill").textContent = `上下文 ${fmtTokens(ctxTok)} tok`;
-      $("ctx-pill").classList.remove("hidden");
-    } else {
-      $("ctx-pill").classList.add("hidden");
-    }
+    updateContextDisplay();
 
     renderOutline(tl?.outline || []);
     renderActivity(tl?.activity || null);
@@ -1044,7 +1149,7 @@
       el.addEventListener("click", () => focusFind(idx));
       box.appendChild(el);
     });
-    focusFind(0);
+    // Wait for user to click a specific search result before jumping!
   }
 
   function focusFind(idx) {
@@ -1141,14 +1246,20 @@
     }
     if (t === "claude_auth_progress") {
       const box = $("claude-auth-output");
+      const codeRow = $("claude-auth-code-row");
       if (box) {
         box.classList.remove("hidden");
         if (msg.stage === "oauth_url" && msg.url) {
           box.innerHTML =
-            `<b>请在浏览器中完成官方授权：</b><br />` +
-            `<a class="link-btn" href="${escHtml(msg.url)}" target="_blank" rel="noopener noreferrer">${escHtml(msg.url)} ↗</a>` +
-            `<div class="muted-text" style="margin-top:4px;">授权完成后请点击上方「刷新状态」确认已登录。</div>`;
-        } else if (msg.text) {
+            `<div style="margin-bottom:6px;"><b>已生成官方授权链接（系统浏览器已自动尝试打开）：</b></div>` +
+            `<a class="btn-primary sm" style="text-decoration:none;margin-bottom:6px;" href="${escHtml(msg.url)}" target="_blank" rel="noopener noreferrer">在浏览器中打开官方授权页 ↗</a>` +
+            `<div class="muted-text" style="word-break:break-all;font-size:11px;">${escHtml(msg.url)}</div>` +
+            `<div class="muted-text" style="margin-top:4px;">完成网页授权后，如页面给出授权码 (Code)，请粘贴至下方提交；如已自动回调成功，点击上方「刷新状态」即可。</div>`;
+          codeRow?.classList.remove("hidden");
+        } else if (msg.stage === "done" && msg.auth?.loggedIn) {
+          box.innerHTML = `<b style="color:var(--ok);">● 官方账号授权登录成功！</b>`;
+          codeRow?.classList.add("hidden");
+        } else if (msg.text && !box.innerHTML.includes("在浏览器中打开官方授权页")) {
           box.textContent = (box.textContent ? box.textContent + "\n" : "") + msg.text;
         }
       }
@@ -1252,7 +1363,7 @@
 
     const prov = getSelectedProvider();
     const model = $("model-select").value;
-    const thinking = $("thinking-select").classList.contains("hidden") ? "off" : $("thinking-select").value;
+    const thinking = $("gd-thinking")?.classList.contains("hidden") ? "off" : $("thinking-select").value;
 
     $("composer-input").value = "";
     autoResizeComposer();
@@ -1277,7 +1388,7 @@
     if (!state.wsConnected || !state.activeSessionId) return;
     const prov = getSelectedProvider();
     const model = $("model-select").value;
-    const thinking = $("thinking-select").classList.contains("hidden") ? "off" : $("thinking-select").value;
+    const thinking = $("gd-thinking")?.classList.contains("hidden") ? "off" : $("thinking-select").value;
     state.ws.send(JSON.stringify({
       type: "edit_resend",
       session_id: state.activeSessionId,
@@ -1297,7 +1408,7 @@
     }
     const prov = getSelectedProvider();
     const model = $("model-select").value;
-    const thinking = $("thinking-select").classList.contains("hidden") ? "off" : $("thinking-select").value;
+    const thinking = $("gd-thinking")?.classList.contains("hidden") ? "off" : $("thinking-select").value;
     state.ws.send(JSON.stringify({
       type: "regenerate_reply",
       session_id: state.activeSessionId,
@@ -1540,6 +1651,8 @@
 
   async function startClaudeAuthLogin(mode = "claudeai") {
     const out = $("claude-auth-output");
+    const codeRow = $("claude-auth-code-row");
+    codeRow?.classList.add("hidden");
     if (out) {
       out.classList.remove("hidden");
       out.textContent = `正在启动原生 claude auth login (${mode === "console" ? "Anthropic Console" : "Claude 订阅账号"})…`;
@@ -1556,12 +1669,15 @@
       if (res.oauth_url) {
         if (out) {
           out.innerHTML =
-            `<b>请在官方授权页完成登录：</b><br />` +
-            `<a class="link-btn" href="${escHtml(res.oauth_url)}" target="_blank" rel="noopener noreferrer">${escHtml(res.oauth_url)} ↗</a>` +
-            `<div class="muted-text" style="margin-top:4px;">${escHtml(res.message || "完成后点击上方「刷新状态」")}</div>`;
+            `<div style="margin-bottom:6px;"><b>已为您打开官方授权页面：</b></div>` +
+            `<a class="btn-primary sm" style="text-decoration:none;margin-bottom:6px;" href="${escHtml(res.oauth_url)}" target="_blank" rel="noopener noreferrer">在浏览器中打开官方授权页 ↗</a>` +
+            `<div class="muted-text" style="word-break:break-all;font-size:11px;">${escHtml(res.oauth_url)}</div>` +
+            `<div class="muted-text" style="margin-top:4px;">${escHtml(res.message || "")}</div>`;
         }
+        codeRow?.classList.remove("hidden");
+        $("claude-auth-code-input")?.focus();
         window.open(res.oauth_url, "_blank", "noopener,noreferrer");
-        toast("已弹出 Claude 官方授权页，完成后请点击刷新状态", 4000);
+        toast("已弹出官方授权页，如页面给出授权码请粘贴回填", 4500);
       } else {
         if (out) out.textContent = res.message || res.output || "登录流程已结束";
         await refreshClaudeStatus(true);
@@ -1570,6 +1686,37 @@
     } catch (err) {
       if (out) out.textContent = "登录请求失败: " + err.message;
       toast("登录失败: " + err.message, 4000);
+    }
+  }
+
+  async function submitClaudeAuthCodeInput() {
+    const inp = $("claude-auth-code-input");
+    const code = (inp?.value || "").trim();
+    if (!code) return toast("请先粘贴官方页面给出的授权码 (Code)");
+    const btn = $("btn-claude-auth-submit-code");
+    if (btn) btn.disabled = true;
+    try {
+      const res = await apiJson("/api/claude/auth/submit-code", {
+        method: "POST",
+        body: JSON.stringify({ code }),
+      });
+      if (res.runtime) {
+        state.claudeNative = res.runtime;
+        renderClaudeStatusViews();
+      }
+      if (res.ok) {
+        if (inp) inp.value = "";
+        $("claude-auth-code-row")?.classList.add("hidden");
+        const out = $("claude-auth-output");
+        if (out) out.innerHTML = `<b style="color:var(--ok);">● ${escHtml(res.message || "官方账号授权登录成功！")}</b>`;
+        toast("原生 Claude 官方账号登录成功！", 3500);
+      } else {
+        toast(res.error || res.message || "提交授权码未生效，请重试", 4500);
+      }
+    } catch (err) {
+      toast("提交授权码失败: " + err.message, 4000);
+    } finally {
+      if (btn) btn.disabled = false;
     }
   }
 
@@ -1847,17 +1994,25 @@
     const card = document.createElement("div");
     card.className = "wp-card" + (isActive ? " active" : "");
     const thumbStyle = w.preview_css ? `background:${w.preview_css}` : `background-image:url('${escHtml(w.thumb || w.url)}')`;
-    const badgeHtml = w.type === "live"
-      ? `<span class="wp-live-badge">✨ 动态 60fps</span>`
-      : w.resolution
-        ? `<span class="wp-res-badge">${escHtml(w.resolution)}</span>`
-        : "";
+    const badgeHtml =
+      w.type === "live"
+        ? `<span class="wp-live-badge">✨ 60fps 动态</span>`
+        : w.type === "video"
+          ? `<span class="wp-live-badge">🎬 在线动态视频</span>`
+          : w.resolution
+            ? `<span class="wp-res-badge">${escHtml(w.resolution)}</span>`
+            : "";
+    const subText = w.description
+      ? `${w.description}`
+      : `${w.license || "Open"} · ${w.author || ""}`;
     card.innerHTML =
       `<div class="wp-thumb" style="${thumbStyle}">${badgeHtml}</div>` +
-      `<div class="wp-meta"><div class="wp-name">${escHtml(w.name)}</div><div class="wp-sub">${escHtml(w.license || "Open")} · ${escHtml(w.author || "")}</div></div>`;
+      `<div class="wp-meta"><div class="wp-name">${escHtml(w.name)}</div><div class="wp-sub">${escHtml(subText)}</div></div>`;
     card.addEventListener("click", () => {
       if (w.type === "live") {
         updateAppearance({ bgType: "live", liveBg: w.liveBg, bgUrl: "", bgName: w.name });
+      } else if (w.type === "video") {
+        updateAppearance({ bgType: "video", bgUrl: w.url || "", liveBg: "", bgName: w.name });
       } else {
         updateAppearance({ bgType: w.type, bgUrl: w.url || "", liveBg: "", bgName: w.name });
       }
@@ -1877,12 +2032,12 @@
 
     if (!append) {
       state.wpPage = 1;
-      grid.innerHTML = `<div class="muted-text">${q ? `正在实时联网搜索「${escHtml(q)}」海量 4K 壁纸…` : cat === "live" ? "加载 60fps 动态壁纸…" : "正在加载精选与热门 4K 壁纸…"}</div>`;
+      grid.innerHTML = `<div class="muted-text">${q ? `正在实时联网搜索「${escHtml(q)}」${cat === "live" ? "动态壁纸与在线循环视频" : "海量 4K 壁纸"}…` : cat === "live" ? "正在加载 12 套 60fps 动态壁纸与在线开源动态视频…" : "正在加载精选与热门 4K 壁纸…"}</div>`;
       if (metaEl) metaEl.textContent = "检索中…";
       moreBtn?.classList.add("hidden");
     } else if (moreBtn) {
       moreBtn.disabled = true;
-      moreBtn.textContent = "加载下一页 4K 壁纸中…";
+      moreBtn.textContent = "加载下一页中…";
     }
 
     try {
@@ -1894,7 +2049,7 @@
 
       const items = data.items || [];
       if (!items.length && !append) {
-        grid.innerHTML = `<div class="muted-text">未搜索到匹配壁纸${data.online_error ? `（${escHtml(data.online_error)}）` : "，试试「星空」「动漫」「风景」或英文关键词"}。</div>`;
+        grid.innerHTML = `<div class="muted-text">未搜索到匹配壁纸${data.online_error ? `（${escHtml(data.online_error)}）` : "，试试「星空」「极光」「海洋」「樱花」「赛博」或英文关键词"}。</div>`;
       } else {
         for (const w of items) {
           grid.appendChild(buildWallpaperCard(w, grid));
@@ -1905,12 +2060,12 @@
       state.wpHasMore = Boolean(data.has_more);
       if (moreBtn) {
         moreBtn.disabled = false;
-        moreBtn.textContent = `加载更多 4K 壁纸（第 ${state.wpPage + 1} 页）`;
+        moreBtn.textContent = cat === "live" ? `加载更多在线动态视频（第 ${state.wpPage + 1} 页）` : `加载更多 4K 壁纸（第 ${state.wpPage + 1} 页）`;
         moreBtn.classList.toggle("hidden", !state.wpHasMore);
       }
       if (metaEl) {
         if (cat === "live") {
-          metaEl.textContent = `共 ${items.length} 套 60fps 实时动态壁纸`;
+          metaEl.textContent = `当前已加载 ${grid.children.length} 个动态壁纸（60fps + 在线视频）${data.online_error ? ` · ${data.online_error}` : ""}`;
         } else if (data.total_online > 0) {
           metaEl.textContent = `在线共 ${Number(data.total_online).toLocaleString()} 张 4K 壁纸（第 ${state.wpPage}/${data.last_page || 1} 页）`;
         } else if (data.online_error) {
@@ -1936,6 +2091,7 @@
     $("modal-settings").classList.remove("hidden");
     $("set-system-prompt").value = state.settings.system_prompt || "";
     if ($("set-prompt-mode")) $("set-prompt-mode").value = state.settings.prompt_mode || "replace";
+    if ($("set-engine-mode")) $("set-engine-mode").value = state.settings.engine_mode || "auto";
     $("set-permission-mode").value = state.settings.permission_mode || "auto";
     $("set-default-cwd").value = state.settings.default_cwd || "";
     $("set-update-channel").value = state.settings.update_channel || "stable";
@@ -1943,8 +2099,61 @@
     renderClaudeStatusViews();
   }
 
+  async function checkClaudeCoreVersions() {
+    const box = $("claude-ver-compare");
+    const btn = $("btn-claude-check-ver");
+    if (btn) btn.disabled = true;
+    if (box) box.textContent = "正在联网检测本机原生 Claude Code 与官方稳定版 (stable) / 最新版 (latest)…";
+    try {
+      const res = await apiJson("/api/claude/versions");
+      state.lastClaudeVersions = res;
+      if (res.runtime) {
+        state.claudeNative = res.runtime;
+        renderClaudeStatusViews();
+      }
+      const badgeColor =
+        res.channel_status === "stable" || res.channel_status === "latest" || res.channel_status === "both"
+          ? "var(--ok)"
+          : res.channel_status === "outdated"
+            ? "var(--brand)"
+            : "var(--warn)";
+      if (box) {
+        box.innerHTML =
+          `<div style="font-weight:600;color:${badgeColor};">${escHtml(res.status_text || "")}</div>` +
+          `<div class="ver-compare-grid">` +
+            `<div class="ver-pill-card"><span class="v-lbl">本机当前版本</span><span class="v-val">${escHtml(res.current_version ? `v${res.current_version}` : "未安装")}</span></div>` +
+            `<div class="ver-pill-card"><span class="v-lbl">官方稳定版 (stable)</span><span class="v-val">${escHtml(res.stable_version ? `v${res.stable_version}` : "获取失败")}</span></div>` +
+            `<div class="ver-pill-card"><span class="v-lbl">官方最新版 (latest)</span><span class="v-val">${escHtml(res.latest_version ? `v${res.latest_version}` : "获取失败")}</span></div>` +
+          `</div>` +
+          (res.error ? `<div class="muted-text" style="color:var(--err);margin-top:6px;">${escHtml(res.error)}</div>` : "");
+      }
+    } catch (err) {
+      if (box) box.textContent = "版本检测失败: " + err.message;
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   async function installOrSwitchClaudeCore(channel) {
     const label = channel === "latest" ? "最新版 (latest)" : "稳定版 (stable)";
+    const vInfo = state.lastClaudeVersions;
+    const targetVerHint =
+      channel === "latest"
+        ? (vInfo?.latest_version ? ` (v${vInfo.latest_version})` : "")
+        : (vInfo?.stable_version ? ` (v${vInfo.stable_version})` : "");
+    const curHint = state.claudeNative?.version ? `当前版本：${state.claudeNative.version}` : "当前本机尚未安装原生 Claude Code";
+
+    if (
+      !window.confirm(
+        `确认安装/切换原生 Claude Code 到「${label}${targetVerHint}」？\n\n` +
+          `${curHint}\n` +
+          `• 切换过程会自动保留您的账号登录状态与原有配置\n` +
+          `• 迁移成功后会自动清理旧版本残留二进制文件，释放磁盘空间`,
+      )
+    ) {
+      return;
+    }
+
     const pre = $("claude-install-log");
     const btnS = $("btn-claude-install-stable");
     const btnL = $("btn-claude-install-latest");
@@ -1971,7 +2180,9 @@
         pre.scrollTop = pre.scrollHeight;
       }
       if (res.ok) {
-        toast(`原生 Claude Code ${label} 已就绪！(${state.claudeNative?.version || ""})`, 4000);
+        const cleanNote = res.cleanup?.removed ? `，已清理 ${res.cleanup.removed} 个旧版本 (${res.cleanup.freed_mb}MB)` : "";
+        toast(`原生 Claude Code ${label} 已就绪 (${state.claudeNative?.version || ""})${cleanNote}`, 5000);
+        checkClaudeCoreVersions();
       } else {
         toast(`切换失败：${res.error || "请查看下方日志"}`, 5000);
       }
@@ -1986,10 +2197,10 @@
 
   async function runUpdateCheck() {
     const ch = $("set-update-channel").value;
-    $("updater-result").textContent = `正在联网检查「${ch === "stable" ? "稳定版" : "最新版"}」通道更新…`;
+    $("updater-result").textContent = `正在联网检测当前外壳与 GitHub 稳定版 / 最新版…`;
     const res = await apiJson(`/api/updater/check?channel=${encodeURIComponent(ch)}`);
     if (!res.ok) {
-      $("updater-result").innerHTML = `${escHtml(res.message || "检查失败")} <a class="link-btn" href="${escHtml(res.repo_url)}" target="_blank">打开 GitHub Releases ↗</a>`;
+      $("updater-result").innerHTML = `${escHtml(res.message || "检测失败")} <a class="link-btn" href="${escHtml(res.repo_url)}" target="_blank">打开 GitHub Releases ↗</a>`;
       return;
     }
     if (!res.target_version) {
@@ -1997,39 +2208,57 @@
       return;
     }
     const statusLine = res.has_update
-      ? `<b style="color:var(--brand);">发现新版本 ${escHtml(res.tag_name)}</b>（当前 v${escHtml(res.current_version)}）`
-      : `<b style="color:var(--ok);">已是该通道最新版本 (${escHtml(res.tag_name)})</b>`;
+      ? `<b style="color:var(--brand);">可升级至 ${escHtml(res.tag_name)}</b>（当前 v${escHtml(res.current_version)}）`
+      : `<b style="color:var(--ok);">当前 v${escHtml(res.current_version)} 已是该通道最新版本 (${escHtml(res.tag_name)})</b>`;
     const dlBtn = res.recommended_asset
       ? `<a class="btn-primary sm" style="text-decoration:none;margin-right:8px;" href="${escHtml(res.recommended_asset.download_url)}" target="_blank">下载本平台安装包 (${escHtml(res.recommended_asset.name)})</a>`
       : "";
     $("updater-result").innerHTML =
-      `<div>${statusLine} · 稳定版: <code>${escHtml(res.available_channels?.stable || "-")}</code> · 最新版: <code>${escHtml(res.available_channels?.latest || "-")}</code></div>` +
-      `<div style="margin:8px 0;">${dlBtn}<a class="link-btn" href="${escHtml(res.release_url)}" target="_blank">查看完整发布说明 ↗</a></div>` +
-      (res.notes ? `<pre class="tool-pre" style="max-height:140px;">${escHtml(res.notes)}</pre>` : "");
+      `<div>${statusLine}</div>` +
+      `<div class="ver-compare-grid">` +
+        `<div class="ver-pill-card"><span class="v-lbl">本机当前外壳</span><span class="v-val">v${escHtml(res.current_version)}</span></div>` +
+        `<div class="ver-pill-card"><span class="v-lbl">GitHub 稳定版</span><span class="v-val">${escHtml(res.available_channels?.stable || "-")}</span></div>` +
+        `<div class="ver-pill-card"><span class="v-lbl">GitHub 最新版</span><span class="v-val">${escHtml(res.available_channels?.latest || "-")}</span></div>` +
+      `</div>` +
+      `<div style="margin:10px 0 4px;">${dlBtn}<a class="link-btn" href="${escHtml(res.release_url)}" target="_blank">查看完整发布说明 ↗</a></div>`;
   }
 
-  // ==================== MODAL: CWD / MEMORY / LOGS ====================
+  // ==================== MODAL: CWD (NATIVE PICKER + CUSTOM BY DRIVE) / MEMORY / LOGS ====================
 
-  async function browseCwd(dir) {
-    $("cwd-manual-input").value = dir;
-    const data = await apiJson(`/api/dirs?path=${encodeURIComponent(dir)}`);
-    state.cwdBrowsePath = data.path;
-    $("cwd-cur-path").textContent = data.path;
-    $("cwd-shortcuts").innerHTML = "";
-    for (const s of data.shortcuts || []) {
-      const r = document.createElement("div");
-      r.className = "dir-row";
-      r.innerHTML = `<span>${escHtml(s.label)}</span><code class="mono">${escHtml(s.path)}</code>`;
-      r.addEventListener("click", () => applyCwd(s.path));
-      $("cwd-shortcuts").appendChild(r);
-    }
-    $("cwd-children").innerHTML = "";
-    for (const ch of data.children || []) {
-      const r = document.createElement("div");
-      r.className = "dir-row";
-      r.innerHTML = `<span>📁 ${escHtml(ch.name)}</span><button class="link-btn">选用</button>`;
-      r.addEventListener("click", (e) => (e.target.tagName === "BUTTON" ? applyCwd(ch.path) : browseCwd(ch.path)));
-      $("cwd-children").appendChild(r);
+  function updateCustomCwdPreview() {
+    const drive = $("cwd-drive-select")?.value || "";
+    const sub = ($("cwd-subpath-input")?.value || "").trim().replace(/^[\\/]+/, "");
+    const isWin = drive.includes("\\");
+    const sep = isWin ? "\\" : "/";
+    const preview = !sub ? drive : drive.endsWith(sep) ? drive + sub : drive + sep + sub;
+    if ($("cwd-custom-preview")) $("cwd-custom-preview").textContent = preview || "请选择盘符并输入文件夹名";
+  }
+
+  async function openCwdModal() {
+    $("modal-cwd").classList.remove("hidden");
+    const cur = state.activeCwd || state.settings.default_cwd || "";
+    if ($("cwd-active-hint")) $("cwd-active-hint").textContent = `当前工作目录：${cur || "未设置"}`;
+    try {
+      const info = await apiJson("/api/dirs/drives");
+      const sel = $("cwd-drive-select");
+      if (sel) {
+        sel.innerHTML = "";
+        for (const d of info.drives || []) {
+          const opt = document.createElement("option");
+          opt.value = d;
+          opt.textContent = info.platform === "win32" ? `${d} 盘` : d;
+          sel.appendChild(opt);
+        }
+        // Pre-select current drive if matched
+        const matchedDrive = (info.drives || []).find((d) => cur.toLowerCase().startsWith(d.toLowerCase()));
+        if (matchedDrive) sel.value = matchedDrive;
+      }
+      if ($("cwd-subpath-input") && !$("cwd-subpath-input").value) {
+        $("cwd-subpath-input").value = "";
+      }
+      updateCustomCwdPreview();
+    } catch (err) {
+      toast("加载本地盘符失败: " + err.message);
     }
   }
 
@@ -2177,14 +2406,35 @@
 
     // Navigation buttons
     $("btn-open-providers").addEventListener("click", () => openProvidersModal());
-    $("btn-edit-cur-provider")?.addEventListener("click", () => openProvidersModal($("provider-select").value || state.activeProvider?.id));
     $("btn-open-stores").addEventListener("click", () => openStoresModal("mcp"));
     $("btn-quick-bg").addEventListener("click", () => openStoresModal("wallpapers"));
     $("btn-open-memory").addEventListener("click", openMemoryModal);
     $("btn-open-settings").addEventListener("click", openSettingsModal);
     $("btn-open-logs").addEventListener("click", () => openLogsModal("server"));
 
-    // Composer selectors (live provider/model switching)
+    // Custom Glass Popover Dropdown triggers
+    for (const [ddId, btnId, menuId] of [
+      ["gd-provider", "gd-provider-btn", "gd-provider-menu"],
+      ["gd-model", "gd-model-btn", "gd-model-menu"],
+      ["gd-thinking", "gd-thinking-btn", "gd-thinking-menu"],
+    ]) {
+      $(btnId)?.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const dd = $(ddId);
+        const menu = $(menuId);
+        const wasOpen = dd?.classList.contains("open");
+        closeAllGlassDropdowns();
+        if (!wasOpen && dd && menu) {
+          dd.classList.add("open");
+          menu.classList.remove("hidden");
+        }
+      });
+    }
+    document.addEventListener("click", (ev) => {
+      if (!ev.target.closest(".glass-dropdown")) closeAllGlassDropdowns();
+    });
+
+    // Composer selectors (fallback sync)
     $("provider-select").addEventListener("change", async () => {
       const pid = $("provider-select").value;
       renderComposerSelectors(pid);
@@ -2272,35 +2522,37 @@
     $("btn-close-drawer").addEventListener("click", closeDrawer);
     $("outline-filter").addEventListener("input", () => renderOutline(state.activeTimeline?.outline || []));
     $("thread-find-input").addEventListener("input", runThreadFind);
-    $("thread-find-input").addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { e.preventDefault(); focusFind(state.findIndex + (e.shiftKey ? -1 : 1)); }
-    });
-    $("btn-find-prev").addEventListener("click", () => focusFind(state.findIndex - 1));
-    $("btn-find-next").addEventListener("click", () => focusFind(state.findIndex + 1));
 
-    // Title & CWD
+    // Title & Simplified CWD Modal (Native Picker + Custom by Drive)
     $("thread-title").addEventListener("click", () => {
       if (state.activeSessionId) promptRename(state.activeSessionId, $("thread-title").textContent);
     });
-    $("cwd-pill").addEventListener("click", () => {
-      $("modal-cwd").classList.remove("hidden");
-      browseCwd(state.activeCwd || state.settings.default_cwd || "");
+    $("cwd-pill").addEventListener("click", openCwdModal);
+    $("cwd-drive-select")?.addEventListener("change", updateCustomCwdPreview);
+    $("cwd-subpath-input")?.addEventListener("input", updateCustomCwdPreview);
+    $("cwd-subpath-input")?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") $("btn-cwd-create-apply")?.click();
     });
     $("btn-cwd-native").addEventListener("click", async () => {
       const btn = $("btn-cwd-native");
       btn.disabled = true;
       const oldTxt = btn.textContent;
-      btn.textContent = "等待选择…";
+      btn.textContent = "请在弹出的系统窗口中选择文件夹…";
       try {
         let picked = "";
         if (window.opencodeDesktop?.pickDirectory) {
           picked = await window.opencodeDesktop.pickDirectory();
         } else {
-          const res = await apiJson("/api/dirs/pick-native", { method: "POST" });
+          const res = await apiJson("/api/dirs/pick-native", {
+            method: "POST",
+            body: JSON.stringify({ initial_dir: state.activeCwd || state.settings.default_cwd || "" }),
+          });
           picked = res.path || "";
         }
         if (picked) {
           await applyCwd(picked);
+        } else {
+          toast("已取消选择文件夹");
         }
       } catch (err) {
         toast("打开系统目录选择框失败: " + err.message);
@@ -2309,15 +2561,21 @@
         btn.textContent = oldTxt;
       }
     });
-    $("btn-cwd-browse").addEventListener("click", () => browseCwd($("cwd-manual-input").value.trim()));
-    $("btn-cwd-apply").addEventListener("click", () => applyCwd($("cwd-manual-input").value.trim()));
-    $("btn-cwd-up").addEventListener("click", () => {
-      const cur = state.cwdBrowsePath || "";
-      const parts = cur.split(/[\\/]+/).filter(Boolean);
-      if (parts.length <= 1) return;
-      parts.pop();
-      const parent = cur.includes("\\") ? parts.join("\\") + (parts.length === 1 ? "\\" : "") : "/" + parts.join("/");
-      browseCwd(parent);
+    $("btn-cwd-create-apply")?.addEventListener("click", async () => {
+      const drive = $("cwd-drive-select")?.value || "";
+      const subpath = ($("cwd-subpath-input")?.value || "").trim();
+      try {
+        const res = await apiJson("/api/dirs/ensure", {
+          method: "POST",
+          body: JSON.stringify({ drive, subpath }),
+        });
+        if (res.ok && res.path) {
+          await applyCwd(res.path);
+          if (res.created) toast(`已新建并切换到工作目录：${res.path}`);
+        }
+      } catch (err) {
+        toast("设置自定义目录失败: " + err.message, 4000);
+      }
     });
 
     // Providers modal actions & Native Claude Auth
@@ -2346,6 +2604,8 @@
     });
     $("btn-claude-auth-login")?.addEventListener("click", () => startClaudeAuthLogin("claudeai"));
     $("btn-claude-auth-console")?.addEventListener("click", () => startClaudeAuthLogin("console"));
+    $("btn-claude-auth-submit-code")?.addEventListener("click", submitClaudeAuthCodeInput);
+    $("claude-auth-code-input")?.addEventListener("keydown", (e) => { if (e.key === "Enter") submitClaudeAuthCodeInput(); });
     $("btn-claude-auth-logout")?.addEventListener("click", async () => {
       if (!window.confirm("确定退出本机原生 Claude Code 官方账号登录？")) return;
       const res = await apiJson("/api/claude/auth/logout", { method: "POST" });
@@ -2354,7 +2614,7 @@
       toast(res.ok ? "已退出原生 Claude 账号" : (res.error || "退出失败"));
     });
 
-    // Stores tabs & live debounced searches
+    // Stores tabs & live debounced searches + public URL/package importers
     document.querySelectorAll("[data-storetab]").forEach((b) => b.addEventListener("click", () => openStoresModal(b.dataset.storetab)));
     $("btn-search-mcp").addEventListener("click", () => searchMcp($("mcp-search-input").value.trim()));
     $("mcp-search-input").addEventListener("keydown", (e) => { if (e.key === "Enter") searchMcp($("mcp-search-input").value.trim()); });
@@ -2362,15 +2622,30 @@
       clearTimeout(state.mcpSearchTimer);
       state.mcpSearchTimer = setTimeout(() => searchMcp($("mcp-search-input").value.trim()), 450);
     });
+    $("btn-import-mcp")?.addEventListener("click", async () => {
+      const raw = window.prompt("粘贴任意公开 MCP（支持远程 HTTP/SSE URL、npm 包名、GitHub 仓库链接或 mcpServers JSON）：");
+      if (!raw || !raw.trim()) return;
+      toast("正在解析并安装公开 MCP…");
+      try {
+        const res = await apiJson("/api/mcp/import", { method: "POST", body: JSON.stringify({ input: raw.trim() }) });
+        loadInstalledMcps();
+        toast(`已成功导入并适配 MCP「${res.item?.name || ""}」！`, 3500);
+      } catch (err) {
+        toast("导入 MCP 失败: " + err.message, 4500);
+      }
+    });
     $("btn-custom-mcp").addEventListener("click", async () => {
       const name = window.prompt("MCP 名称（如 my-mcp）：");
       if (!name) return;
-      const cmdLine = window.prompt("启动命令（如 npx -y @modelcontextprotocol/server-memory）：");
+      const cmdLine = window.prompt("启动命令或远程 URL（如 npx -y @modelcontextprotocol/server-memory 或 https://...）：");
       if (!cmdLine) return;
-      const parts = cmdLine.trim().split(/\s+/);
-      await apiJson("/api/mcp", { method: "POST", body: JSON.stringify({ name, command: parts[0], args: parts.slice(1), enabled: true }) });
+      const trimmed = cmdLine.trim();
+      const body = /^https?:\/\//i.test(trimmed)
+        ? { name, command: /sse/i.test(trimmed) ? "sse" : "http", args: [trimmed], enabled: true }
+        : { name, command: trimmed.split(/\s+/)[0], args: trimmed.split(/\s+/).slice(1), enabled: true };
+      await apiJson("/api/mcp", { method: "POST", body: JSON.stringify(body) });
       loadInstalledMcps();
-      toast("已添加并启动自定义 MCP");
+      toast("已添加并适配自定义 MCP");
     });
 
     $("btn-search-skills").addEventListener("click", () => searchSkills($("skills-search-input").value.trim()));
@@ -2378,6 +2653,18 @@
     $("skills-search-input").addEventListener("input", () => {
       clearTimeout(state.skillSearchTimer);
       state.skillSearchTimer = setTimeout(() => searchSkills($("skills-search-input").value.trim()), 450);
+    });
+    $("btn-import-skill")?.addEventListener("click", async () => {
+      const url = window.prompt("粘贴任意公开 GitHub Skill 仓库链接或 SKILL.md 文件链接：");
+      if (!url || !url.trim()) return;
+      toast("正在拉取并解析公开 Skill…");
+      try {
+        const res = await apiJson("/api/skills/import-url", { method: "POST", body: JSON.stringify({ url: url.trim() }) });
+        loadInstalledSkills();
+        toast(`已成功导入并启用 Skill /${res.item?.slug || ""}！`, 3500);
+      } catch (err) {
+        toast("导入 Skill 失败: " + err.message, 4500);
+      }
     });
     $("btn-custom-skill").addEventListener("click", async () => {
       const name = window.prompt("新建 Skill 名称（如 算法刷题教练）：");
@@ -2394,8 +2681,8 @@
     // Appearance & Wallpaper controls (HD / Subtle / Live / Video / Massive Search)
     $("ap-theme").addEventListener("change", () => updateAppearance({ theme: $("ap-theme").value }));
     $("btn-bgmode-hd")?.addEventListener("click", () => {
-      updateAppearance({ bgMode: "hd", bgBlur: 0, bgOpacity: 0.72 });
-      toast("已切换为「高清原版壁纸」模式（0 模糊，清透呈现）");
+      updateAppearance({ bgMode: "hd", bgBlur: 0, bgOpacity: 0.64 });
+      toast("已切换为「高清原版壁纸」模式（0 模糊，两侧栏清透适配）");
     });
     $("btn-bgmode-subtle")?.addEventListener("click", () => {
       updateAppearance({ bgMode: "subtle", bgBlur: 10, bgOpacity: 0.88 });
@@ -2427,25 +2714,17 @@
       }
     });
     $("btn-search-wp").addEventListener("click", () => {
-      state.wpCategory = "all";
-      document.querySelectorAll(".wp-cat").forEach((c) => c.classList.toggle("active", c.dataset.cat === "all"));
       searchWallpapers($("wp-search-input").value.trim(), 1, false);
     });
     $("wp-search-input").addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
-        state.wpCategory = "all";
         searchWallpapers($("wp-search-input").value.trim(), 1, false);
       }
     });
     $("wp-search-input").addEventListener("input", () => {
       clearTimeout(state.wpSearchTimer);
       state.wpSearchTimer = setTimeout(() => {
-        const q = $("wp-search-input").value.trim();
-        if (q && state.wpCategory === "live") {
-          state.wpCategory = "all";
-          document.querySelectorAll(".wp-cat").forEach((c) => c.classList.toggle("active", c.dataset.cat === "all"));
-        }
-        searchWallpapers(q, 1, false);
+        searchWallpapers($("wp-search-input").value.trim(), 1, false);
       }, 450);
     });
     document.querySelectorAll(".wp-cat").forEach((btn) => {
@@ -2468,7 +2747,7 @@
       searchWallpapers($("wp-search-input").value.trim(), state.wpPage + 1, true);
     });
 
-    // Settings, Claude Code Core Channel (stable/latest) & Shell Updater
+    // Settings, Claude Code Core Detector & Safe Switcher + Shell Updater
     document.querySelectorAll(".prompt-preset").forEach((b) =>
       b.addEventListener("click", () => { $("set-system-prompt").value = PROMPT_PRESETS[b.dataset.preset] || ""; }),
     );
@@ -2478,14 +2757,17 @@
         body: JSON.stringify({
           system_prompt: $("set-system-prompt").value,
           prompt_mode: $("set-prompt-mode")?.value || "replace",
+          engine_mode: $("set-engine-mode")?.value || "auto",
           permission_mode: $("set-permission-mode").value,
           default_cwd: $("set-default-cwd").value.trim(),
           update_channel: $("set-update-channel").value,
         }),
       });
       state.settings = res.settings;
+      updateThinkingSelector();
       toast("设置已保存并立即生效");
     });
+    $("btn-claude-check-ver")?.addEventListener("click", checkClaudeCoreVersions);
     $("btn-claude-install-stable")?.addEventListener("click", () => installOrSwitchClaudeCore("stable"));
     $("btn-claude-install-latest")?.addEventListener("click", () => installOrSwitchClaudeCore("latest"));
     $("btn-check-update").addEventListener("click", runUpdateCheck);

@@ -22,7 +22,7 @@ import {
   updateSessionMeta,
 } from "./db.mjs";
 import { runApiCompact, runOpenCodeApiTurn } from "./engine_api.mjs";
-import { detectClaudeRuntime, runNativeClaudeCodeTurn } from "./claude_runtime.mjs";
+import { cleanupClaudeSessionFiles, detectClaudeRuntime, runNativeClaudeCodeTurn } from "./claude_runtime.mjs";
 import { classifyError, logEvent, newReqId } from "./logger.mjs";
 
 export class SessionOrchestrator {
@@ -216,7 +216,10 @@ export class SessionOrchestrator {
       images: images !== null ? images : orig.images || [],
     });
 
-    // Clear claude_cli_sid resume linkage since we branched history
+    // Clean up previous CLI temp session file so repeated branching NEVER leaves scattered files on disk
+    if (meta.claude_cli_sid) {
+      cleanupClaudeSessionFiles([meta.claude_cli_sid]);
+    }
     updateSessionMeta(sessionId, { claude_cli_sid: "" });
 
     this.broadcast({
@@ -266,6 +269,9 @@ export class SessionOrchestrator {
     }
 
     const parentUserId = origAsst.parent_id;
+    if (meta.claude_cli_sid) {
+      cleanupClaudeSessionFiles([meta.claude_cli_sid]);
+    }
     updateSessionMeta(sessionId, { claude_cli_sid: "" });
 
     this._launchExecution({
@@ -408,9 +414,10 @@ export class SessionOrchestrator {
             : null;
 
         const claudeRt = detectClaudeRuntime(false);
+        const engineMode = settings.engine_mode || "auto"; // auto | claude_code | api_direct
         const useNativeClaudeCode =
           provider.kind === "claude_native" ||
-          (settings.engine_mode !== "api_direct" && claudeRt.mode !== "missing" && !process.env.OPENCODE_FORCE_API_DIRECT);
+          (engineMode !== "api_direct" && claudeRt.mode !== "missing" && !process.env.OPENCODE_FORCE_API_DIRECT);
 
         let lastPushTs = 0;
         const pushLive = (force = false) => {
