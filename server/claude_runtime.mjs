@@ -14,17 +14,22 @@
  *      custom system prompt, fork-session branching, and privacy flags.
  */
 
+import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { getAllSettings, listInstalledMcps, listInstalledSkills, listMemories } from "./db.mjs";
+import { getAllSettings, listInstalledMcps, listInstalledSkills } from "./db.mjs";
 import { appendTurnLog, classifyError, logEvent } from "./logger.mjs";
+import { buildUnifiedMemoryContext, syncDiskMemoriesToDb } from "./memory_sync.mjs";
 import { detectModelCapabilities } from "./model_registry.mjs";
 import { getPaths, PROJECT_ROOT } from "./paths.mjs";
 
 let _cachedRuntime = null;
 let _cachedAt = 0;
+// Track last injected memory digest per CLI session so memories are injected once per session
+// and re-injected automatically whenever disk or Web UI memories change.
+const _lastSessionMemHash = new Map();
 
 export function clearRuntimeCache() {
   _cachedRuntime = null;
@@ -962,18 +967,15 @@ export async function installOrSwitchClaudeVersion({ channel = "stable", forceNa
   };
 }
 
-function buildCustomPromptAndMcp(cwd, rtMode) {
+export function buildCustomPromptAndMcp(cwd, rtMode) {
   const settings = getAllSettings();
-  const base = String(settings.system_prompt || "").trim();
+  const basePrompt = String(settings.system_prompt || "").trim();
   const mode = settings.prompt_mode || "replace"; // replace | append | native
 
   const extraSections = [];
-  const mems = listMemories({ cwd });
-  const pinned = mems.filter((m) => m.pinned).slice(0, 8);
-  if (pinned.length) {
-    extraSections.push(
-      "[用户置顶记忆]\n" + pinned.map((m) => `- ${m.title}: ${m.content.slice(0, 220).replace(/\s+/g, " ")}`).join("\n"),
-    );
+  const memoryBlock = buildUnifiedMemoryContext({ cwd, rtMode });
+  if (memoryBlock) {
+    extraSections.push(memoryBlock);
   }
   const skills = listInstalledSkills().filter((s) => s.enabled);
   if (skills.length) {
@@ -983,7 +985,20 @@ function buildCustomPromptAndMcp(cwd, rtMode) {
     );
   }
 
-  const combined = [base, ...extraSections].filter(Boolean).join("\n\n");
+  const extraContext = extraSections.filter(Boolean).join("\n\n");
+  // In native mode, preserve Claude's built-in system prompt while still appending unified memories & Skills!
+  const effectiveFlag =
+    mode === "replace"
+      ? "--system-prompt-file"
+      : extraContext || (mode === "append" && basePrompt)
+        ? "--append-system-prompt-file"
+        : "";
+  const effectivePromptText =
+    mode === "replace"
+      ? [basePrompt, extraContext].filter(Boolean).join("\n\n")
+      : mode === "append"
+        ? [basePrompt, extraContext].filter(Boolean).join("\n\n")
+        : extraContext;
 
   // Sync enabled Skills into managed SKILL.md folder for full portability
   const skillsDir = getPaths().skillsDir;
@@ -1021,7 +1036,15 @@ function buildCustomPromptAndMcp(cwd, rtMode) {
     mcpConfigPath = rtMode === "wsl" ? winPathToWsl(fp) : fp;
   }
 
-  return { promptMode: mode, promptText: combined, mcpConfigPath };
+  return {
+    promptMode: mode,
+    basePrompt,
+    memoryBlock,
+    extraContext,
+    promptFlag: effectiveFlag,
+    promptText: effectivePromptText,
+    mcpConfigPath,
+  };
 }
 
 function buildBridgeHistoryPrefix(historyItems) {
@@ -1078,7 +1101,7 @@ export async function runNativeClaudeCodeTurn({
   );
   const effectiveThinking =
     thinkingLevel && thinkingLevel !== "auto" ? thinkingLevel : (cap.thinking_supported ? cap.default_thinking : "off");
-  const { promptMode, promptText, mcpConfigPath } = buildCustomPromptAndMcp(cwd, rt.mode);
+  const { memoryBlock, promptFlag, promptText, mcpConfigPath } = buildCustomPromptAndMcp(cwd, rt.mode);
 
   // Build strictly isolated environment so native auth & API providers NEVER collide
   const env = {
@@ -1167,19 +1190,50 @@ export async function runNativeClaudeCodeTurn({
   } else if (effectiveThinking === "on") {
     args.push("--effort", "high");
   }
-  if (promptMode === "replace") {
-    const safePrompt = rt.isCmd ? promptText.replace(/\r?\n/g, " ") : promptText;
-    args.push("--system-prompt", safePrompt);
-  } else if (promptMode === "append" && promptText) {
-    const safePrompt = rt.isCmd ? promptText.replace(/\r?\n/g, " ") : promptText;
-    args.push("--append-system-prompt", safePrompt);
+  let tempPromptFile = null;
+  if (promptFlag && promptText) {
+    try {
+      const safeReq = String(reqId || Date.now()).replace(/[^a-z0-9_-]/gi, "_");
+      tempPromptFile = path.join(getPaths().logsDir, `prompt_${safeReq}.txt`);
+      fs.writeFileSync(tempPromptFile, promptText, "utf8");
+      const cliPromptPath = rt.mode === "wsl" ? winPathToWsl(tempPromptFile) : tempPromptFile;
+      args.push(promptFlag, cliPromptPath);
+    } catch {
+      const fallbackFlag = promptFlag === "--system-prompt-file" ? "--system-prompt" : "--append-system-prompt";
+      const safePrompt = rt.isCmd ? promptText.replace(/\r?\n/g, " ") : promptText;
+      args.push(fallbackFlag, safePrompt);
+      tempPromptFile = null;
+    }
   }
+  const cleanupTempPrompt = () => {
+    if (!tempPromptFile) return;
+    try {
+      fs.unlinkSync(tempPromptFile);
+    } catch {}
+    tempPromptFile = null;
+  };
   if (mcpConfigPath) {
     args.push("--mcp-config", mcpConfigPath);
   }
 
   const promptBody =
     resumeCliSid ? latestUser.content_text || "" : buildBridgeHistoryPrefix(historyItems) + (latestUser.content_text || "");
+
+  // Inject unified memories as a clean <system-reminder> in the first turn (or whenever memories change).
+  // Many OpenAI-compatible relays truncate Claude Code's ~28KB system prompt tail; placing memories
+  // in <system-reminder> matches Claude Code's own dynamic memory delivery and guarantees 100% recall!
+  let memoryReminderPrefix = "";
+  let injectedMemHash = "";
+  if (memoryBlock) {
+    injectedMemHash = crypto.createHash("sha1").update(memoryBlock).digest("hex").slice(0, 12);
+    const sessionKey = resumeCliSid || sessionId || "default";
+    const needInject = !resumeCliSid || _lastSessionMemHash.get(sessionKey) !== injectedMemHash;
+    if (needInject) {
+      memoryReminderPrefix = `<system-reminder>\n${memoryBlock}\n</system-reminder>\n\n`;
+      _lastSessionMemHash.set(sessionKey, injectedMemHash);
+      if (sessionId) _lastSessionMemHash.set(sessionId, injectedMemHash);
+    }
+  }
 
   const contentBlocks = [];
   const attachedFileNotes = [];
@@ -1220,7 +1274,9 @@ export async function runNativeClaudeCodeTurn({
       );
     }
   }
-  const finalUserText = [promptBody, ...attachedFileNotes].filter(Boolean).join("\n\n") || "请查看附带的文件或图片。";
+  const finalUserText =
+    memoryReminderPrefix +
+    ([promptBody, ...attachedFileNotes].filter(Boolean).join("\n\n") || "请查看附带的文件或图片。");
   contentBlocks.push({ type: "text", text: finalUserText });
 
   appendTurnLog(
@@ -1362,6 +1418,7 @@ export async function runNativeClaudeCodeTurn({
     });
 
     proc.on("error", (err) => {
+      cleanupTempPrompt();
       reject(
         classifyError({
           message: err.message,
@@ -1376,6 +1433,14 @@ export async function runNativeClaudeCodeTurn({
     });
 
     proc.on("close", (code) => {
+      cleanupTempPrompt();
+      if (cliSessionId && injectedMemHash) {
+        _lastSessionMemHash.set(cliSessionId, injectedMemHash);
+      }
+      try {
+        // Keep SQLite memory library automatically in sync if Claude created/updated disk .md memories during this turn
+        syncDiskMemoriesToDb({ force: true });
+      } catch {}
       appendTurnLog(sessionId, `=== CLAUDE EXIT rc=${code} blocks=${blocks.length} cli_sid=${cliSessionId} ===`);
       if (signal?.aborted) {
         return resolve({

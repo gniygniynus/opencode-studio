@@ -28,6 +28,9 @@ const { executeBuiltinTool, isDangerousCommand } = await import("../server/tools
 const { compareSemver } = await import("../server/updater.mjs");
 const { CURATED_MCPS, CURATED_SKILLS, CURATED_WALLPAPERS } = await import("../server/stores.mjs");
 const { isPathInsideDir, scanAuthorizedWallpaperLibrary } = await import("../server/wallpaper_engine.mjs");
+const { buildCustomPromptAndMcp } = await import("../server/claude_runtime.mjs");
+const { buildTransparentSystemPrompt } = await import("../server/engine_api.mjs");
+const { getActiveClaudeMemoryRoot, resetMemorySyncCache } = await import("../server/memory_sync.mjs");
 const { startServer } = await import("../server/index.mjs");
 
 let mockLlmServer;
@@ -488,5 +491,74 @@ describe("OpenCode Studio Core Suite", () => {
     } finally {
       await new Promise((r) => strictRelay.close(r));
     }
+  });
+
+  it("syncs disk memories bidirectionally without duplicates and injects full memory indexes in native/append/replace modes", async () => {
+    resetMemorySyncCache();
+    const claudeRoot = getActiveClaudeMemoryRoot();
+    const legacyMemDir = path.join(claudeRoot, "projects", "-mnt-legacy-home", "memory");
+    fs.mkdirSync(legacyMemDir, { recursive: true });
+
+    const longPadding = "这是一段超过二百二十字符的详细项目索引背景说明。".repeat(30);
+    const sentinel = "PROJECT_SENTINEL_ALPHA_9981";
+    const memoryMd = `# 记忆索引\n\n${longPadding}\n\n## 活跃项目\n- [关键项目 Alpha](project_alpha.md) — ${sentinel}\n`;
+    const alphaFile = path.join(legacyMemDir, "project_alpha.md");
+
+    fs.writeFileSync(path.join(claudeRoot, "CLAUDE.md"), "# 全局规则\n始终遵守严格核验原则。\n", "utf8");
+    fs.writeFileSync(path.join(legacyMemDir, "MEMORY.md"), memoryMd, "utf8");
+    fs.writeFileSync(alphaFile, "---\nname: project-alpha\ntype: project\n---\n\n初始 Alpha 详情\n", "utf8");
+
+    // 1. GET /api/memories auto-discovers disk memories with zero duplicates on repeated calls
+    const list1 = await fetch(`${studioServer.url}/api/memories`).then((r) => r.json());
+    const alphaRow = list1.memories.find((m) => m.title === "project-alpha");
+    assert.ok(alphaRow, "disk memory project_alpha.md should be synced into SQLite");
+    const countBefore = list1.memories.length;
+    const list2 = await fetch(`${studioServer.url}/api/memories`).then((r) => r.json());
+    assert.equal(list2.memories.length, countBefore, "repeated sync must never duplicate memory rows");
+
+    // 2. Native prompt_mode must STILL inject complete (non-220-char-truncated) memory index & cross-cwd paths
+    await fetch(`${studioServer.url}/api/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ system_prompt: "CUSTOM_BASE_PROMPT_XYZ", prompt_mode: "native" }),
+    });
+    const nativeBuilt = buildCustomPromptAndMcp(tmpWorkdir, "native");
+    assert.equal(nativeBuilt.promptFlag, "--append-system-prompt-file");
+    assert.ok(!nativeBuilt.promptText.includes("CUSTOM_BASE_PROMPT_XYZ"), "native mode keeps Claude default base prompt");
+    assert.ok(nativeBuilt.promptText.includes(sentinel), "native mode must inject full MEMORY.md past 220 chars");
+    assert.ok(nativeBuilt.promptText.includes("-mnt-legacy-home"), "must expose cross-cwd memory library path");
+
+    // 3. Replace prompt_mode must use --system-prompt-file with BOTH custom base prompt & full memories
+    await fetch(`${studioServer.url}/api/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ system_prompt: "CUSTOM_BASE_PROMPT_XYZ", prompt_mode: "replace" }),
+    });
+    const replaceBuilt = buildCustomPromptAndMcp(tmpWorkdir, "native");
+    assert.equal(replaceBuilt.promptFlag, "--system-prompt-file");
+    assert.ok(replaceBuilt.promptText.includes("CUSTOM_BASE_PROMPT_XYZ"));
+    assert.ok(replaceBuilt.promptText.includes(sentinel));
+
+    // 4. API direct engine also injects full memory index without 220-char truncation
+    const apiSysPrompt = buildTransparentSystemPrompt(tmpWorkdir);
+    assert.ok(apiSysPrompt.includes(sentinel));
+
+    // 5. Bidirectional sync: editing a synced memory in Web UI writes straight back to its disk .md file
+    const updatedContent = "---\nname: project-alpha\ntype: project\n---\n\n已通过工作台更新 Alpha 详情\n";
+    const postRes = await fetch(`${studioServer.url}/api/memories`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: alphaRow.id,
+        scope: alphaRow.scope,
+        cwd: alphaRow.cwd,
+        title: alphaRow.title,
+        category: alphaRow.category,
+        content: updatedContent,
+        pinned: alphaRow.pinned,
+      }),
+    }).then((r) => r.json());
+    assert.equal(postRes.disk_synced, true);
+    assert.equal(fs.readFileSync(alphaFile, "utf8"), updatedContent);
   });
 });

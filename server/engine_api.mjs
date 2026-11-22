@@ -9,8 +9,9 @@
  */
 
 import fs from "node:fs";
-import { getAllSettings, listInstalledSkills, listMemories } from "./db.mjs";
+import { getAllSettings, listInstalledSkills } from "./db.mjs";
 import { appendTurnLog, classifyError, logEvent } from "./logger.mjs";
+import { buildUnifiedMemoryContext } from "./memory_sync.mjs";
 import { buildApiEndpoint, detectModelCapabilities, THINKING_BUDGETS } from "./model_registry.mjs";
 import { BUILTIN_TOOLS, executeBuiltinTool } from "./tools.mjs";
 
@@ -25,19 +26,10 @@ export function buildTransparentSystemPrompt(cwd) {
     `\n[运行环境]\n- 操作系统: ${process.platform} (${process.arch})\n- 当前工作目录: ${cwd}\n- 提示: 操作文件与命令默认相对于当前工作目录。`,
   );
 
-  // Inject concise index of pinned/project memories (keeps constant token usage slim!)
-  const mems = listMemories({ cwd });
-  const pinned = mems.filter((m) => m.pinned).slice(0, 8);
-  const others = mems.filter((m) => !m.pinned).slice(0, 12);
-  if (pinned.length || others.length) {
-    const lines = ["\n[持久化记忆索引（详细内容可调用 memory_search 按需读取）]"];
-    for (const m of pinned) {
-      lines.push(`- [置顶/${m.scope}] ${m.title}: ${m.content.slice(0, 220).replace(/\s+/g, " ")}`);
-    }
-    for (const m of others) {
-      lines.push(`- [${m.scope}/${m.category}] ${m.title}`);
-    }
-    parts.push(lines.join("\n"));
+  // Inject unified live memories (full core rules + full MEMORY.md indexes + pinned web memories, never 220-char truncated)
+  const unifiedMem = buildUnifiedMemoryContext({ cwd, rtMode: "native", includeToolHint: true });
+  if (unifiedMem) {
+    parts.push(`\n${unifiedMem}`);
   }
 
   // Inject enabled installed Skills

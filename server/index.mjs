@@ -63,6 +63,7 @@ import {
   tailLogs,
 } from "./logger.mjs";
 import { McpManager } from "./mcp_client.mjs";
+import { resetMemorySyncCache, syncDiskMemoriesToDb, syncMemoryToDisk } from "./memory_sync.mjs";
 import { enrichProviderForClient, fetchProviderModels } from "./model_registry.mjs";
 import { SessionOrchestrator } from "./orchestrator.mjs";
 import { getPaths, PUBLIC_DIR } from "./paths.mjs";
@@ -791,9 +792,12 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         broadcast({ type: "settings_updated", settings: next });
         if (isolationChanged) {
           clearRuntimeCache();
-          // Refresh Claude runtime asynchronously so saving settings never blocks for seconds
+          resetMemorySyncCache();
+          // Refresh Claude runtime & sync active Claude directory memories asynchronously
           setImmediate(() => {
             try {
+              syncDiskMemoriesToDb({ force: true });
+              broadcast({ type: "memories_updated" });
               broadcast({ type: "claude_status_updated", claude_native: getClaudeRuntimeAndAuth(true) });
             } catch {}
           });
@@ -908,8 +912,9 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         return sendJson(res, 200, { ok: true, timeline });
       }
 
-      // ==================== MEMORIES (CONCURRENCY-SAFE) ====================
+      // ==================== MEMORIES (CONCURRENCY-SAFE & DISK-SYNCED) ====================
       if (method === "GET" && pathname === "/api/memories") {
+        syncDiskMemoriesToDb();
         const q = urlObj.searchParams.get("q") || "";
         const scope = urlObj.searchParams.get("scope") || "";
         const cwd = urlObj.searchParams.get("cwd") || "";
@@ -918,8 +923,9 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       if (method === "POST" && pathname === "/api/memories") {
         const body = await readJsonBody(req);
         const saved = saveMemory(body);
+        const diskSync = syncMemoryToDisk(saved);
         broadcast({ type: "memories_updated" });
-        return sendJson(res, 200, { ok: true, memory: saved });
+        return sendJson(res, 200, { ok: true, memory: saved, disk_synced: Boolean(diskSync.written) });
       }
       if (method === "DELETE" && pathname.match(/^\/api\/memories\/([^/]+)$/)) {
         const id = pathname.split("/")[3];
