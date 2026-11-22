@@ -77,11 +77,16 @@ import {
 import { checkForUpdates, getAppVersion } from "./updater.mjs";
 import {
   detectSteamWallpaperEngineDirs,
+  findWallpaperEngineInstall,
   getAuthorizedWallpaperItem,
+  launchWallpaperEngineApp,
+  readCurrentWallpaperEngineSelection,
   scanAuthorizedWallpaperLibrary,
   serializeWeItemForClient,
   serveAuthorizedWebAsset,
+  stopWallpaperEngineWatcher,
   streamAuthorizedMedia,
+  syncWallpaperEngineWatcher,
 } from "./wallpaper_engine.mjs";
 
 const MIME = {
@@ -685,6 +690,18 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
   const orchestrator = new SessionOrchestrator({ broadcast, mcpManager, getPort: () => boundPort });
   const appVersion = getAppVersion();
 
+  const refreshWeWatcher = () => {
+    const weCfg = getAllSettings().wallpaper_engine || {};
+    syncWallpaperEngineWatcher({
+      enabled: Boolean(weCfg.authorized && weCfg.auto_sync !== false && weCfg.dirs?.length),
+      authorizedDirs: weCfg.dirs || [],
+      onSelectionChange: (selection) => {
+        broadcast({ type: "we_selection_changed", selection });
+      },
+    });
+  };
+  refreshWeWatcher();
+
   const server = http.createServer(async (req, res) => {
     const reqId = newReqId();
     try {
@@ -789,6 +806,9 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         if (isolationChanged) {
           clearRuntimeCache();
           broadcast({ type: "claude_status_updated", claude_native: getClaudeRuntimeAndAuth(true) });
+        }
+        if (body.wallpaper_engine !== undefined) {
+          refreshWeWatcher();
         }
         return sendJson(res, 200, {
           ok: true,
@@ -1052,29 +1072,56 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         return sendJson(res, 200, { ok: true, ...cleared, storage: getWallpaperStorageStats(paths.backgroundsDir) });
       }
 
-      // ==================== WALLPAPER ENGINE (STEAM 431960) & LOCAL 4K ZERO-COPY BRIDGE ====================
+      // ==================== WALLPAPER ENGINE (STEAM 431960) LIVE SYNC & ZERO-COPY LOSSLESS BRIDGE ====================
+      if (method === "POST" && pathname === "/api/we/launch") {
+        const body = await readJsonBody(req).catch(() => ({}));
+        let openFile = "";
+        if (body.item_id) {
+          const weCfg = getAllSettings().wallpaper_engine || {};
+          if (!weCfg.authorized) return sendJson(res, 403, { ok: false, error: "尚未授权访问 Wallpaper Engine" });
+          const item = getAuthorizedWallpaperItem(body.item_id, weCfg.dirs || []);
+          if (item?.file_path) openFile = item.file_path;
+        }
+        const resLaunch = launchWallpaperEngineApp(openFile);
+        return sendJson(res, resLaunch.ok ? 200 : 500, resLaunch);
+      }
+      if (method === "GET" && pathname === "/api/we/current") {
+        const weCfg = getAllSettings().wallpaper_engine || { authorized: false, dirs: [] };
+        if (!weCfg.authorized) {
+          return sendJson(res, 200, { ok: true, authorized: false, current: null });
+        }
+        const current = readCurrentWallpaperEngineSelection(weCfg.dirs || []);
+        return sendJson(res, 200, { ok: true, authorized: true, current });
+      }
       if (method === "GET" && pathname === "/api/we/status") {
-        const weCfg = getAllSettings().wallpaper_engine || { authorized: false, dirs: [], video_muted: true };
+        const weCfg = getAllSettings().wallpaper_engine || { authorized: false, dirs: [], auto_sync: true, passthrough: false, video_muted: true };
         const force = urlObj.searchParams.get("refresh") === "1";
         const q = (urlObj.searchParams.get("q") || "").trim().toLowerCase();
+        const install = findWallpaperEngineInstall(weCfg.dirs || []);
         const items =
           weCfg.authorized && weCfg.dirs?.length
             ? scanAuthorizedWallpaperLibrary(weCfg.dirs, force)
                 .map(serializeWeItemForClient)
                 .filter((it) => !q || it.title.toLowerCase().includes(q) || (it.tags || []).some((t) => t.toLowerCase().includes(q)))
             : [];
+        const current = weCfg.authorized ? readCurrentWallpaperEngineSelection(weCfg.dirs || []) : null;
         return sendJson(res, 200, {
           ok: true,
           authorized: Boolean(weCfg.authorized),
+          we_installed: Boolean(install.install_dir),
+          install_dir: install.install_dir,
           dirs: weCfg.dirs || [],
+          auto_sync: weCfg.auto_sync !== false,
+          passthrough: Boolean(weCfg.passthrough),
           video_muted: weCfg.video_muted !== false,
+          current_selection: current,
           count: items.length,
           items,
         });
       }
       if (method === "POST" && pathname === "/api/we/authorize") {
         const body = await readJsonBody(req);
-        const cur = getAllSettings().wallpaper_engine || { authorized: false, dirs: [], video_muted: true };
+        const cur = getAllSettings().wallpaper_engine || { authorized: false, dirs: [], auto_sync: true, passthrough: false, video_muted: true };
         const dirSet = new Set((cur.dirs || []).map((d) => path.resolve(d)).filter((d) => fs.existsSync(d)));
         let detected = [];
         if (body.auto_detect) {
@@ -1092,28 +1139,37 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         const nextCfg = {
           authorized: nextDirs.length > 0,
           dirs: nextDirs,
+          auto_sync: body.auto_sync !== undefined ? Boolean(body.auto_sync) : cur.auto_sync !== false,
+          passthrough: body.passthrough !== undefined ? Boolean(body.passthrough) : Boolean(cur.passthrough),
           video_muted: body.video_muted !== undefined ? Boolean(body.video_muted) : cur.video_muted !== false,
         };
         setSetting("wallpaper_engine", nextCfg);
         const items = nextDirs.length ? scanAuthorizedWallpaperLibrary(nextDirs, true).map(serializeWeItemForClient) : [];
+        const current = nextDirs.length ? readCurrentWallpaperEngineSelection(nextDirs) : null;
+        refreshWeWatcher();
         broadcast({ type: "settings_updated", settings: getAllSettings() });
         return sendJson(res, 200, {
           ok: true,
           authorized: nextCfg.authorized,
           dirs: nextDirs,
           detected_count: detected.length,
+          auto_sync: nextCfg.auto_sync,
+          passthrough: nextCfg.passthrough,
           video_muted: nextCfg.video_muted,
+          current_selection: current,
           count: items.length,
           items,
           message:
             nextDirs.length === 0
-              ? "未在本机 Steam 默认路径自动检测到 Wallpaper Engine (431960)，您可点击「手动添加目录」授权任意 Steam 创意工坊目录或本地 4K 壁纸文件夹。"
-              : `已授权 ${nextDirs.length} 个本地目录，扫描到 ${items.length} 个壁纸（零拷贝流式直连，0 额外占用）。`,
+              ? "未在本机 Steam 默认路径自动检测到 Wallpaper Engine (431960)，您可点击「添加本地壁纸文件夹」手动授权。"
+              : current?.found
+                ? `已授权并自动识别您当前在 Wallpaper Engine 选用的壁纸：「${current.title}」`
+                : `已授权 ${nextDirs.length} 个目录（扫描到 ${items.length} 个壁纸），现在打开 Wallpaper Engine 选任意壁纸即可自动实时识别！`,
         });
       }
       if (method === "POST" && pathname === "/api/we/revoke") {
         const body = await readJsonBody(req).catch(() => ({}));
-        const cur = getAllSettings().wallpaper_engine || { authorized: false, dirs: [], video_muted: true };
+        const cur = getAllSettings().wallpaper_engine || { authorized: false, dirs: [], auto_sync: true, passthrough: false, video_muted: true };
         let nextDirs = [];
         if (body.remove_dir) {
           const rm = path.resolve(String(body.remove_dir)).toLowerCase();
@@ -1122,15 +1178,20 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         const nextCfg = {
           authorized: nextDirs.length > 0,
           dirs: nextDirs,
+          auto_sync: cur.auto_sync !== false,
+          passthrough: nextDirs.length > 0 ? Boolean(cur.passthrough) : false,
           video_muted: cur.video_muted !== false,
         };
         setSetting("wallpaper_engine", nextCfg);
         const items = nextDirs.length ? scanAuthorizedWallpaperLibrary(nextDirs, true).map(serializeWeItemForClient) : [];
+        const current = nextDirs.length ? readCurrentWallpaperEngineSelection(nextDirs) : null;
+        refreshWeWatcher();
         broadcast({ type: "settings_updated", settings: getAllSettings() });
         return sendJson(res, 200, {
           ok: true,
           authorized: nextCfg.authorized,
           dirs: nextDirs,
+          current_selection: current,
           count: items.length,
           items,
         });
@@ -1471,6 +1532,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
     mcpManager,
     orchestrator,
     async stop() {
+      stopWallpaperEngineWatcher();
       mcpManager.stopAll();
       for (const ws of wsClients) {
         try {

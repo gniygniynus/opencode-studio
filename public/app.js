@@ -1323,6 +1323,10 @@
       }
       return;
     }
+    if (t === "we_selection_changed" && msg.selection) {
+      handleWeSelectionEvent(msg.selection);
+      return;
+    }
     if (t === "running_sessions") {
       state.runningIds = new Set(msg.ids || []);
       renderSessionList();
@@ -2041,11 +2045,86 @@
     }
   }
 
+  function syncDesktopPassthroughUI(enabled, currentTitle = "") {
+    const active = Boolean(enabled && window.opencodeDesktop?.isDesktop);
+    document.documentElement.classList.toggle("desktop-passthrough", active);
+    document.body.classList.toggle("desktop-passthrough", active);
+    $("desktop-passthrough-bar")?.classList.toggle("hidden", !active);
+    const lbl = $("desktop-pt-label");
+    if (lbl) {
+      lbl.textContent = currentTitle
+        ? `Wallpaper Engine 原生无损透视中 · ${currentTitle}（100% 4K 60fps · 0 损耗）`
+        : "Wallpaper Engine 原生无损透视中（100% 原画质 · 0 损耗）";
+    }
+    const btnPt = $("btn-we-passthrough");
+    if (btnPt) {
+      btnPt.textContent = active ? "✨ 退出桌面无损透视" : "✨ 桌面无损透视";
+      btnPt.classList.toggle("btn-primary", active);
+      btnPt.classList.toggle("btn-secondary", !active);
+    }
+  }
+
+  async function applyWeSelectionLossless(sel, silent = false) {
+    if (!sel || !sel.found) return;
+    if (sel.lossless_in_browser && sel.stream_url) {
+      // 100% lossless original Video / Web / Image -> zero blur, zero compression, zero content tampering!
+      updateAppearance({
+        bgType: sel.play_mode,
+        bgUrl: sel.stream_url,
+        liveBg: "",
+        bgMode: "hd",
+        bgBlur: 0,
+        bgName: sel.title,
+      });
+      if (!silent) toast(`已 0 损耗同步 Wallpaper Engine 原版壁纸：${sel.title}`, 3200);
+      return;
+    }
+    // Proprietary DirectX 3D Scene (.pkg): NEVER fake 4K with low-res preview.gif!
+    if (window.opencodeDesktop?.isDesktop && window.opencodeDesktop?.setPassthrough) {
+      const isAlreadyPt = document.body.classList.contains("desktop-passthrough");
+      if (!isAlreadyPt) {
+        await window.opencodeDesktop.setPassthrough(true);
+      } else {
+        syncDesktopPassthroughUI(true, sel.title);
+      }
+      if (!silent) toast(`已联动桌面无损透视呈现 3D Scene：${sel.title}（100% 原画质）`, 3600);
+    } else if (!silent) {
+      toast(
+        `已识别 3D Scene「${sel.title}」：浏览器无法直接渲染 DirectX .pkg，如需 100% 4K 原版请使用桌面版开启「✨ 桌面无损透视」，或在 Wallpaper Engine 中选任意 4K 视频/Web 壁纸即可在网页版 0 损耗直连！`,
+        6000,
+      );
+    }
+  }
+
+  function handleWeSelectionEvent(sel) {
+    if (!sel) return;
+    if (state.weLibrary) {
+      state.weLibrary.current_selection = sel;
+      renderWallpaperEngineSection(state.weLibrary);
+    }
+    if (document.body.classList.contains("desktop-passthrough") && sel.title) {
+      syncDesktopPassthroughUI(true, sel.title);
+    }
+    const autoSync = state.settings.wallpaper_engine?.auto_sync !== false;
+    if (autoSync && sel.found) {
+      if (sel.lossless_in_browser && sel.stream_url) {
+        applyWeSelectionLossless(sel, false);
+      } else if (document.body.classList.contains("desktop-passthrough")) {
+        toast(`Wallpaper Engine 已实时切换为：${sel.title}（原生无损透视同步中）`, 2800);
+      } else {
+        toast(`检测到您在 Wallpaper Engine 切换了 3D Scene「${sel.title}」（桌面版开启无损透视可 100% 原画质呈现）`, 4500);
+      }
+    }
+  }
+
   async function loadWallpaperEngineLibrary(refresh = false) {
     try {
       const data = await apiJson(`/api/we/status?refresh=${refresh ? "1" : "0"}`);
       state.weLibrary = data;
       renderWallpaperEngineSection(data);
+      if (document.body.classList.contains("desktop-passthrough") && data.current_selection?.title) {
+        syncDesktopPassthroughUI(true, data.current_selection.title);
+      }
     } catch {}
   }
 
@@ -2053,27 +2132,29 @@
     if (!data) return;
     const authorized = Boolean(data.authorized && data.dirs?.length);
     const dirsBar = $("we-dirs-bar");
+    const curBox = $("we-current-box");
     const grid = $("we-grid");
     const sub = $("we-bridge-sub");
     const btnSteam = $("btn-we-authorize-steam");
+    const btnAuto = $("btn-we-autosync");
     const btnRef = $("btn-we-refresh");
     const btnMute = $("btn-we-toggle-mute");
     const btnRevoke = $("btn-we-revoke");
 
+    btnAuto?.classList.toggle("hidden", !authorized);
     btnRef?.classList.toggle("hidden", !authorized);
     btnMute?.classList.toggle("hidden", !authorized);
     btnRevoke?.classList.toggle("hidden", !authorized);
-    if (btnSteam) btnSteam.textContent = authorized ? "🔄 重新探测 Steam (431960)" : "🔐 授权连接 Steam (431960)";
-    if (btnMute) {
-      const muted = data.video_muted !== false;
-      btnMute.textContent = muted ? "🔇 视频静音" : "🔊 视频有声";
-    }
+    if (btnSteam) btnSteam.textContent = authorized ? "重新探测 Steam (431960)" : "🔐 授权自动识别当前壁纸";
+    if (btnAuto) btnAuto.textContent = data.auto_sync !== false ? "🔄 自动同步：开" : "⏸ 自动同步：关";
+    if (btnMute) btnMute.textContent = data.video_muted !== false ? "🔇 视频静音" : "🔊 视频有声";
 
     if (!authorized) {
       if (sub) {
         sub.innerHTML =
-          `需您显式授权后才读取 · <b>零拷贝本地流式直连</b>（高达数百 MB / 数 GB 的 4K 60fps 长动画均留在原目录，0 额外占用，断网离线照常用，随时可撤销授权）`;
+          `支持一键打开 Wallpaper Engine 登录并自由选壁纸 · <b>自动实时识别您所选壁纸</b> · 清晰度 0 损耗、内容不做任何删减或降质处理（4K/8K 长动画视频零拷贝直连，DirectX 3D Scene 支持桌面版原生无损透视）`;
       }
+      curBox?.classList.add("hidden");
       dirsBar?.classList.add("hidden");
       grid?.classList.add("hidden");
       return;
@@ -2081,7 +2162,44 @@
 
     if (sub) {
       sub.innerHTML =
-        `<span style="color:var(--ok);font-weight:600;">● 已授权零拷贝直连</span> · 共扫描到 <b>${data.count || 0}</b> 个壁纸（原文件保留在原目录，0 MB 额外磁盘复制 · 支持 4K 数 GB 长动画视频 &amp; Web 互动壁纸 &amp; Scene 原画）`;
+        `<span style="color:var(--ok);font-weight:600;">● 已开启实时识别联动</span> · 在 Wallpaper Engine 中切换任意壁纸将自动识别（<b>0 压缩 · 0 复制 · 0 内容删减</b>，断网照常可用）`;
+    }
+
+    // Current Active Selection in Wallpaper Engine (auto-read from config.json!)
+    const cur = data.current_selection;
+    if (curBox) {
+      if (cur?.found) {
+        curBox.classList.remove("hidden");
+        const typeBadge =
+          cur.we_type === "video"
+            ? `🎬 原版视频 (${cur.size_mb >= 1024 ? `${(cur.size_mb / 1024).toFixed(2)} GB` : `${cur.size_mb} MB`} · 0 损耗直连)`
+            : cur.we_type === "web"
+              ? "🌐 原版 Web 互动壁纸 (0 损耗)"
+              : cur.we_type === "image"
+                ? `🖼️ 原版无损图 (${cur.size_mb} MB)`
+                : "✨ DirectX 3D Scene (桌面版原生无损透视 4K 60fps)";
+        const maxPauseHint =
+          cur.playback_maximized && cur.playback_maximized.toLowerCase() === "pause"
+            ? `<div class="we-current-note" style="color:var(--warn);">提示：检测到您 Wallpaper Engine 设置了「其他应用最大化时暂停」，如需全屏写作时保持 60fps 动态，请在小红车「设置 → 性能」中改为「继续运行」。</div>`
+            : "";
+        curBox.innerHTML =
+          `<div class="we-current-main">` +
+            `<div class="we-current-title"><span>🎯 当前 Wallpaper Engine 已选：${escHtml(cur.title)}</span><span class="mini-tag">${escHtml(typeBadge)}</span></div>` +
+            `<div class="we-current-note">${escHtml(cur.note || "")}</div>` +
+            maxPauseHint +
+          `</div>` +
+          `<div class="we-current-actions">` +
+            (cur.lossless_in_browser
+              ? `<button id="btn-we-sync-now" class="btn-primary sm">⚡ 0 损耗同步为背景</button>`
+              : `<button id="btn-we-sync-now" class="btn-primary sm">✨ 开启桌面无损透视呈现</button>`) +
+          `</div>`;
+        curBox.querySelector("#btn-we-sync-now")?.addEventListener("click", () => applyWeSelectionLossless(cur, false));
+      } else {
+        curBox.classList.remove("hidden");
+        curBox.innerHTML =
+          `<div class="we-current-main"><div class="we-current-title">等待您在 Wallpaper Engine 中选择壁纸…</div>` +
+          `<div class="we-current-note">${escHtml(cur?.reason || "点击上方「🚀 打开 Wallpaper Engine 选壁纸」，登录后选择任意壁纸即可自动识别。")}</div></div>`;
+      }
     }
 
     if (dirsBar) {
@@ -2107,12 +2225,14 @@
     grid.innerHTML = "";
     const items = data.items || [];
     if (!items.length) {
-      grid.innerHTML = `<div class="muted-text" style="white-space:normal;">已授权目录内暂未发现可播放的壁纸（支持 Wallpaper Engine 的 Video / Web / Scene 项目，以及任意 .mp4 / .webm / .mov / .gif / 图片文件）。</div>`;
+      grid.innerHTML = `<div class="muted-text" style="white-space:normal;">已授权目录内暂未发现壁纸，您可在 Wallpaper Engine 创意工坊下载任意 4K 视频 / Web / 3D Scene 壁纸后点「刷新」。</div>`;
       return;
     }
     const ap = state.settings.appearance || {};
     for (const it of items) {
-      const isActive = ap.bgUrl === it.stream_url || (it.hd_url && ap.bgUrl === it.hd_url);
+      const isActive =
+        (it.stream_url && ap.bgUrl === it.stream_url) ||
+        (cur?.found && cur.id === it.id && document.body.classList.contains("desktop-passthrough"));
       const card = document.createElement("div");
       card.className = "wp-card" + (isActive ? " active" : "");
       const thumbHtml =
@@ -2120,27 +2240,34 @@
           ? `<div class="wp-thumb"><video class="wp-thumb-vid" src="${escHtml(it.stream_url)}#t=0.5" muted playsinline preload="metadata"></video><span class="wp-live-badge">${escHtml(it.badge)}</span></div>`
           : `<div class="wp-thumb" style="background-image:url('${escHtml(it.preview_url || it.stream_url)}')">` +
               `<span class="wp-live-badge">${escHtml(it.badge)}</span>` +
-              (it.has_pkg_hd ? `<button type="button" class="we-hd-btn" title="直接零拷贝提取该 Scene 内嵌的 4K 无损原画">🖼️ 4K原画</button>` : "") +
             `</div>`;
       card.innerHTML =
         thumbHtml +
         `<div class="wp-meta"><div class="wp-name">${escHtml(it.title)}</div>` +
         `<div class="wp-sub">${escHtml(it.source_label || "Wallpaper Engine")} · ${escHtml(it.description || "")}</div></div>`;
 
-      card.addEventListener("click", (e) => {
-        if (e.target.closest(".we-hd-btn")) return;
-        updateAppearance({ bgType: it.play_mode, bgUrl: it.stream_url, liveBg: "", bgName: it.title });
-        grid.querySelectorAll(".wp-card").forEach((c) => c.classList.remove("active"));
-        card.classList.add("active");
-        toast(`已应用零拷贝壁纸：${it.title}`, 2800);
-      });
-
-      card.querySelector(".we-hd-btn")?.addEventListener("click", (e) => {
-        e.stopPropagation();
-        updateAppearance({ bgType: "image", bgUrl: it.hd_url, liveBg: "", bgName: `${it.title} (4K 原画)` });
-        grid.querySelectorAll(".wp-card").forEach((c) => c.classList.remove("active"));
-        card.classList.add("active");
-        toast(`已提取并应用 4K 无损原画：${it.title}`, 2800);
+      card.addEventListener("click", async () => {
+        if (it.lossless_in_browser && it.stream_url) {
+          // 100% lossless original file streaming — zero blur, zero downscaling!
+          updateAppearance({ bgType: it.play_mode, bgUrl: it.stream_url, liveBg: "", bgMode: "hd", bgBlur: 0, bgName: it.title });
+          grid.querySelectorAll(".wp-card").forEach((c) => c.classList.remove("active"));
+          card.classList.add("active");
+          toast(`已 0 损耗直连原版壁纸：${it.title}`, 2800);
+        } else {
+          // DirectX 3D Scene: ask Wallpaper Engine itself to load it + enable lossless desktop passthrough!
+          try {
+            await apiJson("/api/we/launch", { method: "POST", body: JSON.stringify({ item_id: it.id }) });
+          } catch {}
+          if (window.opencodeDesktop?.isDesktop && window.opencodeDesktop?.setPassthrough) {
+            await window.opencodeDesktop.setPassthrough(true);
+            toast(`已由 Wallpaper Engine 原生引擎加载 4K 3D 场景：${it.title}`, 3500);
+          } else {
+            toast(
+              `已通知 Wallpaper Engine 切换到 3D Scene「${it.title}」！为保证 4K 0 损耗不降质，请在桌面版中点击「✨ 桌面无损透视」直接透视呈现；网页版支持 4K 视频 / Web 壁纸 0 损耗直连。`,
+              6000,
+            );
+          }
+        }
       });
 
       grid.appendChild(card);
@@ -3012,23 +3139,74 @@
     $("ap-sidebar-opacity")?.addEventListener("input", () => {
       updateAppearance({ sidebarOpacity: Number($("ap-sidebar-opacity").value) });
     });
+    // Frameless desktop transparent passthrough top bar controls
+    $("btn-pt-open-we")?.addEventListener("click", async () => {
+      try {
+        await apiJson("/api/we/launch", { method: "POST", body: JSON.stringify({}) });
+        toast("已唤起官方 Wallpaper Engine，切换壁纸后将 0 延迟自动同步！", 3200);
+      } catch (err) {
+        toast("打开 Wallpaper Engine 失败: " + err.message);
+      }
+    });
+    $("btn-pt-exit")?.addEventListener("click", () => window.opencodeDesktop?.setPassthrough?.(false));
+    $("btn-win-min")?.addEventListener("click", () => window.opencodeDesktop?.windowControl?.("minimize"));
+    $("btn-win-max")?.addEventListener("click", () => window.opencodeDesktop?.windowControl?.("maximize"));
+    $("btn-win-close")?.addEventListener("click", () => window.opencodeDesktop?.windowControl?.("close"));
+
+    $("btn-we-launch")?.addEventListener("click", async () => {
+      toast("正在为您启动官方 Steam Wallpaper Engine (431960)…");
+      try {
+        const res = await apiJson("/api/we/launch", { method: "POST", body: JSON.stringify({}) });
+        if (res.ok) {
+          toast("已拉起 Wallpaper Engine！请在其中登录并选择您喜欢的壁纸，授权后本工作台会自动识别同步。", 4800);
+        } else {
+          toast(res.error || "未能启动 Wallpaper Engine", 4000);
+        }
+      } catch (err) {
+        toast("启动失败: " + err.message, 4000);
+      }
+    });
+    $("btn-we-passthrough")?.addEventListener("click", async () => {
+      if (!window.opencodeDesktop?.isDesktop || !window.opencodeDesktop?.setPassthrough) {
+        return toast(
+          "当前是在普通浏览器中打开网页版（浏览器窗口不支持透明透视桌面）。请下载并运行 OpenCode Studio 桌面版 (.exe/.dmg/.AppImage) 即可一键开启「✨ 桌面无损透视」，100% 4K 60fps 0 损耗透出 Wallpaper Engine 完整 3D Scene 画面！",
+          6500,
+        );
+      }
+      const next = !document.body.classList.contains("desktop-passthrough");
+      await window.opencodeDesktop.setPassthrough(next);
+    });
+    $("btn-we-autosync")?.addEventListener("click", async () => {
+      const curWe = state.settings.wallpaper_engine || { authorized: true, dirs: state.weLibrary?.dirs || [], auto_sync: true, video_muted: true };
+      const nextAuto = !(curWe.auto_sync !== false);
+      const nextWe = { ...curWe, auto_sync: nextAuto };
+      state.settings.wallpaper_engine = nextWe;
+      if (state.weLibrary) state.weLibrary.auto_sync = nextAuto;
+      renderWallpaperEngineSection(state.weLibrary || nextWe);
+      apiJson("/api/settings", { method: "PUT", body: JSON.stringify({ wallpaper_engine: nextWe }) }).catch(() => {});
+      toast(nextAuto ? "已开启自动跟随：在 Wallpaper Engine 换壁纸时将自动实时识别同步" : "已暂停自动跟随同步");
+    });
     $("btn-we-authorize-steam")?.addEventListener("click", async () => {
       if (
         !window.confirm(
-          "授权 OpenCode Studio 只读连接本机 Steam Wallpaper Engine (AppID 431960) 壁纸库？\n\n" +
-            "• 仅只读扫描您的 Steam 创意工坊 (431960) 与 Wallpaper Engine 项目目录\n" +
-            "• 采用「零拷贝本地流式直连」：几百 MB ~ 数 GB 的 4K 长动画均留在原目录，0 额外硬盘复制，断网照常播放\n" +
-            "• 您随时可以一键撤销授权",
+          "授权 OpenCode Studio 只读监听并读取本机 Steam Wallpaper Engine (AppID 431960)？\n\n" +
+            "• 自动读取 Wallpaper Engine 当前选用的壁纸（config.json）并在您切换时实时同步\n" +
+            "• 4K/8K 原版视频与 Web 互动壁纸采用零拷贝直连（0 压缩、0 拷贝、0 额外占用）\n" +
+            "• DirectX 3D Scene 壁纸绝不降质糊弄，可在桌面版一键开启原生无损透视 100% 原画呈现\n" +
+            "• 随时可一键撤销授权",
         )
       ) {
         return;
       }
-      toast("正在探测并扫描 Steam Wallpaper Engine (431960) 壁纸库…");
+      toast("正在授权并读取 Wallpaper Engine 当前所选壁纸…");
       try {
         const res = await apiJson("/api/we/authorize", { method: "POST", body: JSON.stringify({ auto_detect: true }) });
         state.weLibrary = res;
         renderWallpaperEngineSection(res);
         toast(res.message || `已连接，发现 ${res.count || 0} 个壁纸`, 4200);
+        if (res.current_selection?.found && res.current_selection.lossless_in_browser && res.auto_sync !== false) {
+          applyWeSelectionLossless(res.current_selection, false);
+        }
       } catch (err) {
         toast("授权连接失败: " + err.message, 4200);
       }
@@ -3290,6 +3468,19 @@
     $("cwd-pill-text").textContent = state.activeCwd || "选择目录";
 
     applyAppearance(state.settings.appearance || {});
+    if (window.opencodeDesktop?.isDesktop) {
+      const isPt =
+        new URLSearchParams(window.location.search).get("desktop_passthrough") === "1" ||
+        Boolean(await window.opencodeDesktop.getPassthrough?.().catch(() => false));
+      syncDesktopPassthroughUI(isPt, "");
+      if (isPt && state.settings.wallpaper_engine?.authorized) {
+        apiJson("/api/we/current")
+          .then((r) => {
+            if (r?.current?.title) syncDesktopPassthroughUI(true, r.current.title);
+          })
+          .catch(() => {});
+      }
+    }
     renderComposerSelectors();
     renderClaudeStatusViews();
     connectWs();

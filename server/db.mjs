@@ -47,8 +47,10 @@ export const DEFAULT_SEARCH_ENGINE = {
 };
 
 export const DEFAULT_WALLPAPER_ENGINE = {
-  authorized: false,        // 必须用户显式授权后才扫描本地 Steam 431960 / 大视频目录
+  authorized: false,        // 必须用户显式授权后才读取 Steam 431960 config.json 与原文件目录
   dirs: [],                 // 已授权的绝对目录列表（零拷贝只读流式播放）
+  auto_sync: true,          // 自动实时识别并同步用户在 Wallpaper Engine 中选择的壁纸
+  passthrough: false,       // Electron 桌面版原生无损透视 Wallpaper Engine 模式（100% 4K 60fps 0 损耗 0 处理）
   video_muted: true,        // 视频壁纸默认静音循环，可随时手动开关声音
 };
 

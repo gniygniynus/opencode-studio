@@ -353,13 +353,21 @@ describe("OpenCode Studio Core Suite", () => {
     fs.writeFileSync(path.join(webProj, "project.json"), JSON.stringify({ title: "WebGL Matrix", type: "web", file: "index.html" }));
     fs.writeFileSync(path.join(webProj, "index.html"), "<html><body>ok</body></html>");
 
+    const sceneProj = path.join(weDir, "1003");
+    fs.mkdirSync(sceneProj, { recursive: true });
+    fs.writeFileSync(path.join(sceneProj, "project.json"), JSON.stringify({ title: "4K DirectX Scene", type: "scene", file: "scene.json", preview: "preview.gif" }));
+    fs.writeFileSync(path.join(sceneProj, "scene.pkg"), Buffer.alloc(2048, 0x50));
+    fs.writeFileSync(path.join(sceneProj, "preview.gif"), Buffer.alloc(128, 0x47));
+
     // Directory jail must reject parent traversal
     assert.equal(isPathInsideDir(path.join(vidProj, "loop.mp4"), weDir), true);
     assert.equal(isPathInsideDir(path.resolve(weDir, "..", "outside.mp4"), weDir), false);
 
     const items = scanAuthorizedWallpaperLibrary([weDir], true);
-    assert.equal(items.length, 2);
-    assert.equal(items.some((i) => i.title === "4K Anime Loop" && i.we_type === "video" && i.play_mode === "video"), true);
-    assert.equal(items.some((i) => i.title === "WebGL Matrix" && i.we_type === "web" && i.play_mode === "web"), true);
+    assert.equal(items.length, 3);
+    assert.equal(items.some((i) => i.title === "4K Anime Loop" && i.we_type === "video" && i.lossless_in_browser === true), true);
+    assert.equal(items.some((i) => i.title === "WebGL Matrix" && i.we_type === "web" && i.lossless_in_browser === true), true);
+    // Scene (.pkg) must NEVER fake 4K with preview.gif — requires lossless desktop passthrough!
+    assert.equal(items.some((i) => i.title === "4K DirectX Scene" && i.we_type === "scene" && i.play_mode === "passthrough" && i.lossless_in_browser === false), true);
   });
 });
