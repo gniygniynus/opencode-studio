@@ -194,11 +194,30 @@ async function handleAnthropicPassthrough(req, res, provider, rawBody, subpath) 
     headers["Authorization"] = `Bearer ${provider.api_key}`;
   }
 
-  const upstream = await fetch(url, {
+  let upstream = await fetch(url, {
     method: "POST",
     headers,
     body: rawBody,
   });
+
+  // Auto-fallback if an Anthropic-compatible relay rejects optional thinking parameter with 400/422
+  if ((upstream.status === 400 || upstream.status === 422) && rawBody && rawBody.includes('"thinking"')) {
+    try {
+      const parsed = JSON.parse(rawBody);
+      if (parsed && typeof parsed === "object" && parsed.thinking) {
+        delete parsed.thinking;
+        const retryRes = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(parsed),
+        });
+        if (retryRes.ok) {
+          logEvent("INFO", "proxy", "anthropic_thinking_fallback_ok", `上游「${provider.name}」拒绝 thinking 参数，已自动降级恢复成功`);
+          upstream = retryRes;
+        }
+      }
+    } catch {}
+  }
 
   const respHeaders = {
     "Content-Type": upstream.headers.get("content-type") || "application/json",
@@ -219,20 +238,113 @@ async function handleAnthropicPassthrough(req, res, provider, rawBody, subpath) 
   }
 }
 
+// Per-provider/model compatibility cache: remembers when an upstream rejects enable_thinking or reasoning_effort
+// Values: "reasoning_effort" | "strip_thinking" | "strip_all_extras"
+const _upstreamCompatMode = new Map();
+
 async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "") {
   const url = buildApiEndpoint(provider.base_url, "openai", "/chat/completions");
   const oaiBody = anthropicToOpenAiBody(antBody, provider, thinkingHint);
   const headers = { "Content-Type": "application/json" };
   if (provider.api_key) headers["Authorization"] = `Bearer ${provider.api_key}`;
 
-  const upstream = await fetch(url, {
+  const compatKey = `${provider.id}::${oaiBody.model}`;
+  const cachedCompat = _upstreamCompatMode.get(compatKey);
+  const applyCompat = (body, mode) => {
+    const cloned = { ...body };
+    if (mode === "reasoning_effort") {
+      if (cloned.enable_thinking === true) {
+        delete cloned.enable_thinking;
+        cloned.reasoning_effort = "high";
+      } else {
+        delete cloned.enable_thinking;
+      }
+    } else if (mode === "strip_thinking") {
+      delete cloned.enable_thinking;
+      delete cloned.reasoning_effort;
+    } else if (mode === "strip_all_extras") {
+      delete cloned.enable_thinking;
+      delete cloned.reasoning_effort;
+      delete cloned.stream_options;
+    }
+    return cloned;
+  };
+
+  let sendBody = cachedCompat ? applyCompat(oaiBody, cachedCompat) : oaiBody;
+  let upstream = await fetch(url, {
     method: "POST",
     headers,
-    body: JSON.stringify(oaiBody),
+    body: JSON.stringify(sendBody),
   });
 
-  if (!upstream.ok) {
+  // Zero-400 auto-fallback when a relay rejects optional thinking/stream extension fields
+  if ((upstream.status === 400 || upstream.status === 422) && !cachedCompat) {
+    const firstErrTxt = await upstream.text();
+    const hadEnableThinking = sendBody.enable_thinking !== undefined;
+    const hadEffort = sendBody.reasoning_effort !== undefined;
+    const hadStreamOpts = sendBody.stream_options !== undefined;
+
+    const fallbacks = [];
+    if (hadEnableThinking && sendBody.enable_thinking === true) fallbacks.push("reasoning_effort");
+    if (hadEnableThinking || hadEffort) fallbacks.push("strip_thinking");
+    if (hadStreamOpts) fallbacks.push("strip_all_extras");
+
+    let recovered = false;
+    let lastStatus = upstream.status;
+    let lastErrTxt = firstErrTxt;
+
+    for (const mode of fallbacks) {
+      const nextBody = applyCompat(oaiBody, mode);
+      const retryRes = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(nextBody),
+      });
+      if (retryRes.ok) {
+        _upstreamCompatMode.set(compatKey, mode);
+        logEvent(
+          "INFO",
+          "proxy",
+          "compat_fallback_ok",
+          `上游「${provider.name} / ${oaiBody.model}」拒绝扩展参数，已自动切换兼容模式 (${mode}) 并恢复成功`,
+        );
+        upstream = retryRes;
+        sendBody = nextBody;
+        recovered = true;
+        break;
+      }
+      lastStatus = retryRes.status;
+      lastErrTxt = await retryRes.text();
+    }
+
+    if (!recovered) {
+      logEvent(
+        "ERROR",
+        "proxy",
+        "upstream_http_error",
+        `上游「${provider.name} / ${oaiBody.model}」返回 HTTP ${lastStatus}: ${lastErrTxt.slice(0, 320)}`,
+        { layer: "upstream-api" },
+      );
+      res.writeHead(lastStatus, { "Content-Type": "application/json" });
+      return res.end(
+        JSON.stringify({
+          type: "error",
+          error: {
+            type: lastStatus === 401 ? "authentication_error" : lastStatus === 429 ? "rate_limit_error" : "api_error",
+            message: lastErrTxt.slice(0, 1200),
+          },
+        }),
+      );
+    }
+  } else if (!upstream.ok) {
     const errTxt = await upstream.text();
+    logEvent(
+      "ERROR",
+      "proxy",
+      "upstream_http_error",
+      `上游「${provider.name} / ${oaiBody.model}」返回 HTTP ${upstream.status}: ${errTxt.slice(0, 320)}`,
+      { layer: "upstream-api" },
+    );
     res.writeHead(upstream.status, { "Content-Type": "application/json" });
     return res.end(
       JSON.stringify({

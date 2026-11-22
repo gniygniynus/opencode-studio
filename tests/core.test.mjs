@@ -436,4 +436,57 @@ describe("OpenCode Studio Core Suite", () => {
     const g3 = await fetch(`${studioServer.url}/api/settings`).then((r) => r.json());
     assert.equal(g3.system_prompt, "");
   });
+
+  it("auto-falls back without 400 error when upstream relay rejects enable_thinking/reasoning_effort", async () => {
+    // Spin up a strict mock relay that rejects enable_thinking & reasoning_effort with HTTP 400 (like some NewAPI/OneAPI routes)
+    let attempts = 0;
+    const strictRelay = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      attempts++;
+      if (body.enable_thinking !== undefined || body.reasoning_effort !== undefined) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "the request parameters were rejected by the model provider" } }));
+      }
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "兼容回退成功" } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+    await new Promise((r) => strictRelay.listen(0, "127.0.0.1", r));
+    const strictUrl = `http://127.0.0.1:${strictRelay.address().port}`;
+    try {
+      const saved = await fetch(`${studioServer.url}/api/providers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: "Strict Relay",
+          kind: "openai",
+          base_url: strictUrl,
+          api_key: "sk-strict-test-key",
+          default_model: "deepseek-v4.1-flash",
+          models: ["deepseek-v4.1-flash"],
+        }),
+      }).then((r) => r.json());
+      const res = await fetch(`${studioServer.url}/proxy/provider/${saved.provider.id}/on/v1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "OPENCODE_STUDIO_PROXY" },
+        body: JSON.stringify({
+          model: "deepseek-v4.1-flash",
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: "user", content: "测试开启思考兼容性" }],
+        }),
+      });
+      assert.equal(res.status, 200);
+      const sse = await res.text();
+      assert.ok(sse.includes("兼容回退成功"));
+      assert.ok(attempts >= 2);
+      deleteProvider(saved.provider.id);
+    } finally {
+      await new Promise((r) => strictRelay.close(r));
+    }
+  });
 });
