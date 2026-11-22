@@ -2103,12 +2103,14 @@
     grid.classList.remove("hidden");
     grid.innerHTML = "";
     const items = data.items || [];
+    const playableItems = items.filter((i) => i.playable);
+    const lockedItems = items.filter((i) => !i.playable);
     if (!items.length) {
       grid.innerHTML = `<div class="muted-text" style="white-space:normal;">已授权目录内暂未发现壁纸。点击上方「🚀 打开 Steam 小红车逛工坊」订阅任意 <b>视频 (Video)</b> 或 <b>网页 (Web)</b> 类型壁纸后，点击「🔄 刷新」即可独立原画质播放！</div>`;
       return;
     }
     const ap = state.settings.appearance || {};
-    for (const it of items) {
+    const buildWeCard = (it) => {
       const isActive = Boolean(it.playable && it.stream_url && ap.bgUrl === it.stream_url);
       const card = document.createElement("div");
       card.className = "wp-card" + (isActive ? " active" : "") + (!it.playable ? " we-card-locked" : "");
@@ -2132,13 +2134,34 @@
           toast(`已独立应用原版 0 损耗壁纸：${it.title}（不影响您的桌面壁纸）`, 3200);
         } else {
           toast(
-            `「${it.title}」是小红车专有 DirectX 3D (.pkg) 格式，无法脱离小红车无损独立渲染（我们绝不降质糊弄，也绝不动您桌面壁纸）。请在小红车创意工坊勾选「类型：视频 (Video) / 网页 (Web)」下载，或直接把任意 4K .mp4 放进本地目录即可 100% 原画质独立使用！`,
-            6500,
+            `「${it.title}」是小红车专有 DirectX 3D (.pkg) 格式，无法脱离小红车无损独立渲染。在创意工坊勾选「类型：视频 (Video) / 网页 (Web)」下载即可 100% 4K 独立播放！`,
+            5500,
           );
         }
       });
+      return card;
+    };
 
-      grid.appendChild(card);
+    if (!playableItems.length) {
+      const hint = document.createElement("div");
+      hint.className = "muted-text";
+      hint.style.cssText = "grid-column:1/-1;white-space:normal;line-height:1.5;";
+      hint.innerHTML =
+        `当前已授权目录内暂无可直接 0 损耗独立播放的 <b>视频 (Video)</b> 或 <b>网页 (Web)</b> 壁纸。请在 Steam 小红车创意工坊左侧筛选勾选 <b>「类型：视频」</b> 或 <b>「类型：网页」</b> 订阅下载后点击「🔄 刷新」。`;
+      grid.appendChild(hint);
+    } else {
+      for (const it of playableItems) grid.appendChild(buildWeCard(it));
+    }
+
+    if (lockedItems.length) {
+      const det = document.createElement("details");
+      det.className = "we-locked-details";
+      det.innerHTML =
+        `<summary>已折叠 ${lockedItems.length} 个小红车专有 DirectX 3D (.pkg) 项目（专有格式无法脱离小红车无损独立渲染）</summary>` +
+        `<div class="wp-grid" style="margin-top:8px;"></div>`;
+      const subGrid = det.querySelector(".wp-grid");
+      for (const it of lockedItems) subGrid.appendChild(buildWeCard(it));
+      grid.appendChild(det);
     }
   }
 

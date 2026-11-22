@@ -1170,6 +1170,8 @@ async function searchOnlineLiveVideos(q, translated, pageNum) {
   };
 }
 
+let _wallhavenCooldownUntil = 0;
+
 export async function searchWallpaperStore(query = "", page = 1, category = "all", enginePref = "") {
   const q = String(query || "").trim();
   const pageNum = Math.max(1, Number(page) || 1);
@@ -1246,43 +1248,46 @@ export async function searchWallpaperStore(query = "", page = 1, category = "all
       onlineError = `国内全网壁纸搜索失败: ${err.message}`;
     }
   } else {
-    // Global Proxy Mode: Wallhaven 4K first, auto-fallback/supplement with Bing Full-Web so results are NEVER empty!
-    try {
-      const whParams = new URLSearchParams({
-        purity: "100",
-        page: String(pageNum),
-        sorting: translated ? "relevance" : "toplist",
-        ratios: "16x9,16x10,21x9",
-      });
-      if (translated) whParams.set("q", translated);
-      else if (category === "anime") whParams.set("categories", "010");
-      else if (category === "scenery") whParams.set("q", "landscape nature");
-      else whParams.set("categories", "110");
-
-      const whUrl = `https://wallhaven.cc/api/v1/search?${whParams.toString()}`;
-      const data = await fetchJsonWithTimeout(whUrl, 7500);
-      lastPage = Number(data?.meta?.last_page || 1);
-      totalCount = Number(data?.meta?.total || 0);
-
-      for (const item of data?.data || []) {
-        const thumb = item.thumbs?.small || item.path;
-        const full = item.path;
-        if (!thumb || !full) continue;
-        onlineItems.push({
-          id: `wh-${item.id}`,
-          name: `${item.category || "HD"} · ${item.resolution || "4K"}`,
-          author: "Wallhaven 4K",
-          license: item.resolution || "HD",
-          type: "image",
-          thumb: proxyImageUrl(thumb),
-          url: proxyImageUrl(full),
-          resolution: item.resolution || "",
-          colors: item.colors || [],
+    // Global Proxy Mode: Wallhaven 4K first (with 3.5s fast-fail & 5-min cooldown), seamlessly supplemented by Bing Full-Web!
+    if (Date.now() >= _wallhavenCooldownUntil) {
+      try {
+        const whParams = new URLSearchParams({
+          purity: "100",
+          page: String(pageNum),
+          sorting: translated ? "relevance" : "toplist",
+          ratios: "16x9,16x10,21x9",
         });
+        if (translated) whParams.set("q", translated);
+        else if (category === "anime") whParams.set("categories", "010");
+        else if (category === "scenery") whParams.set("q", "landscape nature");
+        else whParams.set("categories", "110");
+
+        const whUrl = `https://wallhaven.cc/api/v1/search?${whParams.toString()}`;
+        const data = await fetchJsonWithTimeout(whUrl, 3500);
+        lastPage = Number(data?.meta?.last_page || 1);
+        totalCount = Number(data?.meta?.total || 0);
+
+        for (const item of data?.data || []) {
+          const thumb = item.thumbs?.small || item.path;
+          const full = item.path;
+          if (!thumb || !full) continue;
+          onlineItems.push({
+            id: `wh-${item.id}`,
+            name: `${item.category || "HD"} · ${item.resolution || "4K"}`,
+            author: "Wallhaven 4K",
+            license: item.resolution || "HD",
+            type: "image",
+            thumb: proxyImageUrl(thumb),
+            url: proxyImageUrl(full),
+            resolution: item.resolution || "",
+            colors: item.colors || [],
+          });
+        }
+      } catch (err) {
+        _wallhavenCooldownUntil = Date.now() + 5 * 60 * 1000;
+        onlineError = `Wallhaven 超时，已自动切至必应全网补齐 (${err.message})`;
+        logEvent("WARN", "stores", "wallhaven_fallback_bing", onlineError);
       }
-    } catch (err) {
-      onlineError = `Wallhaven 超时，已自动切至必应全网补齐 (${err.message})`;
-      logEvent("WARN", "stores", "wallhaven_fallback_bing", onlineError);
     }
 
     // If Wallhaven timed out or returned few hits, supplement seamlessly with Bing Full-Web!

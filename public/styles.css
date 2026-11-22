@@ -1820,6 +1820,19 @@ mark.search-hl { background: var(--mark-bg); color: var(--mark-text); padding: 0
 .we-card-locked:hover {
   opacity: 0.92;
 }
+.we-locked-details {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+  padding: 6px 10px;
+  border-radius: 9px;
+  border: 1px dashed var(--border-strong);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.we-locked-details > summary {
+  cursor: pointer;
+  user-select: none;
+}
 
 .streaming-cursor::after { content: "▍"; display: inline-block; margin-left: 2px; color: var(--brand); animation: blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
