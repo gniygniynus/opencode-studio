@@ -172,6 +172,134 @@ export function detectSteamWallpaperEngineDirs() {
   return foundDirs;
 }
 
+function parseJpegDimensions(buf) {
+  let i = 2;
+  while (i + 9 < buf.length) {
+    if (buf[i] !== 0xff) { i++; continue; }
+    const marker = buf[i + 1];
+    if (marker === 0xd8 || marker === 0xd9) { i += 2; continue; }
+    const len = buf.readUInt16BE(i + 2);
+    if ((marker >= 0xc0 && marker <= 0xc3) || (marker >= 0xc5 && marker <= 0xc7) || (marker >= 0xc9 && marker <= 0xcb)) {
+      return { width: buf.readUInt16BE(i + 7), height: buf.readUInt16BE(i + 5) };
+    }
+    if (len < 2) break;
+    i += 2 + len;
+  }
+  return null;
+}
+
+/**
+ * Inspect Wallpaper Engine `scene.pkg` (PKGVxxxx) header-only to distinguish:
+ *  - Complete single-image high-res photo/artwork scenes (e.g. 6000x4000 11MB JPEG or 3840x2160 4K JPEG/PNG):
+ *      Contains EXACTLY 1 main visual `.tex` (excluding masks/particles) wrapping a complete native JPEG/PNG.
+ *      Safe to stream bit-for-bit at exact byte offsets with 0 quality loss & 0 missing foreground layers!
+ *  - Multi-layer DirectX 3D scenes (2+ separate foreground/background `.tex` layers like WLOP Dome / Moonlight):
+ *      Returns null so we NEVER serve an incomplete single background strip as fake 4K!
+ */
+export function inspectCompleteSingleImageInPkg(pkgPath) {
+  let fd;
+  try {
+    const st = fs.statSync(pkgPath);
+    if (!st.isFile() || st.size < 64 || st.size > 1024 * 1024 * 1024) return null;
+    fd = fs.openSync(pkgPath, "r");
+
+    const headBuf = Buffer.alloc(Math.min(st.size, 256 * 1024));
+    fs.readSync(fd, headBuf, 0, headBuf.length, 0);
+
+    let off = 0;
+    const magicLen = headBuf.readInt32LE(off);
+    off += 4;
+    if (magicLen <= 0 || magicLen > 32) return null;
+    const magic = headBuf.subarray(off, off + magicLen).toString("ascii");
+    if (!magic.startsWith("PKGV")) return null;
+    off += magicLen;
+
+    const count = headBuf.readInt32LE(off);
+    off += 4;
+    if (count <= 0 || count > 20000) return null;
+
+    const mainTex = [];
+    for (let i = 0; i < count; i++) {
+      if (off + 12 > headBuf.length) break;
+      const nLen = headBuf.readInt32LE(off);
+      off += 4;
+      if (nLen <= 0 || nLen > 512 || off + nLen + 8 > headBuf.length) break;
+      const name = headBuf.subarray(off, off + nLen).toString("utf8");
+      off += nLen;
+      const fOff = headBuf.readInt32LE(off);
+      off += 4;
+      const fLen = headBuf.readInt32LE(off);
+      off += 4;
+      if (
+        /\.tex$/i.test(name) &&
+        fLen > 200_000 &&
+        !/(^|\/)(masks?|particles?|effects?|bokeh|glow|dust|snow|rain|spark)/i.test(name)
+      ) {
+        mainTex.push({ name, fOff, fLen });
+      }
+    }
+    const dataBase = off;
+
+    // Strictly require EXACTLY 1 main visual texture so multi-layer 3D scenes are NEVER broken!
+    if (mainTex.length !== 1) return null;
+
+    const entry = mainTex[0];
+    const absStart = dataBase + entry.fOff;
+    if (absStart + 64 > st.size) return null;
+
+    const probe = Buffer.alloc(Math.min(entry.fLen, 64 * 1024));
+    const got = fs.readSync(fd, probe, 0, probe.length, absStart);
+    const sub = probe.subarray(0, got);
+
+    const pngIdx = sub.indexOf(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    if (pngIdx >= 0 && pngIdx + 24 <= sub.length) {
+      const width = sub.readUInt32BE(pngIdx + 16);
+      const height = sub.readUInt32BE(pngIdx + 20);
+      if (width < 800 || height < 600) return null;
+      const length = entry.fLen - pngIdx;
+      return {
+        mime: "image/png",
+        start: absStart + pngIdx,
+        length,
+        width,
+        height,
+        size_mb: Math.round((length / (1024 * 1024)) * 10) / 10,
+      };
+    }
+
+    const jpgIdx = sub.indexOf(Buffer.from([0xff, 0xd8, 0xff]));
+    if (jpgIdx >= 0) {
+      const dims = parseJpegDimensions(sub.subarray(jpgIdx));
+      if (!dims || dims.width < 800 || dims.height < 600) return null;
+      // Check tail bytes for exact JPEG EOI (FF D9) so zero trailing TEX bytes are appended
+      let length = entry.fLen - jpgIdx;
+      const tailLen = Math.min(length, 4096);
+      const tailBuf = Buffer.alloc(tailLen);
+      fs.readSync(fd, tailBuf, 0, tailLen, absStart + jpgIdx + length - tailLen);
+      const eoi = tailBuf.lastIndexOf(Buffer.from([0xff, 0xd9]));
+      if (eoi >= 0) {
+        length = length - tailLen + eoi + 2;
+      }
+      return {
+        mime: "image/jpeg",
+        start: absStart + jpgIdx,
+        length,
+        width: dims.width,
+        height: dims.height,
+        size_mb: Math.round((length / (1024 * 1024)) * 10) / 10,
+      };
+    }
+
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
 function scanWallpaperProjectFolder(dirPath, rootLabel) {
   const projJsonPath = path.join(dirPath, "project.json");
   if (!fs.existsSync(projJsonPath)) return null;
@@ -248,11 +376,39 @@ function scanWallpaperProjectFolder(dirPath, rootLabel) {
     };
   }
 
-  // 3. SCENE (.pkg DirectX 3D engine): honestly mark as native-only — NEVER fake 4K with preview.gif, NEVER alter desktop!
+  // 3. SCENE (.pkg):
+  //    - If it wraps a COMPLETE single high-res original JPEG/PNG (e.g. 6000x4000 / 3840x2160 photo scene),
+  //      stream that exact original image bit-for-bit with 0 quality loss!
+  //    - If it is a multi-layer DirectX 3D scene (2+ split layers), honestly mark as native-only!
   if (rawType === "scene" || fs.existsSync(path.join(dirPath, "scene.pkg")) || fs.existsSync(path.join(dirPath, "scene.json"))) {
     const pkgPath = path.join(dirPath, "scene.pkg");
     const sceneTarget = fs.existsSync(pkgPath) ? pkgPath : fs.existsSync(filePath) ? filePath : "";
     if (!sceneTarget) return null;
+    const singleImg = fs.existsSync(pkgPath) ? inspectCompleteSingleImageInPkg(pkgPath) : null;
+    if (singleImg) {
+      return {
+        id,
+        title,
+        we_type: "image",
+        play_mode: "image",
+        playable: true,
+        lossless_in_browser: true,
+        dir_path: dirPath,
+        file_path: pkgPath,
+        pkg_path: pkgPath,
+        pkg_image_slice: singleImg,
+        preview_path: hasPreview ? previewPath : "",
+        size_bytes: singleImg.length,
+        size_mb: singleImg.size_mb,
+        ext: singleImg.mime === "image/png" ? ".png" : ".jpg",
+        tags,
+        source_label: rootLabel,
+        stream_url: `/api/we/media?id=${id}&kind=pkg_image`,
+        preview_url: hasPreview ? `/api/we/media?id=${id}&kind=preview` : `/api/we/media?id=${id}&kind=pkg_image`,
+        badge: `🖼️ 原版无损 · ${singleImg.width}×${singleImg.height} · ${singleImg.size_mb} MB`,
+        description: `从单图 scene.pkg 零拷贝直读完整原片（0 压缩 0 缺图，不影响桌面壁纸）`,
+      };
+    }
     const pkgSizeMb = Math.round((fs.statSync(sceneTarget).size / (1024 * 1024)) * 10) / 10;
     return {
       id,
@@ -271,8 +427,8 @@ function scanWallpaperProjectFolder(dirPath, rootLabel) {
       source_label: rootLabel,
       stream_url: "",
       preview_url: hasPreview ? `/api/we/media?id=${id}&kind=preview` : "",
-      badge: "🔒 DirectX 3D (.pkg)",
-      description: "专有 DirectX 场景包（为保证不降质且不改您桌面，请在创意工坊选「视频 / 网页」类型壁纸）",
+      badge: "🔒 多图层 DirectX 3D (.pkg)",
+      description: "多图层 3D 着色器场景包（无法脱离小红车无损渲染；单图原片与视频/网页类型均可直接 4K 无损播放）",
     };
   }
 
@@ -389,6 +545,21 @@ export function streamAuthorizedMedia(req, res, item, kind = "file", authorizedD
   if (!item) {
     res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
     return res.end(JSON.stringify({ error: "壁纸项不存在或未授权" }));
+  }
+
+  // Zero-copy exact byte-range read of a complete single-image JPEG/PNG inside scene.pkg!
+  if (kind === "pkg_image" && item.pkg_path && item.pkg_image_slice) {
+    if (!isPathInsideAuthorizedDirs(item.pkg_path, authorizedDirs) || !fs.existsSync(item.pkg_path)) {
+      res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+      return res.end(JSON.stringify({ error: "未授权访问路径" }));
+    }
+    const { start, length, mime } = item.pkg_image_slice;
+    res.writeHead(200, {
+      "Content-Type": mime,
+      "Content-Length": length,
+      "Cache-Control": "public, max-age=86400",
+    });
+    return fs.createReadStream(item.pkg_path, { start, end: start + length - 1 }).pipe(res);
   }
 
   const targetPath = kind === "preview" && item.preview_path ? item.preview_path : item.file_path;
