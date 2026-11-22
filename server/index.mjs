@@ -123,37 +123,88 @@ function spawnAsyncStdout(cmd, args, opts = {}) {
 }
 
 /**
- * Async, non-blocking, ALWAYS-ON-TOP native OS directory picker dialog.
- * Windows PowerShell 5.1 compatible (UTF-16LE -EncodedCommand, zero property crash, TopMost foreground owner).
+ * Async, non-blocking, FOREGROUND native OS directory picker dialog.
+ * Windows: uses Win32 modern IFileOpenDialog (FOS_PICKFOLDERS — same Explorer picker as VS Code / Chrome!)
+ * with IntPtr.Zero so it pops cleanly to the foreground on any Windows 10/11 desktop!
  */
 async function pickNativeDirectoryDialog(initialDir = "") {
   if (process.platform === "win32") {
     const safeInit = String(initialDir || "").replace(/'/g, "''");
     const ps = `
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.Application]::EnableVisualStyles()
-$owner = New-Object System.Windows.Forms.Form
-$owner.TopMost = $true
-$owner.ShowInTaskbar = $false
-$owner.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
-$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-$owner.Show()
-$owner.Activate()
-$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-$dlg.Description = '选择 OpenCode Studio 工作目录'
-$dlg.ShowNewFolderButton = $true
-if ('${safeInit}' -and (Test-Path -LiteralPath '${safeInit}')) { $dlg.SelectedPath = '${safeInit}' }
-$res = $dlg.ShowDialog($owner)
-$owner.Close()
-$owner.Dispose()
-if ($res -eq [System.Windows.Forms.DialogResult]::OK -and $dlg.SelectedPath) {
-  Write-Output $dlg.SelectedPath
+$cs = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class ModernFolderPicker {
+    [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")]
+    private class FileOpenDialog {}
+
+    [ComImport, Guid("42f85136-db7e-439c-85f1-e4075d135fc8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IFileOpenDialog {
+        [PreserveSig] int Show(IntPtr parent);
+        void SetFileTypes(); void SetFileTypeIndex(); void GetFileTypeIndex(); void Advise(); void Unadvise();
+        void SetOptions(uint fos);
+        void GetOptions(out uint fos);
+        void SetDefaultFolder(IShellItem psi);
+        void SetFolder(IShellItem psi);
+        void GetFolder(out IShellItem ppsi);
+        void GetCurrentSelection(out IShellItem ppsi);
+        void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+        void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string pszName);
+        void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
+        void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
+        void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
+        void GetResult(out IShellItem ppsi);
+    }
+
+    [ComImport, Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellItem {
+        void BindToHandler(); void GetParent();
+        void GetDisplayName(uint sigdnName, [MarshalAs(UnmanagedType.LPWStr)] out string ppszName);
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+    private static extern void SHCreateItemFromParsingName(string pszPath, IntPtr pbc, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out IShellItem ppv);
+
+    public static string Pick(string initialDir) {
+        var dlg = (IFileOpenDialog)new FileOpenDialog();
+        uint opts;
+        dlg.GetOptions(out opts);
+        // FOS_PICKFOLDERS (0x20) | FOS_FORCEFILESYSTEM (0x40) | FOS_PATHMUSTEXIST (0x800)
+        dlg.SetOptions(opts | 0x20u | 0x40u | 0x800u);
+        dlg.SetTitle("选择 OpenCode Studio 工作目录");
+        if (!string.IsNullOrEmpty(initialDir)) {
+            try {
+                Guid g = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE");
+                IShellItem item;
+                SHCreateItemFromParsingName(initialDir, IntPtr.Zero, ref g, out item);
+                if (item != null) dlg.SetFolder(item);
+            } catch {}
+        }
+        int hr = dlg.Show(IntPtr.Zero);
+        if (hr == 0) {
+            IShellItem res;
+            dlg.GetResult(out res);
+            if (res != null) {
+                string path;
+                res.GetDisplayName(0x80058000u, out path);
+                return path;
+            }
+        }
+        return "";
+    }
 }
+'@
+Add-Type -TypeDefinition $cs
+$init = '${safeInit}'
+if ($init -and -not (Test-Path -LiteralPath $init)) { $init = '' }
+$picked = [ModernFolderPicker]::Pick($init)
+if ($picked) { Write-Output $picked }
 `;
     const encoded = Buffer.from(ps, "utf16le").toString("base64");
-    const res = await spawnAsyncStdout("powershell.exe", ["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-EncodedCommand", encoded], {
-      windowsHide: true,
+    const res = await spawnAsyncStdout("powershell.exe", ["-NoProfile", "-STA", "-EncodedCommand", encoded], {
+      windowsHide: false,
     });
     if (res.stderr.trim()) {
       logEvent("WARN", "dirs", "pick_native_stderr", res.stderr.trim().slice(0, 300));
@@ -168,6 +219,52 @@ if ($res -eq [System.Windows.Forms.DialogResult]::OK -and $dlg.SelectedPath) {
   if (z.status === 0 && z.stdout.trim()) return z.stdout.trim();
   const k = await spawnAsyncStdout("kdialog", ["--getexistingdirectory"]);
   return k.status === 0 ? k.stdout.trim() || null : null;
+}
+
+function isPublicMediaUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+    const h = u.hostname.toLowerCase();
+    if (
+      h === "localhost" ||
+      h.endsWith(".local") ||
+      h === "::1" ||
+      h.startsWith("[::1]") ||
+      h.startsWith("127.") ||
+      h.startsWith("10.") ||
+      h.startsWith("192.168.") ||
+      h.startsWith("169.254.") ||
+      h.startsWith("0.") ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function enforceWallpaperCacheBudget(dir, maxBytes = 80 * 1024 * 1024) {
+  try {
+    const files = fs
+      .readdirSync(dir)
+      .filter((f) => f.startsWith("wp_cache_") && !f.endsWith(".mime"))
+      .map((f) => {
+        const full = path.join(dir, f);
+        const st = fs.statSync(full);
+        return { full, size: st.size, mtimeMs: st.mtimeMs };
+      })
+      .sort((a, b) => a.mtimeMs - b.mtimeMs);
+    let total = files.reduce((s, f) => s + f.size, 0);
+    while (total > maxBytes && files.length > 0) {
+      const oldest = files.shift();
+      try { fs.unlinkSync(oldest.full); } catch {}
+      try { fs.unlinkSync(`${oldest.full}.mime`); } catch {}
+      total -= oldest.size;
+    }
+  } catch {}
 }
 
 function listAvailableDrives() {
@@ -395,7 +492,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       }
       if (method === "PUT" && pathname === "/api/settings") {
         const body = await readJsonBody(req);
-        for (const key of ["system_prompt", "prompt_mode", "engine_mode", "permission_mode", "update_channel", "appearance", "default_cwd"]) {
+        for (const key of ["system_prompt", "prompt_mode", "permission_mode", "update_channel", "appearance", "search_engine", "default_cwd"]) {
           if (body[key] !== undefined) setSetting(key, body[key]);
         }
         const next = getAllSettings();
@@ -518,10 +615,11 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         return sendJson(res, 200, { ok: true });
       }
 
-      // ==================== ONLINE OPEN-SOURCE STORES ====================
+      // ==================== ONLINE OPEN-SOURCE STORES (DUAL-ENGINE CN DIRECT / PROXY GLOBAL) ====================
       if (method === "GET" && pathname === "/api/stores/mcp") {
         const q = urlObj.searchParams.get("q") || "";
-        return sendJson(res, 200, await searchMcpStore(q));
+        const eng = urlObj.searchParams.get("engine") || "";
+        return sendJson(res, 200, await searchMcpStore(q, eng));
       }
       if (method === "GET" && pathname === "/api/mcp") {
         return sendJson(res, 200, { items: mcpManager.getStatusList() });
@@ -560,7 +658,8 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
 
       if (method === "GET" && pathname === "/api/stores/skills") {
         const q = urlObj.searchParams.get("q") || "";
-        return sendJson(res, 200, await searchSkillsStore(q));
+        const eng = urlObj.searchParams.get("engine") || "";
+        return sendJson(res, 200, await searchSkillsStore(q, eng));
       }
       if (method === "GET" && pathname === "/api/skills") {
         return sendJson(res, 200, { items: listInstalledSkills() });
@@ -593,17 +692,14 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         const q = urlObj.searchParams.get("q") || "";
         const page = Number(urlObj.searchParams.get("page") || 1);
         const category = urlObj.searchParams.get("category") || "all";
-        return sendJson(res, 200, await searchWallpaperStore(q, page, category));
+        const eng = urlObj.searchParams.get("engine") || "";
+        return sendJson(res, 200, await searchWallpaperStore(q, page, category, eng));
       }
       if (method === "GET" && pathname === "/api/wallpaper-proxy") {
         const rawUrl = urlObj.searchParams.get("url") || "";
-        // Strict open wallpaper allowlist: Wallhaven + Wikimedia Commons (images + loop videos, prevents SSRF)
-        if (
-          !/^https:\/\/(th\.wallhaven\.cc\/|w\.wallhaven\.cc\/|upload\.wikimedia\.org\/wikipedia\/commons\/|thumb\.wikimedia\.org\/wikipedia\/commons\/|commons\.wikimedia\.org\/wiki\/Special:FilePath\/)/i.test(
-            rawUrl,
-          )
-        ) {
-          return sendJson(res, 400, { error: "仅允许代理 Wallhaven / Wikimedia 开源壁纸与动态视频源" });
+        const fbUrl = urlObj.searchParams.get("fb") || "";
+        if (!isPublicMediaUrl(rawUrl)) {
+          return sendJson(res, 400, { error: "仅允许代理公网公开图片与动态视频资源" });
         }
         const hash = crypto.createHash("sha1").update(rawUrl).digest("hex");
         const cachePath = path.join(paths.backgroundsDir, `wp_cache_${hash}`);
@@ -638,22 +734,45 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         if (fs.existsSync(cachePath) && fs.existsSync(metaPath)) {
           return serveCachedFile();
         }
-        try {
+
+        const tryFetchMedia = async (targetUrl) => {
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 25000);
-          const upstream = await fetch(rawUrl, {
-            headers: { "User-Agent": "OpenCodeStudio/1.1 (+https://github.com/gniygniynus/opencode-studio)" },
-            signal: controller.signal,
-          });
-          clearTimeout(timer);
-          if (!upstream.ok) return sendJson(res, 502, { error: `上游图源 HTTP ${upstream.status}` });
-          const mime = (upstream.headers.get("content-type") || "image/jpeg").split(";")[0];
-          if (!mime.startsWith("image/") && !mime.startsWith("video/")) {
-            return sendJson(res, 502, { error: `上游媒体类型不支持: ${mime}` });
+          const timer = setTimeout(() => controller.abort(), 14000);
+          try {
+            const originRef = new URL(targetUrl).origin + "/";
+            const upstream = await fetch(targetUrl, {
+              headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+                Referer: originRef,
+                Accept: "image/avif,image/webp,image/apng,image/gif,image/*,video/webm,video/mp4,*/*;q=0.8",
+              },
+              signal: controller.signal,
+            });
+            if (!upstream.ok) throw new Error(`HTTP ${upstream.status}`);
+            const mime = (upstream.headers.get("content-type") || "image/jpeg").split(";")[0];
+            if (!mime.startsWith("image/") && !mime.startsWith("video/")) throw new Error(`不支持的媒体类型 ${mime}`);
+            const buf = Buffer.from(await upstream.arrayBuffer());
+            if (buf.length > 35 * 1024 * 1024) throw new Error("超过 35MB 限制");
+            return { buf, mime };
+          } finally {
+            clearTimeout(timer);
           }
-          const buf = Buffer.from(await upstream.arrayBuffer());
-          fs.writeFileSync(cachePath, buf);
-          fs.writeFileSync(metaPath, mime, "utf8");
+        };
+
+        try {
+          let fetched;
+          try {
+            fetched = await tryFetchMedia(rawUrl);
+          } catch (e1) {
+            if (fbUrl && isPublicMediaUrl(fbUrl)) {
+              fetched = await tryFetchMedia(fbUrl);
+            } else {
+              throw e1;
+            }
+          }
+          fs.writeFileSync(cachePath, fetched.buf);
+          fs.writeFileSync(metaPath, fetched.mime, "utf8");
+          enforceWallpaperCacheBudget(paths.backgroundsDir, 80 * 1024 * 1024);
           return serveCachedFile();
         } catch (err) {
           return sendJson(res, 502, { error: `拉取壁纸资源失败: ${err.message}` });

@@ -181,37 +181,41 @@ body.has-wallpaper.bg-mode-hd .wallpaper-scrim {
   transition: background 0.22s ease, border-color 0.22s ease;
 }
 
-/* Harmonized sidebar/drawer/topbar & card transparency when wallpaper is active */
-body.has-wallpaper .glass-panel {
-  background: rgba(var(--sidebar-rgb), calc(var(--glass-alpha) * 0.86));
-  border-color: rgba(var(--surface-rgb), 0.24);
-}
-body.has-wallpaper .glass-card,
-body.has-wallpaper .msg-assistant {
-  background: rgba(var(--surface-rgb), calc(var(--glass-alpha) * 0.92));
+/* Independent transparency variables for dialogue boxes & sidebars */
+:root {
+  --bubble-alpha: 0.88;
+  --sidebar-alpha: 0.82;
 }
 
-/* HD Original Wallpaper Mode: crystal-clear artwork + airy translucent sidebars & topbar */
+/* Harmonized sidebar/drawer/topbar & card transparency when wallpaper is active */
+body.has-wallpaper .glass-panel {
+  background: rgba(var(--sidebar-rgb), var(--sidebar-alpha));
+  border-color: rgba(var(--surface-rgb), calc(var(--sidebar-alpha) * 0.35 + 0.08));
+}
+body.has-wallpaper .glass-card,
+body.has-wallpaper .msg-assistant,
+body.has-wallpaper .msg-user-card {
+  background: rgba(var(--surface-rgb), var(--bubble-alpha));
+}
+
+/* HD Original Wallpaper Mode: crystal-clear artwork + refined glass blur */
 body.has-wallpaper.bg-mode-hd .glass-panel {
-  background: rgba(var(--sidebar-rgb), calc(var(--glass-alpha) * 0.56));
+  background: rgba(var(--sidebar-rgb), var(--sidebar-alpha));
   backdrop-filter: blur(12px) saturate(145%);
   -webkit-backdrop-filter: blur(12px) saturate(145%);
   border-color: rgba(255, 255, 255, 0.22);
 }
 body.has-wallpaper.bg-mode-hd .glass-card,
-body.has-wallpaper.bg-mode-hd .msg-assistant {
-  background: rgba(var(--surface-rgb), calc(var(--glass-alpha) * 0.78));
-  backdrop-filter: blur(14px) saturate(140%);
-  -webkit-backdrop-filter: blur(14px) saturate(140%);
-}
+body.has-wallpaper.bg-mode-hd .msg-assistant,
 body.has-wallpaper.bg-mode-hd .msg-user-card {
-  background: rgba(var(--surface-rgb), calc(var(--glass-alpha) * 0.82));
-  backdrop-filter: blur(10px);
+  background: rgba(var(--surface-rgb), var(--bubble-alpha));
+  backdrop-filter: blur(12px) saturate(135%);
+  -webkit-backdrop-filter: blur(12px) saturate(135%);
 }
 body.has-wallpaper.bg-mode-hd .welcome-view {
-  background: rgba(var(--surface-rgb), calc(var(--glass-alpha) * 0.62));
-  backdrop-filter: blur(14px) saturate(140%);
-  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  background: rgba(var(--surface-rgb), calc(var(--bubble-alpha) * 0.72));
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
   border-radius: 20px;
   padding: 22px 24px;
   margin-top: 12px;
@@ -227,6 +231,58 @@ body.has-wallpaper.bg-mode-hd .welcome-card {
 body.has-wallpaper.bg-mode-hd .composer-footnote {
   color: var(--text-primary);
   text-shadow: 0 1px 4px rgba(var(--surface-rgb), 0.75);
+}
+
+/* Custom Bordered Dialogue Box with arbitrary transparency (even without wallpaper!) */
+.msg-assistant {
+  background: rgba(var(--surface-rgb), var(--bubble-alpha));
+}
+.msg-user-card {
+  background: rgba(var(--surface-rgb), var(--bubble-alpha));
+}
+.composer-box.glass-card {
+  background: rgba(var(--surface-rgb), max(var(--bubble-alpha), 0.16));
+}
+
+/* Custom Pure-Text Borderless Dialogue Mode (只显示文字，完全无边框无底色!) */
+body.bubble-text-only .msg-user-card,
+body.bubble-text-only .msg-assistant {
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  padding-left: 6px;
+  padding-right: 6px;
+}
+body.bubble-text-only .msg-user-text,
+body.bubble-text-only .md-body,
+body.bubble-text-only .msg-assistant-head {
+  text-shadow: 0 1px 6px rgba(var(--surface-rgb), 0.85), 0 0 2px rgba(var(--surface-rgb), 0.7);
+}
+body.bubble-text-only .msg-assistant .msg-footer-bar {
+  border-top-color: transparent;
+}
+body.bubble-text-only .welcome-view {
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+}
+
+.appearance-sliders-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+.search-engine-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 ::-webkit-scrollbar { width: 7px; height: 7px; }

@@ -1,7 +1,7 @@
 {
   "name": "opencode-studio",
-  "version": "1.2.0",
-  "description": "OpenCode Studio — 基于原生 Claude Code 内核打造的全平台增强工作台（完整官方 Auth 登录、内置多 API 透明协议代理、Claude Code 稳定/最新版一键切换、MCP/Skills/高清与动态 4K 壁纸商店、历史编辑与重新回复分支）",
+  "version": "1.3.0",
+  "description": "OpenCode Studio — 内置官方原生 Claude Code 的全平台开箱即用工作台（随安装包自带原生 Claude Code、零代理直连内置多 API、官方完整 OAuth 登录、国内直连/代理双引擎全网商店、自定义无边框对话框与高清/动态壁纸）",
   "type": "module",
   "main": "electron/main.mjs",
   "author": "gniygniynus <gniygniynus@users.noreply.github.com>",
@@ -24,6 +24,7 @@
     "build:linux": "electron-builder --linux AppImage deb --publish never"
   },
   "dependencies": {
+    "@anthropic-ai/claude-code": "^2.1.323",
     "ws": "^8.18.0"
   },
   "devDependencies": {
@@ -42,15 +43,29 @@
       "public/**/*",
       "package.json",
       "LICENSE",
-      "README.md"
+      "README.md",
+      "!node_modules/@anthropic-ai/claude-code/bin/claude*"
+    ],
+    "asarUnpack": [
+      "node_modules/@anthropic-ai/**"
     ],
     "extraMetadata": {
       "main": "electron/main.mjs"
     },
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] },
-        { "target": "portable", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
       ]
     },
     "nsis": {
@@ -62,15 +77,35 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [
-        { "target": "dmg", "arch": ["arm64", "x64"] },
-        { "target": "zip", "arch": ["arm64", "x64"] }
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
       ]
     },
     "linux": {
       "category": "Development",
       "target": [
-        { "target": "AppImage", "arch": ["x64"] },
-        { "target": "deb", "arch": ["x64"] }
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        }
       ]
     }
   }

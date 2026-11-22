@@ -394,6 +394,16 @@
         <button class="modal-tab active" data-storetab="mcp">MCP 商店与管理</button>
         <button class="modal-tab" data-storetab="skills">Skills 商店与管理</button>
         <button class="modal-tab" data-storetab="wallpapers">背景壁纸与外观</button>
+        <div class="tab-spacer"></div>
+        <div class="search-engine-bar" title="切换国内直连全网搜索引擎（免代理）或代理全网搜索引擎">
+          <span class="muted-text">搜索引擎：</span>
+          <select id="store-search-engine" class="compact-select">
+            <option value="auto">🌐 自动探测 (免代理直连 / 代理自动切)</option>
+            <option value="cn">🇨🇳 国内直连引擎 (必应全网 + npmmirror + CDN)</option>
+            <option value="proxy">🚀 代理全网引擎 (Wallhaven + Wikimedia + GitHub)</option>
+          </select>
+          <span id="store-engine-badge" class="mini-tag">检测中</span>
+        </div>
       </div>
       <div class="modal-body">
         <!-- Store Tab 1: MCP -->
@@ -438,30 +448,41 @@
               <button id="btn-bgmode-hd" class="seg-btn" data-bgmode="hd">高清原版</button>
               <button id="btn-bgmode-subtle" class="seg-btn active" data-bgmode="subtle">隐性护眼</button>
             </div>
-            <label class="inline-ctrl">
-              <span>字号 <b id="ap-fontsize-val">14.5px</b></span>
-              <input id="ap-fontsize" type="range" min="13" max="17.5" step="0.5" value="14.5" />
-            </label>
-            <label class="inline-ctrl">
-              <span>模糊 <b id="ap-blur-val">10px</b></span>
-              <input id="ap-blur" type="range" min="0" max="24" step="1" value="10" />
-            </label>
-            <label class="inline-ctrl">
-              <span>界面浓度 <b id="ap-opacity-val">88%</b></span>
-              <input id="ap-opacity" type="range" min="0.20" max="0.98" step="0.02" value="0.88" />
-            </label>
+            <div class="segmented-bar" title="自定义对话消息外观：带边框卡片或纯文字无边框">
+              <button id="btn-bubble-card" class="seg-btn active" data-bstyle="card">对话框·有边框</button>
+              <button id="btn-bubble-text" class="seg-btn" data-bstyle="text">纯文字·无边框</button>
+            </div>
             <input id="bg-upload-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm" class="hidden" />
-            <button id="btn-upload-bg" class="btn-secondary sm">上传图片/动态视频</button>
+            <button id="btn-upload-bg" class="btn-secondary sm" style="margin-left:auto;">上传图片/动态视频</button>
+
+            <div class="appearance-sliders-row">
+              <label class="inline-ctrl">
+                <span>字号 <b id="ap-fontsize-val">14.5px</b></span>
+                <input id="ap-fontsize" type="range" min="13" max="17.5" step="0.5" value="14.5" />
+              </label>
+              <label class="inline-ctrl">
+                <span>壁纸模糊 <b id="ap-blur-val">10px</b></span>
+                <input id="ap-blur" type="range" min="0" max="24" step="1" value="10" />
+              </label>
+              <label class="inline-ctrl">
+                <span>对话框透明度 <b id="ap-bubble-opacity-val">88%</b></span>
+                <input id="ap-bubble-opacity" type="range" min="0" max="1" step="0.02" value="0.88" />
+              </label>
+              <label class="inline-ctrl">
+                <span>两边栏透明度 <b id="ap-sidebar-opacity-val">82%</b></span>
+                <input id="ap-sidebar-opacity" type="range" min="0" max="0.98" step="0.02" value="0.82" />
+              </label>
+            </div>
           </div>
 
           <div class="store-search-bar">
-            <input id="wp-search-input" class="text-input" placeholder="输入即实时搜索海量 4K 静态壁纸或在线动态视频（支持中文：星空、极光、樱花、海洋、赛博、动漫、风景）…" />
-            <button id="btn-search-wp" class="btn-primary">搜索壁纸</button>
+            <input id="wp-search-input" class="text-input" placeholder="输入即全网实时搜索海量 4K 静态壁纸或动态壁纸（免代理支持任意中文：星空、动漫、樱花、赛博、海洋、风景）…" />
+            <button id="btn-search-wp" class="btn-primary">全网搜索</button>
           </div>
 
           <div class="wp-cat-bar">
             <button class="chip-btn wp-cat active" data-cat="all">全部精选+热门</button>
-            <button class="chip-btn wp-cat" data-cat="live">✨ 动态壁纸 (60fps + 在线视频)</button>
+            <button class="chip-btn wp-cat" data-cat="live">✨ 动态壁纸 (60fps + 全网动图/视频)</button>
             <button class="chip-btn wp-cat" data-cat="scenery">自然风景</button>
             <button class="chip-btn wp-cat" data-cat="anime">动漫二次元</button>
             <button class="chip-btn wp-cat" data-q="星空">星空宇宙</button>
@@ -515,18 +536,18 @@
 
         <div class="settings-section two-col">
           <label class="field">
-            <span>驱动引擎模式（双引擎无代理直连保障）</span>
-            <select id="set-engine-mode" class="text-input">
-              <option value="auto">智能双引擎（推荐：优先原生 Claude Code，未装自动无缝切内置直连引擎）</option>
-              <option value="claude_code">优先原生 Claude Code 内核（本机透明代理直连）</option>
-              <option value="api_direct">内置免装直连引擎（零外部依赖，适合未装 CLI 的学生）</option>
-            </select>
-          </label>
-          <label class="field">
             <span>命令执行权限模式（推荐给学生开启高风险确认）</span>
             <select id="set-permission-mode" class="text-input">
               <option value="auto">全自动执行（高效开发，不弹窗）</option>
               <option value="confirm_dangerous">安全护栏模式（删除/重置/强制推送前弹窗确认）</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>联网商店搜索引擎模式</span>
+            <select id="set-search-mode" class="text-input">
+              <option value="auto">自动探测（无代理自动走国内直连，有代理走全网引擎）</option>
+              <option value="cn">始终国内直连全网引擎（免代理，学生推荐）</option>
+              <option value="proxy">始终海外代理全网引擎（Wallhaven / Wikimedia / GitHub）</option>
             </select>
           </label>
           <label class="field full">

@@ -5,9 +5,69 @@
  *   3. Wallpaper Store — curated CC0/Public-Domain open-source wallpapers + live Wikimedia Commons search
  */
 
+import { getAllSettings } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
 
-const USER_AGENT = "OpenCodeStudio/1.0 (+https://github.com/gniygniynus/opencode-studio)";
+const USER_AGENT = "OpenCodeStudio/1.3 (+https://github.com/gniygniynus/opencode-studio)";
+const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+// ==================== DUAL SEARCH ENGINE DETECTOR (DOMESTIC DIRECT vs PROXY GLOBAL) ====================
+let _globalProbeCache = { reachable: false, checkedAt: 0 };
+
+async function fetchWithTimeout(url, { timeoutMs = 8500, headers = {} } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": USER_AGENT, ...headers },
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchJsonWithTimeout(url, timeoutMs = 9000, extraHeaders = {}) {
+  const res = await fetchWithTimeout(url, { timeoutMs, headers: { Accept: "application/json", ...extraHeaders } });
+  return await res.json();
+}
+
+async function fetchTextWithTimeout(url, timeoutMs = 8500, extraHeaders = {}) {
+  const res = await fetchWithTimeout(url, { timeoutMs, headers: extraHeaders });
+  return await res.text();
+}
+
+/**
+ * Determine active search engine:
+ *  - "cn"    : Domestic Direct Full-Web Engine (Bing CN 4K/Live + npmmirror + jsDelivr CDN, zero proxy needed!)
+ *  - "proxy" : Global Proxy Full-Web Engine (Wallhaven 4K + Wikimedia Video + Official MCP Registry + GitHub + Bing)
+ *  - "auto"  : Fast 2.2s probe (cached 60s); automatically picks "proxy" if global reachable else "cn"!
+ */
+export async function resolveSearchEngine(requested = "") {
+  const saved = getAllSettings().search_engine || {};
+  const pref = ["cn", "proxy", "auto"].includes(requested) ? requested : (saved.mode || "auto");
+  if (pref === "cn") {
+    return { active: "cn", requested: pref, label: "🇨🇳 国内直连全网引擎" };
+  }
+  if (pref === "proxy") {
+    return { active: "proxy", requested: pref, label: "🚀 代理全网引擎" };
+  }
+
+  // Auto-probe global network (cached 60s so switching pages is instant)
+  if (Date.now() - _globalProbeCache.checkedAt > 60_000) {
+    try {
+      await fetchWithTimeout("https://api.github.com/zen", { timeoutMs: 2200 });
+      _globalProbeCache = { reachable: true, checkedAt: Date.now() };
+    } catch {
+      _globalProbeCache = { reachable: false, checkedAt: Date.now() };
+    }
+  }
+  return _globalProbeCache.reachable
+    ? { active: "proxy", requested: "auto", label: "🚀 自动 · 代理全网引擎" }
+    : { active: "cn", requested: "auto", label: "🇨🇳 自动 · 国内直连全网引擎" };
+}
 
 // ==================== 1. CURATED OPEN-SOURCE MCP CATALOG ====================
 export const CURATED_MCPS = [
@@ -167,8 +227,9 @@ export const CURATED_SKILLS = [
   },
 ];
 
-function proxyImageUrl(raw) {
-  return `/api/wallpaper-proxy?url=${encodeURIComponent(raw)}`;
+function proxyImageUrl(raw, fallbackUrl = "") {
+  const base = `/api/wallpaper-proxy?url=${encodeURIComponent(raw)}`;
+  return fallbackUrl ? `${base}&fb=${encodeURIComponent(fallbackUrl)}` : base;
 }
 
 // Built-in 60fps Canvas live wallpapers (12 curated themes, zero bandwidth, searchable by Chinese & English)
@@ -421,19 +482,98 @@ function translateWallpaperQuery(q) {
   return out.replace(/\s+/g, " ").trim();
 }
 
-async function fetchJsonWithTimeout(url, timeoutMs = 10000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
-  } finally {
-    clearTimeout(timer);
+// ==================== DOMESTIC DIRECT FULL-WEB ENGINES (BING CN 4K / LIVE GIF / WEB) ====================
+function parseBingImageCards(html) {
+  const out = [];
+  const seen = new Set();
+  for (const m of html.matchAll(/m="(\{[^"]+\})"/g)) {
+    try {
+      const obj = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&#39;/g, "'"));
+      const full = obj.bmurl || obj.murl;
+      const thumb = obj.turl || obj.murl;
+      if (!full || !thumb || !/^https?:\/\//i.test(full) || seen.has(full)) continue;
+      seen.add(full);
+      out.push({
+        id: `bing-${obj.cid || obj.md5 || out.length}`,
+        title: String(obj.t || obj.desc || "全网高清壁纸").replace(/\s+/g, " ").slice(0, 44),
+        thumb,
+        full,
+        murl: obj.murl || full,
+        bmurl: obj.bmurl || "",
+      });
+    } catch {}
   }
+  return out;
+}
+
+async function searchBingWallpapers(q, pageNum = 1, category = "all") {
+  const catKeywords = {
+    all: "4k 超清桌面壁纸 风景 动漫",
+    scenery: "自然风景 山水 4k 电脑壁纸",
+    anime: "二次元 动漫 唯美 4k 桌面壁纸",
+  };
+  const kw = q ? `${q} 4k 壁纸` : (catKeywords[category] || catKeywords.all);
+  const first = (pageNum - 1) * 24;
+  const url =
+    `https://cn.bing.com/images/async?q=${encodeURIComponent(kw)}` +
+    `&first=${first}&count=24&qft=+filterui:imagesize-wallpaper+filterui:aspect-wide&mmasync=1`;
+  const html = await fetchTextWithTimeout(url, 8000, { "User-Agent": BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9" });
+  const cards = parseBingImageCards(html);
+  return {
+    items: cards.map((c) => ({
+      id: c.id,
+      name: c.title,
+      author: "必应全网",
+      license: "高清宽屏",
+      type: "image",
+      thumb: proxyImageUrl(c.thumb),
+      url: proxyImageUrl(c.murl, c.thumb),
+      resolution: "HD",
+    })),
+    hasMore: cards.length >= 12,
+  };
+}
+
+async function searchBingLiveGifs(q, pageNum = 1) {
+  const kw = q ? `${q} 动态壁纸 唯美 gif` : "唯美 星空 樱花 赛博 风景 动态壁纸 gif";
+  const first = (pageNum - 1) * 20;
+  const url =
+    `https://cn.bing.com/images/async?q=${encodeURIComponent(kw)}` +
+    `&first=${first}&count=20&qft=+filterui:photo-animatedgif&mmasync=1`;
+  const html = await fetchTextWithTimeout(url, 8000, { "User-Agent": BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9" });
+  const cards = parseBingImageCards(html);
+  return {
+    items: cards.map((c) => ({
+      id: `blive-${c.id}`,
+      name: c.title,
+      description: "必应全网在线动态壁纸",
+      author: "必应全网动图",
+      license: "动态 GIF",
+      type: "gif",
+      thumb: proxyImageUrl(c.thumb),
+      // Direct original GIF URL (with same-origin Referer in proxy) + Bing CDN thumb fallback
+      url: proxyImageUrl(c.murl, c.thumb),
+      resolution: "动态",
+    })),
+    hasMore: cards.length >= 10,
+  };
+}
+
+async function searchBingGithubRepos(querySuffix, q, limit = 10) {
+  const url = `https://cn.bing.com/search?q=${encodeURIComponent(`site:github.com ${q} ${querySuffix}`)}&count=${limit}`;
+  const html = await fetchTextWithTimeout(url, 7000, { "User-Agent": BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9" });
+  const repos = [];
+  const seen = new Set();
+  for (const m of html.matchAll(/href="(https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+))"/g)) {
+    const [, repoUrl, owner, repo] = m;
+    if (["topics", "search", "explore", "features", "marketplace", "orgs", "settings"].includes(owner.toLowerCase())) continue;
+    const full = `${owner}/${repo}`;
+    if (seen.has(full.toLowerCase())) continue;
+    seen.add(full.toLowerCase());
+    repos.push({ owner, repo, full_name: full, html_url: repoUrl });
+    if (repos.length >= limit) break;
+  }
+  return repos;
 }
 
 // ==================== ONLINE SEARCH: MCP STORE (OFFICIAL REGISTRY + NPM + GITHUB) ====================
@@ -489,8 +629,9 @@ function parseRegistryMcpEntry(entry) {
   };
 }
 
-export async function searchMcpStore(query = "") {
+export async function searchMcpStore(query = "", enginePref = "") {
   const q = String(query || "").trim();
+  const engine = await resolveSearchEngine(enginePref);
   const localHits = q
     ? CURATED_MCPS.filter((m) =>
         `${m.name} ${m.title} ${m.description} ${(m.tags || []).join(" ")}`.toLowerCase().includes(q.toLowerCase()),
@@ -499,81 +640,131 @@ export async function searchMcpStore(query = "") {
 
   const onlineItems = [];
   const errors = [];
+  const tasks = [];
 
-  // Run Official MCP Registry + npm + GitHub in parallel for maximum public coverage!
-  const tasks = [
-    // 1. Official MCP Registry (covers thousands of public stdio + remote HTTP/SSE MCPs)
-    (async () => {
-      try {
-        const regUrl = q
-          ? `https://registry.modelcontextprotocol.io/v0/servers?search=${encodeURIComponent(q)}&limit=18`
-          : `https://registry.modelcontextprotocol.io/v0/servers?limit=12`;
-        const data = await fetchJsonWithTimeout(regUrl, 8500);
-        for (const entry of data.servers || []) {
-          const parsed = parseRegistryMcpEntry(entry);
-          if (parsed) onlineItems.push(parsed);
-        }
-      } catch (err) {
-        errors.push(`官方Registry: ${err.message}`);
-      }
-    })(),
-  ];
-
-  if (q) {
-    // 2. npm Registry (all public JS/TS MCP packages)
+  if (engine.active === "cn") {
+    // Domestic Direct Engine: Taobao npmmirror (covers 100% public npm MCPs at 300ms zero-proxy!) + Bing CN web search
     tasks.push(
       (async () => {
         try {
-          const npmUrl = `https://registry.npmjs.org/-/v1/search?text=${encodeURIComponent(`mcp ${q}`)}&size=14`;
-          const npmData = await fetchJsonWithTimeout(npmUrl, 8500);
-          for (const obj of npmData.objects || []) {
+          const term = q ? `mcp ${q}` : "modelcontextprotocol server";
+          const url = `https://registry.npmmirror.com/-/v1/search?text=${encodeURIComponent(term)}&size=24`;
+          const data = await fetchJsonWithTimeout(url, 8000);
+          for (const obj of data.objects || []) {
             const pkg = obj.package || {};
             if (!pkg.name) continue;
             onlineItems.push({
-              id: `npm-${pkg.name.replace(/[^a-z0-9]/gi, "-")}`,
+              id: `npmm-${pkg.name.replace(/[^a-z0-9]/gi, "-")}`,
               name: pkg.name.split("/").pop().replace(/^mcp-server-|^server-/, "") || pkg.name,
               title: `${pkg.name} (v${pkg.version || "latest"})`,
-              description: pkg.description || `公开 npm MCP 包，使用 npx -y ${pkg.name} 一键启动。`,
+              description: pkg.description || `公开 npm MCP 包，使用 npx -y ${pkg.name} 一键安装启用。`,
               command: "npx",
               args: ["-y", pkg.name],
               env_hints: [],
               repo_url: pkg.links?.repository || pkg.links?.npm || "",
-              tags: ["npm", "npx"],
-              source: "npm",
+              tags: ["国内镜像", "npx"],
+              source: "npmmirror",
             });
           }
         } catch (err) {
-          errors.push(`npm: ${err.message}`);
+          errors.push(`国内npm镜像: ${err.message}`);
         }
       })(),
     );
-
-    // 3. GitHub open-source MCP repos (auto-detect Python uvx vs Node npx!)
+    if (q) {
+      tasks.push(
+        (async () => {
+          try {
+            const repos = await searchBingGithubRepos("mcp server", q, 10);
+            for (const r of repos) {
+              onlineItems.push({
+                id: `bmcp-${r.full_name.replace(/[^a-z0-9]/gi, "-")}`,
+                name: r.repo.toLowerCase(),
+                title: `${r.full_name} (必应全网)`,
+                description: `必应全网检索到的 GitHub 公开 MCP 项目 (${r.full_name})，可一键安装或查看仓库。`,
+                command: "npx",
+                args: ["-y", r.repo],
+                env_hints: [],
+                repo_url: r.html_url,
+                tags: ["必应全网", "GitHub"],
+                source: "bing-cn",
+              });
+            }
+          } catch {}
+        })(),
+      );
+    }
+  } else {
+    // Global Proxy Engine: Official MCP Registry + npmjs + GitHub API
     tasks.push(
       (async () => {
         try {
-          const ghUrl = `https://api.github.com/search/repositories?q=${encodeURIComponent(`${q} mcp server`)}&sort=stars&per_page=10`;
-          const ghData = await fetchJsonWithTimeout(ghUrl, 8500);
-          for (const repo of ghData.items || []) {
-            const isPy = String(repo.language || "").toLowerCase() === "python";
-            onlineItems.push({
-              id: `gh-${repo.id}`,
-              name: repo.name.replace(/[^a-z0-9_-]/gi, "-").toLowerCase(),
-              title: `${repo.full_name} (★ ${repo.stargazers_count || 0})`,
-              description: repo.description || `GitHub 公开 MCP 仓库 (${repo.language || "开源"})`,
-              command: isPy ? "uvx" : "npx",
-              args: isPy ? [repo.name] : ["-y", repo.name],
-              env_hints: [],
-              repo_url: repo.html_url,
-              tags: ["GitHub", isPy ? "uvx" : "npx", `★${repo.stargazers_count || 0}`],
-              source: "github",
-            });
+          const regUrl = q
+            ? `https://registry.modelcontextprotocol.io/v0/servers?search=${encodeURIComponent(q)}&limit=18`
+            : `https://registry.modelcontextprotocol.io/v0/servers?limit=12`;
+          const data = await fetchJsonWithTimeout(regUrl, 8000);
+          for (const entry of data.servers || []) {
+            const parsed = parseRegistryMcpEntry(entry);
+            if (parsed) onlineItems.push(parsed);
           }
         } catch (err) {
-          errors.push(`GitHub: ${err.message}`);
+          errors.push(`官方Registry: ${err.message}`);
         }
       })(),
     );
+    if (q) {
+      tasks.push(
+        (async () => {
+          try {
+            const npmUrl = `https://registry.npmjs.org/-/v1/search?text=${encodeURIComponent(`mcp ${q}`)}&size=14`;
+            const npmData = await fetchJsonWithTimeout(npmUrl, 8000);
+            for (const obj of npmData.objects || []) {
+              const pkg = obj.package || {};
+              if (!pkg.name) continue;
+              onlineItems.push({
+                id: `npm-${pkg.name.replace(/[^a-z0-9]/gi, "-")}`,
+                name: pkg.name.split("/").pop().replace(/^mcp-server-|^server-/, "") || pkg.name,
+                title: `${pkg.name} (v${pkg.version || "latest"})`,
+                description: pkg.description || `公开 npm MCP 包，使用 npx -y ${pkg.name} 一键启动。`,
+                command: "npx",
+                args: ["-y", pkg.name],
+                env_hints: [],
+                repo_url: pkg.links?.repository || pkg.links?.npm || "",
+                tags: ["npm", "npx"],
+                source: "npm",
+              });
+            }
+          } catch (err) {
+            errors.push(`npm: ${err.message}`);
+          }
+        })(),
+      );
+      tasks.push(
+        (async () => {
+          try {
+            const ghUrl = `https://api.github.com/search/repositories?q=${encodeURIComponent(`${q} mcp server`)}&sort=stars&per_page=10`;
+            const ghData = await fetchJsonWithTimeout(ghUrl, 8000);
+            for (const repo of ghData.items || []) {
+              const isPy = String(repo.language || "").toLowerCase() === "python";
+              onlineItems.push({
+                id: `gh-${repo.id}`,
+                name: repo.name.replace(/[^a-z0-9_-]/gi, "-").toLowerCase(),
+                title: `${repo.full_name} (★ ${repo.stargazers_count || 0})`,
+                description: repo.description || `GitHub 公开 MCP 仓库 (${repo.language || "开源"})`,
+                command: isPy ? "uvx" : "npx",
+                args: isPy ? [repo.name] : ["-y", repo.name],
+                env_hints: [],
+                repo_url: repo.html_url,
+                tags: ["GitHub", isPy ? "uvx" : "npx", `★${repo.stargazers_count || 0}`],
+                source: "github",
+              });
+            }
+          } catch (err) {
+            errors.push(`GitHub: ${err.message}`);
+          }
+        })(),
+      );
+    }
   }
 
   await Promise.all(tasks);
@@ -585,7 +776,8 @@ export async function searchMcpStore(query = "") {
   }
   return {
     ok: true,
-    mode: q ? "online" : "curated+registry",
+    mode: q ? "online" : "curated+online",
+    search_engine: engine,
     query: q,
     items: [...dedup.values()].slice(0, 36),
     online_error: errors.length && !onlineItems.length ? errors.join("；") : "",
@@ -693,47 +885,75 @@ function parseSkillFrontmatter(mdText) {
   return out;
 }
 
-async function fetchAnthropicOfficialSkills() {
+async function fetchAnthropicOfficialSkills(engineActive = "cn") {
   if (_cachedOfficialSkills && Date.now() - _cachedOfficialAt < 30 * 60 * 1000) {
     return _cachedOfficialSkills;
   }
+  // 1) Domestic-friendly jsDelivr CDN index (works cleanly without VPN!)
   try {
-    const dirs = await fetchJsonWithTimeout("https://api.github.com/repos/anthropics/skills/contents/skills", 8000);
-    if (!Array.isArray(dirs)) return [];
-    const list = dirs
-      .filter((d) => d.type === "dir" && d.name)
-      .slice(0, 16)
-      .map((d) => ({
+    const jsd = await fetchJsonWithTimeout("https://data.jsdelivr.com/v1/packages/gh/anthropics/skills@main", 7000);
+    const skillsDir = (jsd.files || []).find((f) => f.type === "directory" && f.name === "skills");
+    const dirs = (skillsDir?.files || []).filter((f) => f.type === "directory" && f.name);
+    if (dirs.length) {
+      const list = dirs.slice(0, 20).map((d) => ({
         id: `anth-skill-${d.name}`,
         slug: d.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"),
         name: `${d.name} (Anthropic 官方开源)`,
-        description: `来自官方开源仓库 anthropics/skills 的 /${d.name} 技能，点击即可下载完整 SKILL.md 并启用。`,
-        source_url: d.html_url || `https://github.com/anthropics/skills/tree/main/skills/${d.name}`,
-        raw_skill_url: `https://raw.githubusercontent.com/anthropics/skills/main/skills/${d.name}/SKILL.md`,
+        description: `来自官方开源仓库 anthropics/skills 的 /${d.name} 技能，免代理经 CDN 直连下载 SKILL.md 并启用。`,
+        source_url: `https://github.com/anthropics/skills/tree/main/skills/${d.name}`,
+        raw_skill_url: `https://cdn.jsdelivr.net/gh/anthropics/skills@main/skills/${d.name}/SKILL.md`,
         github_full_name: "anthropics/skills",
         default_branch: "main",
-        tags: ["官方开源", "SKILL.md"],
+        tags: ["官方开源", "CDN直连"],
         content: "",
       }));
-    _cachedOfficialSkills = list;
-    _cachedOfficialAt = Date.now();
-    return list;
-  } catch {
-    return [];
+      _cachedOfficialSkills = list;
+      _cachedOfficialAt = Date.now();
+      return list;
+    }
+  } catch {}
+
+  if (engineActive === "proxy") {
+    try {
+      const dirs = await fetchJsonWithTimeout("https://api.github.com/repos/anthropics/skills/contents/skills", 7000);
+      if (Array.isArray(dirs)) {
+        const list = dirs
+          .filter((d) => d.type === "dir" && d.name)
+          .slice(0, 20)
+          .map((d) => ({
+            id: `anth-skill-${d.name}`,
+            slug: d.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"),
+            name: `${d.name} (Anthropic 官方开源)`,
+            description: `来自官方开源仓库 anthropics/skills 的 /${d.name} 技能，点击即可下载完整 SKILL.md 并启用。`,
+            source_url: d.html_url || `https://github.com/anthropics/skills/tree/main/skills/${d.name}`,
+            raw_skill_url: `https://raw.githubusercontent.com/anthropics/skills/main/skills/${d.name}/SKILL.md`,
+            github_full_name: "anthropics/skills",
+            default_branch: "main",
+            tags: ["官方开源", "SKILL.md"],
+            content: "",
+          }));
+        _cachedOfficialSkills = list;
+        _cachedOfficialAt = Date.now();
+        return list;
+      }
+    } catch {}
   }
+  return [];
 }
 
-export async function searchSkillsStore(query = "") {
+export async function searchSkillsStore(query = "", enginePref = "") {
   const q = String(query || "").trim();
-  const official = await fetchAnthropicOfficialSkills();
+  const engine = await resolveSearchEngine(enginePref);
+  const official = await fetchAnthropicOfficialSkills(engine.active);
   const baseCatalog = [...CURATED_SKILLS, ...official];
 
   if (!q) {
     return {
       ok: true,
       mode: "curated+official",
+      search_engine: engine,
       items: baseCatalog,
-      online_note: "已加载精选与官方开源 Skills，输入关键词可实时搜索全网 GitHub 公开 Skills，或直接粘贴任意公开链接导入",
+      online_note: "已加载精选与官方开源 Skills，输入关键词可全网实时搜索公开 Skills",
     };
   }
 
@@ -743,25 +963,56 @@ export async function searchSkillsStore(query = "") {
 
   const onlineItems = [];
   let onlineError = "";
-  try {
-    const ghUrl = `https://api.github.com/search/repositories?q=${encodeURIComponent(`${q} (claude-skill OR agent-skill OR "SKILL.md" OR claude skill)`)}&sort=stars&per_page=14`;
-    const ghData = await fetchJsonWithTimeout(ghUrl, 9000);
-    for (const repo of ghData.items || []) {
-      onlineItems.push({
-        id: `gh-skill-${repo.id}`,
-        slug: repo.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"),
-        name: `${repo.name} (★ ${repo.stargazers_count || 0})`,
-        description: repo.description || `来自 ${repo.full_name} 的 GitHub 公开 Skill，安装时自动拉取 SKILL.md 与说明。`,
-        source_url: repo.html_url,
-        github_full_name: repo.full_name,
-        default_branch: repo.default_branch || "main",
-        tags: ["GitHub", `★${repo.stargazers_count || 0}`],
-        content: "",
-      });
+
+  if (engine.active === "cn") {
+    // Domestic Direct Engine: Taobao npmmirror Skills + Bing CN web search (zero proxy needed!)
+    try {
+      const npmData = await fetchJsonWithTimeout(
+        `https://registry.npmmirror.com/-/v1/search?text=${encodeURIComponent(`claude skill ${q}`)}&size=18`,
+        8000,
+      );
+      for (const obj of npmData.objects || []) {
+        const pkg = obj.package || {};
+        if (!pkg.name) continue;
+        const repoUrl = pkg.links?.repository || pkg.links?.homepage || pkg.links?.npm || "";
+        const ghMatch = repoUrl.match(/github\.com\/([^/]+\/[^/#?]+)/i);
+        const slug = pkg.name.split("/").pop().toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+        onlineItems.push({
+          id: `npmm-sk-${pkg.name.replace(/[^a-z0-9]/gi, "-")}`,
+          slug,
+          name: `${pkg.name} (v${pkg.version || "latest"})`,
+          description: pkg.description || `公开 Skill 包 (${pkg.name})，点击下载说明与指令并启用。`,
+          source_url: repoUrl,
+          github_full_name: ghMatch ? ghMatch[1].replace(/\.git$/i, "") : "",
+          default_branch: "main",
+          tags: ["国内镜像", "公开Skill"],
+          content: "",
+        });
+      }
+    } catch (err) {
+      onlineError = `国内镜像检索失败: ${err.message}`;
     }
-  } catch (err) {
-    onlineError = `GitHub Skills 联网搜索受限: ${err.message}`;
-    logEvent("WARN", "stores", "skills_search_err", onlineError);
+  } else {
+    try {
+      const ghUrl = `https://api.github.com/search/repositories?q=${encodeURIComponent(`${q} (claude-skill OR agent-skill OR "SKILL.md" OR claude skill)`)}&sort=stars&per_page=14`;
+      const ghData = await fetchJsonWithTimeout(ghUrl, 8500);
+      for (const repo of ghData.items || []) {
+        onlineItems.push({
+          id: `gh-skill-${repo.id}`,
+          slug: repo.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"),
+          name: `${repo.name} (★ ${repo.stargazers_count || 0})`,
+          description: repo.description || `来自 ${repo.full_name} 的 GitHub 公开 Skill，安装时自动拉取 SKILL.md 与说明。`,
+          source_url: repo.html_url,
+          github_full_name: repo.full_name,
+          default_branch: repo.default_branch || "main",
+          tags: ["GitHub", `★${repo.stargazers_count || 0}`],
+          content: "",
+        });
+      }
+    } catch (err) {
+      onlineError = `GitHub Skills 联网搜索受限: ${err.message}`;
+      logEvent("WARN", "stores", "skills_search_err", onlineError);
+    }
   }
 
   const dedup = new Map();
@@ -771,6 +1022,7 @@ export async function searchSkillsStore(query = "") {
   return {
     ok: true,
     mode: "online",
+    search_engine: engine,
     query: q,
     items: [...dedup.values()].slice(0, 28),
     online_error: onlineError,
@@ -778,7 +1030,7 @@ export async function searchSkillsStore(query = "") {
 }
 
 /**
- * Download SKILL.md (or README.md fallback) from ANY public GitHub repo or direct SKILL.md URL!
+ * Download SKILL.md (or README.md fallback) via BOTH jsDelivr CDN (works in China direct!) & GitHub raw.
  */
 export async function downloadRemoteSkillContent(item) {
   if (item.content && item.content.trim()) return item.content;
@@ -786,26 +1038,22 @@ export async function downloadRemoteSkillContent(item) {
   if (item.raw_skill_url) candidates.push(item.raw_skill_url);
   if (item.github_full_name) {
     const branch = item.default_branch || "main";
+    const gh = item.github_full_name;
+    // Try domestic-accessible jsDelivr CDN first, then raw.githubusercontent.com
     candidates.push(
-      `https://raw.githubusercontent.com/${item.github_full_name}/${branch}/SKILL.md`,
-      `https://raw.githubusercontent.com/${item.github_full_name}/${branch}/skill.md`,
-      `https://raw.githubusercontent.com/${item.github_full_name}/${branch}/skills/${item.slug}/SKILL.md`,
-      `https://raw.githubusercontent.com/${item.github_full_name}/${branch}/README.md`,
+      `https://cdn.jsdelivr.net/gh/${gh}@${branch}/SKILL.md`,
+      `https://cdn.jsdelivr.net/gh/${gh}@${branch}/skills/${item.slug}/SKILL.md`,
+      `https://raw.githubusercontent.com/${gh}/${branch}/SKILL.md`,
+      `https://raw.githubusercontent.com/${gh}/${branch}/skills/${item.slug}/SKILL.md`,
+      `https://cdn.jsdelivr.net/gh/${gh}@${branch}/README.md`,
+      `https://raw.githubusercontent.com/${gh}/${branch}/README.md`,
     );
   }
   for (const url of candidates) {
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8000);
-      const res = await fetch(url, { headers: { "User-Agent": USER_AGENT }, signal: controller.signal });
-      clearTimeout(timer);
-      if (res.ok) {
-        const text = await res.text();
-        if (text.trim().length > 20) return text.slice(0, 24000);
-      }
-    } catch {
-      // try next candidate
-    }
+      const txt = await fetchTextWithTimeout(url, 7000);
+      if (txt.trim().length > 20) return txt.slice(0, 24000);
+    } catch {}
   }
   return `# ${item.name}\n\n来源: ${item.source_url || ""}\n\n${item.description || ""}`;
 }
@@ -922,12 +1170,13 @@ async function searchOnlineLiveVideos(q, translated, pageNum) {
   };
 }
 
-export async function searchWallpaperStore(query = "", page = 1, category = "all") {
+export async function searchWallpaperStore(query = "", page = 1, category = "all", enginePref = "") {
   const q = String(query || "").trim();
   const pageNum = Math.max(1, Number(page) || 1);
   const translated = translateWallpaperQuery(q);
+  const engine = await resolveSearchEngine(enginePref);
 
-  // Category filter for LIVE wallpapers: 12 built-in 60fps Canvas + massive online Wikimedia open-source loop videos!
+  // ==================== LIVE WALLPAPERS (12x 60fps + DOMESTIC BING LIVE GIF / PROXY WIKIMEDIA VIDEO) ====================
   if (category === "live") {
     const ql = q.toLowerCase();
     const localLive =
@@ -938,104 +1187,112 @@ export async function searchWallpaperStore(query = "", page = 1, category = "all
               `${w.name} ${w.description || ""} ${(w.tags || []).join(" ")}`.toLowerCase().includes(ql),
           )
         : [];
-    let onlineVideos = [];
+    const onlineLive = [];
     let hasMore = false;
     let onlineError = "";
-    try {
-      const vres = await searchOnlineLiveVideos(q, translated, pageNum);
-      onlineVideos = vres.items;
-      hasMore = vres.hasMore;
-    } catch (err) {
-      onlineError = `在线动态视频搜索失败: ${err.message}`;
+
+    if (engine.active === "cn") {
+      try {
+        const bres = await searchBingLiveGifs(q, pageNum);
+        onlineLive.push(...bres.items);
+        hasMore = bres.hasMore;
+      } catch (err) {
+        onlineError = `国内动态壁纸搜索失败: ${err.message}`;
+      }
+    } else {
+      // Global Proxy mode: run Wikimedia loop videos + Bing full-web live GIFs in parallel!
+      const [wmRes, bingRes] = await Promise.allSettled([
+        searchOnlineLiveVideos(q, translated, pageNum),
+        searchBingLiveGifs(q, pageNum),
+      ]);
+      if (wmRes.status === "fulfilled") {
+        onlineLive.push(...wmRes.value.items);
+        hasMore = hasMore || wmRes.value.hasMore;
+      }
+      if (bingRes.status === "fulfilled") {
+        onlineLive.push(...bingRes.value.items);
+        hasMore = hasMore || bingRes.value.hasMore;
+      }
+      if (!onlineLive.length) {
+        onlineError = "在线动态壁纸检索超时，请重试或切换搜索引擎模式";
+      }
     }
+
     return {
       ok: true,
-      mode: "live+video",
+      mode: "live+online",
+      search_engine: engine,
       page: pageNum,
       last_page: hasMore ? pageNum + 1 : pageNum,
-      total_online: localLive.length + onlineVideos.length,
+      total_online: localLive.length + onlineLive.length,
       has_more: hasMore,
-      items: [...localLive, ...onlineVideos],
+      items: [...localLive, ...onlineLive],
       online_error: onlineError,
     };
   }
 
+  // ==================== STATIC 4K WALLPAPERS (DOMESTIC BING CN vs GLOBAL WALLHAVEN + BING) ====================
   const onlineItems = [];
   let onlineError = "";
-  let lastPage = 1;
+  let lastPage = pageNum + 1;
   let totalCount = 0;
 
-  // Query Wallhaven public 4K wallpaper API (24 HD wallpapers per page, infinite pagination, SFW purity=100)
-  try {
-    const whParams = new URLSearchParams({
-      purity: "100",
-      page: String(pageNum),
-      sorting: translated ? "relevance" : "toplist",
-      ratios: "16x9,16x10,21x9",
-    });
-    if (translated) {
-      whParams.set("q", translated);
-    } else if (category === "anime") {
-      whParams.set("categories", "010");
-    } else if (category === "scenery") {
-      whParams.set("q", "landscape nature");
-    } else {
-      whParams.set("categories", "110"); // general + anime (clean wallpapers)
-    }
-
-    const whUrl = `https://wallhaven.cc/api/v1/search?${whParams.toString()}`;
-    const data = await fetchJsonWithTimeout(whUrl, 10000);
-    lastPage = Number(data?.meta?.last_page || 1);
-    totalCount = Number(data?.meta?.total || 0);
-
-    for (const item of data?.data || []) {
-      // Wallhaven's `thumbs.small` (300x200) and `path` (full 4K) are publicly accessible 200 OK
-      // without hotlink 403 (unlike `thumbs.large`/`thumbs.original`).
-      const thumb = item.thumbs?.small || item.path;
-      const full = item.path;
-      if (!thumb || !full) continue;
-      onlineItems.push({
-        id: `wh-${item.id}`,
-        name: `${item.category || "HD"} · ${item.resolution || "4K"}`,
-        author: "Wallhaven",
-        license: item.resolution || "HD",
-        type: "image",
-        thumb: proxyImageUrl(thumb),
-        url: proxyImageUrl(full),
-        resolution: item.resolution || "",
-        colors: item.colors || [],
-      });
-    }
-  } catch (err) {
-    onlineError = `Wallhaven 联网搜索失败: ${err.message}`;
-    logEvent("WARN", "stores", "wallhaven_err", onlineError);
-  }
-
-  // Fallback / supplement with Wikimedia Commons if Wallhaven returned few hits
-  if (onlineItems.length < 6 && q) {
+  if (engine.active === "cn") {
     try {
-      const wmUrl =
-        `https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*` +
-        `&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(`${translated || q} filetype:bitmap`)}&gsrlimit=12` +
-        `&prop=imageinfo&iiprop=url|extmetadata|size&iiurlwidth=640`;
-      const data = await fetchJsonWithTimeout(wmUrl, 9000);
-      for (const pg of Object.values(data?.query?.pages || {})) {
-        const info = pg.imageinfo?.[0];
-        if (!info?.url || !info?.thumburl) continue;
-        if ((info.width || 0) < 900) continue;
-        const cleanName = String(pg.title || "").replace(/^File:/i, "").replace(/\.[^.]+$/, "").replace(/_/g, " ").slice(0, 50);
+      const bres = await searchBingWallpapers(q, pageNum, category);
+      onlineItems.push(...bres.items);
+      lastPage = bres.hasMore ? pageNum + 9 : pageNum;
+    } catch (err) {
+      onlineError = `国内全网壁纸搜索失败: ${err.message}`;
+    }
+  } else {
+    // Global Proxy Mode: Wallhaven 4K first, auto-fallback/supplement with Bing Full-Web so results are NEVER empty!
+    try {
+      const whParams = new URLSearchParams({
+        purity: "100",
+        page: String(pageNum),
+        sorting: translated ? "relevance" : "toplist",
+        ratios: "16x9,16x10,21x9",
+      });
+      if (translated) whParams.set("q", translated);
+      else if (category === "anime") whParams.set("categories", "010");
+      else if (category === "scenery") whParams.set("q", "landscape nature");
+      else whParams.set("categories", "110");
+
+      const whUrl = `https://wallhaven.cc/api/v1/search?${whParams.toString()}`;
+      const data = await fetchJsonWithTimeout(whUrl, 7500);
+      lastPage = Number(data?.meta?.last_page || 1);
+      totalCount = Number(data?.meta?.total || 0);
+
+      for (const item of data?.data || []) {
+        const thumb = item.thumbs?.small || item.path;
+        const full = item.path;
+        if (!thumb || !full) continue;
         onlineItems.push({
-          id: `wm-${pg.pageid}`,
-          name: cleanName || "Wikimedia 壁纸",
-          author: "Wikimedia",
-          license: info.extmetadata?.LicenseShortName?.value || "CC",
+          id: `wh-${item.id}`,
+          name: `${item.category || "HD"} · ${item.resolution || "4K"}`,
+          author: "Wallhaven 4K",
+          license: item.resolution || "HD",
           type: "image",
-          thumb: proxyImageUrl(info.thumburl),
-          url: proxyImageUrl(info.url),
+          thumb: proxyImageUrl(thumb),
+          url: proxyImageUrl(full),
+          resolution: item.resolution || "",
+          colors: item.colors || [],
         });
       }
-    } catch {
-      // ignore fallback err
+    } catch (err) {
+      onlineError = `Wallhaven 超时，已自动切至必应全网补齐 (${err.message})`;
+      logEvent("WARN", "stores", "wallhaven_fallback_bing", onlineError);
+    }
+
+    // If Wallhaven timed out or returned few hits, supplement seamlessly with Bing Full-Web!
+    if (onlineItems.length < 8) {
+      try {
+        const bres = await searchBingWallpapers(q, pageNum, category);
+        onlineItems.push(...bres.items);
+        if (bres.hasMore && lastPage <= pageNum) lastPage = pageNum + 5;
+        if (onlineItems.length > 0) onlineError = "";
+      } catch {}
     }
   }
 
@@ -1043,12 +1300,13 @@ export async function searchWallpaperStore(query = "", page = 1, category = "all
   return {
     ok: true,
     mode: q ? "online" : "curated+online",
+    search_engine: engine,
     query: q,
     translated_query: translated,
     page: pageNum,
     last_page: lastPage,
     total_online: totalCount,
-    has_more: pageNum < lastPage,
+    has_more: pageNum < lastPage && onlineItems.length > 0,
     items: [...baseItems, ...onlineItems],
     online_error: onlineError,
   };

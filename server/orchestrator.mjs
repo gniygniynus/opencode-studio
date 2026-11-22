@@ -413,11 +413,9 @@ export class SessionOrchestrator {
             ? (info) => this._requestConfirm(sessionId, info)
             : null;
 
-        const claudeRt = detectClaudeRuntime(false);
-        const engineMode = settings.engine_mode || "auto"; // auto | claude_code | api_direct
-        const useNativeClaudeCode =
-          provider.kind === "claude_native" ||
-          (engineMode !== "api_direct" && claudeRt.mode !== "missing" && !process.env.OPENCODE_FORCE_API_DIRECT);
+        // Pure Native Claude Code architecture (bundled inside app installer out-of-the-box!).
+        // Only tests explicitly setting OPENCODE_FORCE_API_DIRECT=1 use the lightweight test mock engine.
+        const useNativeClaudeCode = process.env.OPENCODE_FORCE_API_DIRECT !== "1";
 
         let lastPushTs = 0;
         const pushLive = (force = false) => {

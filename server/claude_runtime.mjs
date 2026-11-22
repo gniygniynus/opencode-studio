@@ -21,7 +21,7 @@ import path from "node:path";
 import { getAllSettings, listInstalledMcps, listInstalledSkills, listMemories } from "./db.mjs";
 import { appendTurnLog, classifyError, logEvent } from "./logger.mjs";
 import { detectModelCapabilities } from "./model_registry.mjs";
-import { getPaths } from "./paths.mjs";
+import { getPaths, PROJECT_ROOT } from "./paths.mjs";
 
 let _cachedRuntime = null;
 let _cachedAt = 0;
@@ -85,24 +85,50 @@ function testWslClaude() {
   };
 }
 
+function getBundledClaudeCandidates() {
+  const binName = process.platform === "win32" ? "claude.exe" : "claude";
+  const platPkg = `@anthropic-ai/claude-code-${process.platform}-${process.arch}`;
+  const roots = [PROJECT_ROOT];
+  // When packaged inside Electron app.asar, native binaries live in app.asar.unpacked!
+  if (PROJECT_ROOT.includes("app.asar") && !PROJECT_ROOT.includes("app.asar.unpacked")) {
+    roots.unshift(PROJECT_ROOT.replace("app.asar", "app.asar.unpacked"));
+  }
+  const out = [];
+  for (const r of roots) {
+    out.push(path.join(r, "node_modules", platPkg, binName));
+    if (process.platform === "linux") {
+      out.push(path.join(r, "node_modules", `${platPkg}-musl`, binName));
+    }
+    out.push(path.join(r, "node_modules", "@anthropic-ai", "claude-code", "bin", binName));
+  }
+  return out;
+}
+
 /**
- * Detect a genuinely working native Claude Code CLI (never fooled by broken shim scripts).
+ * Detect a genuinely working native Claude Code CLI:
+ *  1. User-upgraded native binary (~/.local/bin/claude[.exe])
+ *  2. Bundled official native binary shipped INSIDE OpenCode Studio installer (out-of-the-box!)
+ *  3. System PATH / WSL2 fallback
  */
 export function detectClaudeRuntime(force = false) {
   if (!force && _cachedRuntime && Date.now() - _cachedAt < 10_000) {
     return _cachedRuntime;
   }
 
+  const bundledSet = new Set(getBundledClaudeCandidates().map((p) => path.resolve(p)));
   const candidates = [];
+
   if (process.platform === "win32") {
     candidates.push(path.join(os.homedir(), ".local", "bin", "claude.exe"));
     candidates.push(path.join(process.env.LOCALAPPDATA || "", "Programs", "claude", "claude.exe"));
+    candidates.push(...getBundledClaudeCandidates());
     const w = spawnSync("where.exe", ["claude.exe"], { encoding: "utf8", timeout: 3000, windowsHide: true });
     if (w.status === 0 && w.stdout) candidates.push(...w.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
     const wc = spawnSync("where.exe", ["claude"], { encoding: "utf8", timeout: 3000, windowsHide: true });
     if (wc.status === 0 && wc.stdout) candidates.push(...wc.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
   } else {
     candidates.push(path.join(os.homedir(), ".local", "bin", "claude"));
+    candidates.push(...getBundledClaudeCandidates());
     const w = spawnSync("which", ["claude"], { encoding: "utf8", timeout: 3000 });
     if (w.status === 0 && w.stdout.trim()) candidates.push(w.stdout.trim());
   }
@@ -110,13 +136,16 @@ export function detectClaudeRuntime(force = false) {
   let found = null;
   for (const c of [...new Set(candidates)]) {
     found = testNativeCandidate(c);
-    if (found) break;
+    if (found) {
+      found.bundled = bundledSet.has(path.resolve(c));
+      break;
+    }
   }
   if (!found && process.platform === "win32") {
     found = testWslClaude();
   }
 
-  _cachedRuntime = found || { mode: "missing", binary: null, isCmd: false, version: null };
+  _cachedRuntime = found || { mode: "missing", binary: null, isCmd: false, version: null, bundled: false };
   _cachedAt = Date.now();
   return _cachedRuntime;
 }
@@ -207,12 +236,14 @@ export function getClaudeRuntimeAndAuth(force = false) {
   return {
     installed: true,
     mode: rt.mode,
+    bundled: Boolean(rt.bundled),
     binary: rt.binary,
     version: rt.version,
     auth,
-    note:
-      rt.mode === "wsl"
-        ? `已接入本机 WSL2 原生 Claude Code (${rt.version})；也可点击安装 Windows 原生版。`
+    note: rt.bundled
+      ? `已开箱启用随安装包内置的原生 Claude Code (${rt.version})，零配置即用。`
+      : rt.mode === "wsl"
+        ? `已接入本机 WSL2 原生 Claude Code (${rt.version})。`
         : `已接入本机原生 Claude Code (${rt.version})。`,
   };
 }
@@ -225,11 +256,22 @@ function parseSemverString(raw) {
   return m ? m[1] : "";
 }
 
+function stripAnsi(s) {
+  return String(s || "").replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+}
+
 function openExternalUrlInHost(url) {
   if (!/^https:\/\//i.test(url || "")) return;
   try {
     if (process.platform === "win32") {
-      spawn("cmd.exe", ["/c", "start", "", url], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+      // Single-quoted PowerShell Start-Process is 100% immune to `&` query-string truncation!
+      const escaped = url.replace(/'/g, "''");
+      const encoded = Buffer.from(`Start-Process -FilePath '${escaped}'`, "utf16le").toString("base64");
+      spawn("powershell.exe", ["-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", encoded], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      }).unref();
     } else if (process.platform === "darwin") {
       spawn("open", [url], { detached: true, stdio: "ignore" }).unref();
     } else {
@@ -311,16 +353,58 @@ export async function runClaudeAuthLogin({ mode = "claudeai", email = "", onProg
   logEvent("INFO", "claude_auth", "login_start", `发起原生 Claude Code 登录 (${mode})`);
 
   return await new Promise((resolve) => {
-    const proc = spawnClaudeProcess(rt, args, {
-      cwd: os.homedir(),
-      env: {
+    // On WSL/Linux, wrap inside Python PTY so Claude CLI flushes OAuth URL immediately (<0.5s) instead of buffering!
+    let proc;
+    if (rt.mode === "wsl") {
+      const pyArgs = JSON.stringify([rt.binary, ...args]);
+      const pyScript = `python3 -u - <<'PY'
+import os, pty, select, subprocess, sys
+m, s = pty.openpty()
+env = os.environ.copy()
+for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+    env.pop(k, None)
+env["DISABLE_TELEMETRY"] = "1"
+p = subprocess.Popen(${pyArgs}, stdin=s, stdout=s, stderr=s, env=env, close_fds=True)
+os.close(s)
+while True:
+    if p.poll() is not None:
+        break
+    r, _, _ = select.select([m, sys.stdin.fileno()], [], [], 0.15)
+    if m in r:
+        try:
+            d = os.read(m, 4096)
+            if not d: break
+            sys.stdout.buffer.write(d)
+            sys.stdout.buffer.flush()
+        except OSError:
+            break
+    if sys.stdin.fileno() in r:
+        line = os.read(sys.stdin.fileno(), 4096)
+        if not line: break
+        os.write(m, line)
+sys.exit(p.wait())
+PY`;
+      proc = spawn("wsl.exe", wslScriptArgs(pyScript), { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    } else {
+      // Native Windows / macOS binary: runs directly & flushes OAuth URL in ~0.3s + launches browser!
+      const authEnv = {
         ANTHROPIC_BASE_URL: null,
         ANTHROPIC_AUTH_TOKEN: null,
         ANTHROPIC_API_KEY: null,
         DISABLE_TELEMETRY: "1",
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+      };
+      // Forward configured search proxy to official Claude OAuth if user set one
+      const se = getAllSettings().search_engine || {};
+      if (se.proxy_url) {
+        authEnv.HTTP_PROXY = se.proxy_url;
+        authEnv.HTTPS_PROXY = se.proxy_url;
+      }
+      proc = spawnClaudeProcess(rt, args, {
+        cwd: os.homedir(),
+        env: authEnv,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    }
 
     const expireTimer = setTimeout(() => {
       if (_activeAuthSession?.proc === proc) {
@@ -350,13 +434,14 @@ export async function runClaudeAuthLogin({ mode = "claudeai", email = "", onProg
     };
 
     const inspectChunk = (chunk) => {
-      const txt = chunk.toString("utf8");
+      const txt = stripAnsi(chunk.toString("utf8"));
       combined += txt;
       if (_activeAuthSession?.proc === proc) _activeAuthSession.combined = combined;
 
-      // Match platform.claude.com, claude.ai, console.anthropic.com OAuth links cleanly
-      const m = combined.match(/https:\/\/(?:platform\.claude\.com|claude\.ai|console\.anthropic\.com)\/oauth\/[^\s"'<>]+/i)
-        || combined.match(/https:\/\/(?:platform\.claude\.com|claude\.ai|console\.anthropic\.com)\/[^\s"'<>]+/i);
+      // Match ALL official Claude OAuth hosts: claude.com, platform.claude.com, claude.ai, console.anthropic.com!
+      const cleanCombined = combined.replace(/\r/g, "");
+      const m =
+        cleanCombined.match(/https:\/\/(?:claude\.com|platform\.claude\.com|claude\.ai|console\.anthropic\.com)\/[^\s"'<>]+/i);
       if (m && !oauthUrl) {
         oauthUrl = m[0].replace(/[.,;)]+$/, "");
         if (_activeAuthSession?.proc === proc) _activeAuthSession.oauthUrl = oauthUrl;
@@ -365,7 +450,7 @@ export async function runClaudeAuthLogin({ mode = "claudeai", email = "", onProg
           openExternalUrlInHost(oauthUrl);
         }
         onProgress?.({ stage: "oauth_url", url: oauthUrl, needs_code_input: true, text: txt });
-        setTimeout(finishEarlyWithUrl, 600);
+        setTimeout(finishEarlyWithUrl, 350);
       } else {
         onProgress?.({ stage: "output", text: txt });
       }
@@ -374,9 +459,18 @@ export async function runClaudeAuthLogin({ mode = "claudeai", email = "", onProg
     proc.stdout?.on("data", inspectChunk);
     proc.stderr?.on("data", inspectChunk);
 
+    // Safety timeout so HTTP endpoint NEVER hangs indefinitely even if CLI stalls
     const urlTimer = setTimeout(() => {
-      if (!resolved && oauthUrl) finishEarlyWithUrl();
-    }, 4500);
+      if (!resolved) {
+        if (oauthUrl) return finishEarlyWithUrl();
+        resolved = true;
+        resolve({
+          ok: false,
+          error: "等待官方授权链接超时（请检查网络/代理连接，或查看下方输出）。",
+          output: combined.trim(),
+        });
+      }
+    }, 10000);
 
     proc.on("close", (code) => {
       clearTimeout(urlTimer);

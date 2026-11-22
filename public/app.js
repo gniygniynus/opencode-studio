@@ -202,17 +202,24 @@
     requestAnimationFrame(doScroll);
   }
 
-  // ==================== APPEARANCE & WALLPAPER (HD / SUBTLE / LIVE CANVAS / VIDEO) ====================
+  // ==================== APPEARANCE & WALLPAPER (HD / SUBTLE / BORDERLESS / CUSTOM ALPHA) ====================
 
   function applyAppearance(ap = {}) {
     const theme = ap.theme === "dark" ? "dark" : "light";
     const bgMode = ap.bgMode === "hd" ? "hd" : "subtle";
+    const bubbleStyle = ap.bubbleStyle === "text" ? "text" : "card";
+    const bubbleAlpha = ap.bubbleOpacity !== undefined ? Number(ap.bubbleOpacity) : (ap.bgOpacity ?? 0.88);
+    const sidebarAlpha = ap.sidebarOpacity !== undefined ? Number(ap.sidebarOpacity) : (bgMode === "hd" ? 0.52 : 0.84);
+
     document.documentElement.setAttribute("data-theme", theme);
     document.documentElement.style.setProperty("--font-size-base", `${ap.fontSize || 14.5}px`);
 
     const blurPx = bgMode === "hd" ? 0 : (ap.bgBlur ?? 10);
     document.documentElement.style.setProperty("--bg-blur", `${blurPx}px`);
+    document.documentElement.style.setProperty("--bubble-alpha", String(bubbleAlpha));
+    document.documentElement.style.setProperty("--sidebar-alpha", String(sidebarAlpha));
     document.body.classList.toggle("bg-mode-hd", bgMode === "hd");
+    document.body.classList.toggle("bubble-text-only", bubbleStyle === "text");
 
     const layer = $("wallpaper-layer");
     const videoEl = $("wallpaper-video");
@@ -233,8 +240,7 @@
 
     if (hasBg) {
       document.body.classList.add("has-wallpaper");
-      const alpha = bgMode === "hd" ? Math.min(ap.bgOpacity ?? 0.64, 0.85) : (ap.bgOpacity ?? 0.88);
-      document.documentElement.style.setProperty("--glass-alpha", String(alpha));
+      document.documentElement.style.setProperty("--glass-alpha", String(bubbleAlpha));
 
       if (bgType === "live" && ap.liveBg) {
         state.liveBgEngine?.setMode(ap.liveBg);
@@ -253,15 +259,19 @@
     }
 
     // Sync controls
-    $("ap-theme").value = theme;
+    if ($("ap-theme")) $("ap-theme").value = theme;
     $("btn-bgmode-hd")?.classList.toggle("active", bgMode === "hd");
     $("btn-bgmode-subtle")?.classList.toggle("active", bgMode !== "hd");
-    $("ap-fontsize").value = String(ap.fontSize || 14.5);
-    $("ap-fontsize-val").textContent = `${ap.fontSize || 14.5}px`;
-    $("ap-blur").value = String(ap.bgBlur ?? 10);
-    $("ap-blur-val").textContent = `${blurPx}px`;
-    $("ap-opacity").value = String(ap.bgOpacity ?? 0.88);
-    $("ap-opacity-val").textContent = `${Math.round((ap.bgOpacity ?? 0.88) * 100)}%`;
+    $("btn-bubble-card")?.classList.toggle("active", bubbleStyle !== "text");
+    $("btn-bubble-text")?.classList.toggle("active", bubbleStyle === "text");
+    if ($("ap-fontsize")) $("ap-fontsize").value = String(ap.fontSize || 14.5);
+    if ($("ap-fontsize-val")) $("ap-fontsize-val").textContent = `${ap.fontSize || 14.5}px`;
+    if ($("ap-blur")) $("ap-blur").value = String(ap.bgBlur ?? 10);
+    if ($("ap-blur-val")) $("ap-blur-val").textContent = `${blurPx}px`;
+    if ($("ap-bubble-opacity")) $("ap-bubble-opacity").value = String(bubbleAlpha);
+    if ($("ap-bubble-opacity-val")) $("ap-bubble-opacity-val").textContent = `${Math.round(bubbleAlpha * 100)}%`;
+    if ($("ap-sidebar-opacity")) $("ap-sidebar-opacity").value = String(sidebarAlpha);
+    if ($("ap-sidebar-opacity-val")) $("ap-sidebar-opacity-val").textContent = `${Math.round(sidebarAlpha * 100)}%`;
   }
 
   let apSaveTimer = null;
@@ -553,13 +563,9 @@
 
     if (prov && $("model-select").value) {
       const mLabel = info?.display_name || $("model-select").value;
-      const engMode = state.settings.engine_mode || "auto";
-      const ccTag =
-        engMode === "api_direct"
-          ? "内置直连引擎"
-          : state.claudeNative?.installed
-            ? `原生 Claude Code ${state.claudeNative.version}`
-            : "内置直连引擎（未装 CLI 自动接管）";
+      const ccTag = state.claudeNative?.installed
+        ? `${state.claudeNative.bundled ? "内置原生" : "原生"} Claude Code ${state.claudeNative.version}`
+        : "原生 Claude Code（未检测到）";
       $("sidebar-prov-model").textContent = `${mLabel} · ${fmtTokens(info?.context_window || 128000)} 上下文`;
       $("composer-engine-note").textContent =
         prov.kind === "claude_native"
@@ -1779,16 +1785,27 @@
 
   // ==================== MODAL: STORES (MCP / SKILLS / WALLPAPERS) ====================
 
+  function getSearchEngineMode() {
+    return $("store-search-engine")?.value || state.settings.search_engine?.mode || "auto";
+  }
+
+  function syncSearchEngineBadge(eng) {
+    const badge = $("store-engine-badge");
+    if (badge && eng?.label) badge.textContent = eng.label;
+  }
+
   function openStoresModal(tab = "mcp") {
     state.activeStoreTab = tab;
     $("modal-stores").classList.remove("hidden");
+    const se = state.settings.search_engine?.mode || "auto";
+    if ($("store-search-engine")) $("store-search-engine").value = se;
     document.querySelectorAll("[data-storetab]").forEach((b) => b.classList.toggle("active", b.dataset.storetab === tab));
     $("store-pane-mcp").classList.toggle("hidden", tab !== "mcp");
     $("store-pane-skills").classList.toggle("hidden", tab !== "skills");
     $("store-pane-wallpapers").classList.toggle("hidden", tab !== "wallpapers");
-    if (tab === "mcp") { loadInstalledMcps(); searchMcp(""); }
-    if (tab === "skills") { loadInstalledSkills(); searchSkills(""); }
-    if (tab === "wallpapers") { renderCustomBgs(); searchWallpapers(""); }
+    if (tab === "mcp") { loadInstalledMcps(); searchMcp($("mcp-search-input").value.trim()); }
+    if (tab === "skills") { loadInstalledSkills(); searchSkills($("skills-search-input").value.trim()); }
+    if (tab === "wallpapers") { renderCustomBgs(); searchWallpapers($("wp-search-input").value.trim()); }
   }
 
   async function loadInstalledMcps() {
@@ -1835,8 +1852,9 @@
     const el = $("store-mcp-list");
     el.innerHTML = `<div class="muted-text">${q ? `正在联网搜索「${escHtml(q)}」开源 MCP (npm & GitHub)…` : "加载精选开源 MCP…"}</div>`;
     try {
-      const data = await apiJson(`/api/stores/mcp?q=${encodeURIComponent(q)}`);
+      const data = await apiJson(`/api/stores/mcp?q=${encodeURIComponent(q)}&engine=${encodeURIComponent(getSearchEngineMode())}`);
       if (seq !== mcpReqSeq) return;
+      syncSearchEngineBadge(data.search_engine);
       el.innerHTML = "";
       const items = data.items || [];
       if (!items.length) {
@@ -1915,8 +1933,9 @@
     const el = $("store-skills-list");
     el.innerHTML = `<div class="muted-text">${q ? `正在联网搜索「${escHtml(q)}」GitHub 开源 Skills…` : "加载精选 Skills…"}</div>`;
     try {
-      const data = await apiJson(`/api/stores/skills?q=${encodeURIComponent(q)}`);
+      const data = await apiJson(`/api/stores/skills?q=${encodeURIComponent(q)}&engine=${encodeURIComponent(getSearchEngineMode())}`);
       if (seq !== skillReqSeq) return;
+      syncSearchEngineBadge(data.search_engine);
       el.innerHTML = "";
       const items = data.items || [];
       if (!items.length) {
@@ -1999,9 +2018,11 @@
         ? `<span class="wp-live-badge">✨ 60fps 动态</span>`
         : w.type === "video"
           ? `<span class="wp-live-badge">🎬 在线动态视频</span>`
-          : w.resolution
-            ? `<span class="wp-res-badge">${escHtml(w.resolution)}</span>`
-            : "";
+          : w.type === "gif"
+            ? `<span class="wp-live-badge">✨ 全网动态 GIF</span>`
+            : w.resolution
+              ? `<span class="wp-res-badge">${escHtml(w.resolution)}</span>`
+              : "";
     const subText = w.description
       ? `${w.description}`
       : `${w.license || "Open"} · ${w.author || ""}`;
@@ -2014,7 +2035,7 @@
       } else if (w.type === "video") {
         updateAppearance({ bgType: "video", bgUrl: w.url || "", liveBg: "", bgName: w.name });
       } else {
-        updateAppearance({ bgType: w.type, bgUrl: w.url || "", liveBg: "", bgName: w.name });
+        updateAppearance({ bgType: w.type === "gif" ? "image" : w.type, bgUrl: w.url || "", liveBg: "", bgName: w.name });
       }
       grid.querySelectorAll(".wp-card").forEach((c) => c.classList.remove("active"));
       card.classList.add("active");
@@ -2042,9 +2063,10 @@
 
     try {
       const data = await apiJson(
-        `/api/stores/wallpapers?q=${encodeURIComponent(q)}&page=${encodeURIComponent(page)}&category=${encodeURIComponent(cat)}`,
+        `/api/stores/wallpapers?q=${encodeURIComponent(q)}&page=${encodeURIComponent(page)}&category=${encodeURIComponent(cat)}&engine=${encodeURIComponent(getSearchEngineMode())}`,
       );
       if (seq !== wpReqSeq) return;
+      syncSearchEngineBadge(data.search_engine);
       if (!append) grid.innerHTML = "";
 
       const items = data.items || [];
@@ -2091,7 +2113,7 @@
     $("modal-settings").classList.remove("hidden");
     $("set-system-prompt").value = state.settings.system_prompt || "";
     if ($("set-prompt-mode")) $("set-prompt-mode").value = state.settings.prompt_mode || "replace";
-    if ($("set-engine-mode")) $("set-engine-mode").value = state.settings.engine_mode || "auto";
+    if ($("set-search-mode")) $("set-search-mode").value = state.settings.search_engine?.mode || "auto";
     $("set-permission-mode").value = state.settings.permission_mode || "auto";
     $("set-default-cwd").value = state.settings.default_cwd || "";
     $("set-update-channel").value = state.settings.update_channel || "stable";
@@ -2678,19 +2700,44 @@
       toast(`已创建 Skill /${slug}`);
     });
 
-    // Appearance & Wallpaper controls (HD / Subtle / Live / Video / Massive Search)
+    // Dual Search Engine switcher inside Stores modal (Auto / Domestic Direct / Global Proxy)
+    $("store-search-engine")?.addEventListener("change", async () => {
+      const mode = $("store-search-engine").value;
+      const nextSearch = { ...(state.settings.search_engine || {}), mode };
+      state.settings.search_engine = nextSearch;
+      apiJson("/api/settings", { method: "PUT", body: JSON.stringify({ search_engine: nextSearch }) }).catch(() => {});
+      if (state.activeStoreTab === "mcp") searchMcp($("mcp-search-input").value.trim());
+      else if (state.activeStoreTab === "skills") searchSkills($("skills-search-input").value.trim());
+      else searchWallpapers($("wp-search-input").value.trim(), 1, false);
+    });
+
+    // Appearance & Custom Dialogue Box controls (HD / Subtle / Bordered vs Pure-Text / Independent Alphas)
     $("ap-theme").addEventListener("change", () => updateAppearance({ theme: $("ap-theme").value }));
     $("btn-bgmode-hd")?.addEventListener("click", () => {
-      updateAppearance({ bgMode: "hd", bgBlur: 0, bgOpacity: 0.64 });
+      updateAppearance({ bgMode: "hd", bgBlur: 0, bubbleOpacity: 0.68, sidebarOpacity: 0.48 });
       toast("已切换为「高清原版壁纸」模式（0 模糊，两侧栏清透适配）");
     });
     $("btn-bgmode-subtle")?.addEventListener("click", () => {
-      updateAppearance({ bgMode: "subtle", bgBlur: 10, bgOpacity: 0.88 });
+      updateAppearance({ bgMode: "subtle", bgBlur: 10, bubbleOpacity: 0.88, sidebarOpacity: 0.84 });
       toast("已切换为「隐性护眼背景」模式（柔焦防干扰）");
+    });
+    $("btn-bubble-card")?.addEventListener("click", () => {
+      updateAppearance({ bubbleStyle: "card" });
+      toast("对话框样式：有边框卡片（可自由拖动下方透明度滑块）");
+    });
+    $("btn-bubble-text")?.addEventListener("click", () => {
+      updateAppearance({ bubbleStyle: "text" });
+      toast("对话框样式：纯文字无边框（直接呈现通透文字）");
     });
     $("ap-fontsize").addEventListener("input", () => updateAppearance({ fontSize: Number($("ap-fontsize").value) }));
     $("ap-blur").addEventListener("input", () => updateAppearance({ bgMode: "subtle", bgBlur: Number($("ap-blur").value) }));
-    $("ap-opacity").addEventListener("input", () => updateAppearance({ bgOpacity: Number($("ap-opacity").value) }));
+    $("ap-bubble-opacity")?.addEventListener("input", () => {
+      const v = Number($("ap-bubble-opacity").value);
+      updateAppearance({ bubbleOpacity: v, bgOpacity: v });
+    });
+    $("ap-sidebar-opacity")?.addEventListener("input", () => {
+      updateAppearance({ sidebarOpacity: Number($("ap-sidebar-opacity").value) });
+    });
     $("btn-upload-bg").addEventListener("click", () => $("bg-upload-input").click());
     $("bg-upload-input").addEventListener("change", async () => {
       const file = $("bg-upload-input").files?.[0];
@@ -2752,18 +2799,20 @@
       b.addEventListener("click", () => { $("set-system-prompt").value = PROMPT_PRESETS[b.dataset.preset] || ""; }),
     );
     $("btn-save-settings").addEventListener("click", async () => {
+      const searchMode = $("set-search-mode")?.value || state.settings.search_engine?.mode || "auto";
       const res = await apiJson("/api/settings", {
         method: "PUT",
         body: JSON.stringify({
           system_prompt: $("set-system-prompt").value,
           prompt_mode: $("set-prompt-mode")?.value || "replace",
-          engine_mode: $("set-engine-mode")?.value || "auto",
           permission_mode: $("set-permission-mode").value,
+          search_engine: { ...(state.settings.search_engine || {}), mode: searchMode },
           default_cwd: $("set-default-cwd").value.trim(),
           update_channel: $("set-update-channel").value,
         }),
       });
       state.settings = res.settings;
+      if ($("store-search-engine")) $("store-search-engine").value = searchMode;
       updateThinkingSelector();
       toast("设置已保存并立即生效");
     });

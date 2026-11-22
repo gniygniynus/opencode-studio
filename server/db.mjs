@@ -32,10 +32,18 @@ export const DEFAULT_APPEARANCE = {
   bgType: "none",           // none | gradient | image | live | video | upload
   bgMode: "subtle",         // hd (高清原版清晰呈现) | subtle (隐性护眼柔和氛围)
   bgUrl: "",
-  liveBg: "",               // live-aurora | live-starfield | live-matrix | live-waves | live-mesh | live-constellation
+  liveBg: "",               // live-aurora | live-starfield | live-sakura | ...
   bgBlur: 10,
-  bgOpacity: 0.88,
+  bgOpacity: 0.88,          // legacy / card opacity alias
+  bubbleStyle: "card",      // card (有边框卡片) | text (纯文字无边框)
+  bubbleOpacity: 0.88,      // 0.00 ~ 1.00 对话框独立透明度
+  sidebarOpacity: 0.82,     // 0.00 ~ 0.98 两侧栏与顶栏独立透明度
   bgName: "",
+};
+
+export const DEFAULT_SEARCH_ENGINE = {
+  mode: "auto",             // auto (自动探测) | cn (国内直连引擎) | proxy (代理全网引擎)
+  proxy_url: "",            // 可选代理地址，如 http://127.0.0.1:7897
 };
 
 function getLocalKey() {
@@ -221,10 +229,10 @@ function seedInitialData(db) {
 
   ensureKv("system_prompt", DEFAULT_SYSTEM_PROMPT);
   ensureKv("prompt_mode", "replace"); // replace | append | native
-  ensureKv("engine_mode", "claude_code"); // claude_code (原生 Claude Code 主内核) | api_direct (无 CLI 兜底)
   ensureKv("permission_mode", "auto"); // auto | confirm_dangerous
   ensureKv("update_channel", "stable"); // stable | latest
   ensureKv("appearance", DEFAULT_APPEARANCE);
+  ensureKv("search_engine", DEFAULT_SEARCH_ENGINE);
   ensureKv("default_cwd", getPaths().defaultCwd);
 
   // Ensure the optional "Claude 原生登录" provider entry exists out of the box (inactive until chosen)
@@ -270,10 +278,10 @@ export function getAllSettings() {
   return {
     system_prompt: getSetting("system_prompt", DEFAULT_SYSTEM_PROMPT),
     prompt_mode: getSetting("prompt_mode", "replace"),
-    engine_mode: getSetting("engine_mode", "claude_code"),
     permission_mode: getSetting("permission_mode", "auto"),
     update_channel: getSetting("update_channel", "stable"),
     appearance: { ...DEFAULT_APPEARANCE, ...(getSetting("appearance", DEFAULT_APPEARANCE) || {}) },
+    search_engine: { ...DEFAULT_SEARCH_ENGINE, ...(getSetting("search_engine", DEFAULT_SEARCH_ENGINE) || {}) },
     default_cwd: getSetting("default_cwd", getPaths().defaultCwd),
   };
 }

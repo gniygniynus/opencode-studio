@@ -44,7 +44,7 @@ jobs:
           - label: Windows-x64
             os: windows-latest
             cmd: npm run build:win
-          - label: macOS-Universal
+          - label: macOS-arm64
             os: macos-latest
             cmd: npm run build:mac
           - label: Linux-x64
@@ -56,6 +56,9 @@ jobs:
         with:
           node-version: "22"
       - run: npm install --no-audit --no-fund
+      - name: Verify bundled native Claude Code binary
+        shell: bash
+        run: ls -lh node_modules/@anthropic-ai/claude-code-*/claude*
       - run: ${{ matrix.cmd }}
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
@@ -103,6 +106,7 @@ jobs:
           body: |
             ## OpenCode Studio ${{ steps.meta.outputs.tag }}
             - 发布通道：**${{ steps.meta.outputs.channel }}**
-            - 支持平台：Windows (`Setup.exe` / 便携版)、macOS (Apple Silicon `arm64` & Intel `x64` `.dmg`)、Linux (`.AppImage` / `.deb`)
+            - **100% 纯净内置官方原生 Claude Code**：安装包已直接随包内置对应平台的官方原生 Claude Code 二进制，下载安装即可开箱即用，无需预先安装 CLI 或折腾代理！
+            - 支持平台：Windows x64 (`Setup.exe` / 便携版)、macOS Apple Silicon `arm64` (`.dmg` / `.zip`)、Linux x64 (`.AppImage` / `.deb`)
             - macOS 首次打开未签名开源应用提示解决：在终端执行 `xattr -cr "/Applications/OpenCode Studio.app"` 后打开即可。
           files: release-artifacts/*
