@@ -46,6 +46,8 @@ export function getPaths() {
     backgroundsDir: path.join(dataRoot, "backgrounds"),
     skillsDir: path.join(dataRoot, "skills"),
     mcpDir: path.join(dataRoot, "mcp"),
+    claudeConfigDir: path.join(dataRoot, "claude-config"),
+    claudeRuntimeDir: path.join(dataRoot, "claude-runtime"),
     defaultCwd: os.homedir(),
   };
 
@@ -57,6 +59,8 @@ export function getPaths() {
     paths.backgroundsDir,
     paths.skillsDir,
     paths.mcpDir,
+    paths.claudeConfigDir,
+    paths.claudeRuntimeDir,
   ]) {
     fs.mkdirSync(dir, { recursive: true });
   }

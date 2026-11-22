@@ -106,10 +106,12 @@ function buildAppMenu(url) {
 }
 
 ipcMain.handle("dialog:pickDirectory", async () => {
-  const res = await dialog.showOpenDialog({
+  const parent = BrowserWindow.getFocusedWindow() || mainWindow || undefined;
+  const opts = {
     properties: ["openDirectory", "createDirectory"],
-    title: "选择工作目录",
-  });
+    title: "选择 OpenCode Studio 工作目录",
+  };
+  const res = parent ? await dialog.showOpenDialog(parent, opts) : await dialog.showOpenDialog(opts);
   if (res.canceled || !res.filePaths?.length) return null;
   return res.filePaths[0];
 });

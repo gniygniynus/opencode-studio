@@ -198,7 +198,7 @@
                 id="composer-input"
                 class="composer-input"
                 rows="1"
-                placeholder="输入指令或问题…（鼠标任意定位编辑 · Ctrl+V 粘贴图片 · / 命令与 Skills · @ 引用文件）"
+                placeholder="输入指令或问题…（鼠标任意定位 · Ctrl+V 直接粘贴文件或图片 · 拖拽文件 · / 命令与 Skills · @ 引用文件）"
               ></textarea>
 
               <div class="composer-toolbar">
@@ -237,12 +237,10 @@
                 </div>
 
                 <div class="composer-right">
-                  <input id="file-upload-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple class="hidden" />
-                  <button id="btn-attach-image" class="icon-btn" title="添加图片（也支持 Ctrl+V 粘贴或拖拽）">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                      <rect x="3" y="3" width="18" height="18" rx="2"></rect>
-                      <circle cx="8.5" cy="8.5" r="1.5"></circle>
-                      <polyline points="21 15 16 10 5 21"></polyline>
+                  <input id="file-upload-input" type="file" multiple class="hidden" />
+                  <button id="btn-attach-image" class="icon-btn" title="添加文件或图片（支持 txt / 代码 / PDF / 图片，也支持 Ctrl+V 粘贴或拖拽）">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
                     </svg>
                   </button>
                   <button id="btn-stop" class="send-btn stop hidden" title="停止生成">■ 停止</button>
@@ -473,6 +471,10 @@
                 <input id="ap-sidebar-opacity" type="range" min="0" max="0.98" step="0.02" value="0.82" />
               </label>
             </div>
+            <div class="wp-storage-bar">
+              <span id="wp-storage-info" class="muted-text">当前壁纸已本地固化（断网离线可用）· 切换自动清理旧壁纸</span>
+              <button id="btn-wp-clear-cache" class="btn-secondary sm" title="仅清理浏览壁纸商店产生的临时缩略图缓存，绝不删除当前生效壁纸与您上传的壁纸">🧹 清理预览缓存</button>
+            </div>
           </div>
 
           <div class="store-search-bar">
@@ -550,7 +552,14 @@
               <option value="proxy">始终海外代理全网引擎（Wallhaven / Wikimedia / GitHub）</option>
             </select>
           </label>
-          <label class="field full">
+          <label class="field">
+            <span>与系统原有 Claude Code 共存模式（零冲突隔离）</span>
+            <select id="set-claude-isolation" class="text-input">
+              <option value="isolated">独立隔离沙盒模式（推荐 · 绝不修改/冲突系统原有 ~/.claude）</option>
+              <option value="shared">共享系统 ~/.claude 模式（复用本机原有官方登录态）</option>
+            </select>
+          </label>
+          <label class="field">
             <span>默认新建会话工作目录</span>
             <input id="set-default-cwd" class="text-input mono" />
           </label>
@@ -611,8 +620,21 @@
       <div class="modal-body">
         <div class="cwd-section-card">
           <div class="section-label" style="margin-top:0;">方式一：浏览并选择现有文件夹</div>
-          <p class="modal-sub" style="margin:0 0 10px;">弹出本机系统文件选择窗口，点击选中任意文件夹即可立即生效。</p>
-          <button id="btn-cwd-native" class="btn-primary full" title="弹出系统原生文件夹选择框">📂 浏览本地文件夹…</button>
+          <p class="modal-sub" style="margin:0 0 10px;">优先弹出本机系统资源管理器选框；若处于后台/无头服务环境则自动展开内嵌全盘目录浏览器。</p>
+          <div style="display:flex;gap:8px;">
+            <button id="btn-cwd-native" class="btn-primary" style="flex:1;" title="弹出系统原生文件夹选择框">📂 浏览本地文件夹…</button>
+            <button id="btn-cwd-inline-toggle" class="btn-secondary" title="在窗口内直接按盘符逐级浏览本地文件夹">内置浏览</button>
+          </div>
+          <div id="cwd-inline-explorer" class="cwd-explorer-box hidden">
+            <div id="cwd-explorer-hint" class="muted-text" style="font-size:11.5px;margin-bottom:6px;"></div>
+            <div id="cwd-explorer-drives" class="cwd-drives-row"></div>
+            <div class="cwd-explorer-nav">
+              <button id="btn-cwd-up" class="btn-secondary sm" title="返回上一级目录">↑ 上一级</button>
+              <code id="cwd-explorer-path" class="cwd-explorer-path mono"></code>
+              <button id="btn-cwd-pick-current" class="btn-primary sm">选择此文件夹</button>
+            </div>
+            <div id="cwd-explorer-list" class="cwd-explorer-list"></div>
+          </div>
         </div>
 
         <div class="cwd-section-card" style="margin-top:14px;">

@@ -85,6 +85,33 @@ function testWslClaude() {
   };
 }
 
+export function getClaudeIsolationConfig() {
+  let mode = "isolated";
+  try {
+    mode = getAllSettings().claude_isolation === "shared" ? "shared" : "isolated";
+  } catch {
+    mode = "isolated";
+  }
+  const paths = getPaths();
+  return {
+    mode,
+    configDir: mode === "isolated" ? paths.claudeConfigDir : null,
+    runtimeDir: paths.claudeRuntimeDir,
+  };
+}
+
+function getManagedClaudeCandidates() {
+  const binName = process.platform === "win32" ? "claude.exe" : "claude";
+  const platPkg = `@anthropic-ai/claude-code-${process.platform}-${process.arch}`;
+  const r = getPaths().claudeRuntimeDir;
+  const out = [path.join(r, "node_modules", platPkg, binName)];
+  if (process.platform === "linux") {
+    out.push(path.join(r, "node_modules", `${platPkg}-musl`, binName));
+  }
+  out.push(path.join(r, "node_modules", "@anthropic-ai", "claude-code", "bin", binName));
+  return out;
+}
+
 function getBundledClaudeCandidates() {
   const binName = process.platform === "win32" ? "claude.exe" : "claude";
   const platPkg = `@anthropic-ai/claude-code-${process.platform}-${process.arch}`;
@@ -105,30 +132,31 @@ function getBundledClaudeCandidates() {
 }
 
 /**
- * Detect a genuinely working native Claude Code CLI:
- *  1. User-upgraded native binary (~/.local/bin/claude[.exe])
+ * Detect a genuinely working native Claude Code CLI with strict zero-conflict priority:
+ *  1. OpenCode Studio private managed upgrade binary (<dataRoot>/claude-runtime) — never overwrites user's system CLI!
  *  2. Bundled official native binary shipped INSIDE OpenCode Studio installer (out-of-the-box!)
- *  3. System PATH / WSL2 fallback
+ *  3. System PATH / WSL2 fallback (only when neither managed nor bundled exists)
  */
 export function detectClaudeRuntime(force = false) {
   if (!force && _cachedRuntime && Date.now() - _cachedAt < 10_000) {
     return _cachedRuntime;
   }
 
-  const bundledSet = new Set(getBundledClaudeCandidates().map((p) => path.resolve(p)));
-  const candidates = [];
+  const managedCandidates = getManagedClaudeCandidates();
+  const bundledCandidates = getBundledClaudeCandidates();
+  const managedSet = new Set(managedCandidates.map((p) => path.resolve(p)));
+  const bundledSet = new Set(bundledCandidates.map((p) => path.resolve(p)));
+  const candidates = [...managedCandidates, ...bundledCandidates];
 
   if (process.platform === "win32") {
     candidates.push(path.join(os.homedir(), ".local", "bin", "claude.exe"));
     candidates.push(path.join(process.env.LOCALAPPDATA || "", "Programs", "claude", "claude.exe"));
-    candidates.push(...getBundledClaudeCandidates());
     const w = spawnSync("where.exe", ["claude.exe"], { encoding: "utf8", timeout: 3000, windowsHide: true });
     if (w.status === 0 && w.stdout) candidates.push(...w.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
     const wc = spawnSync("where.exe", ["claude"], { encoding: "utf8", timeout: 3000, windowsHide: true });
     if (wc.status === 0 && wc.stdout) candidates.push(...wc.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
   } else {
     candidates.push(path.join(os.homedir(), ".local", "bin", "claude"));
-    candidates.push(...getBundledClaudeCandidates());
     const w = spawnSync("which", ["claude"], { encoding: "utf8", timeout: 3000 });
     if (w.status === 0 && w.stdout.trim()) candidates.push(w.stdout.trim());
   }
@@ -137,7 +165,9 @@ export function detectClaudeRuntime(force = false) {
   for (const c of [...new Set(candidates)]) {
     found = testNativeCandidate(c);
     if (found) {
-      found.bundled = bundledSet.has(path.resolve(c));
+      const abs = path.resolve(c);
+      found.managed = managedSet.has(abs);
+      found.bundled = bundledSet.has(abs);
       break;
     }
   }
@@ -145,17 +175,23 @@ export function detectClaudeRuntime(force = false) {
     found = testWslClaude();
   }
 
-  _cachedRuntime = found || { mode: "missing", binary: null, isCmd: false, version: null, bundled: false };
+  _cachedRuntime = found || { mode: "missing", binary: null, isCmd: false, version: null, bundled: false, managed: false };
   _cachedAt = Date.now();
   return _cachedRuntime;
 }
 
 function spawnClaudeProcess(rt, args, { cwd, env, stdio = ["pipe", "pipe", "pipe"] }) {
+  const iso = getClaudeIsolationConfig();
+  const mergedEnv = { ...(env || {}) };
+  if (iso.configDir && mergedEnv.CLAUDE_CONFIG_DIR === undefined) {
+    mergedEnv.CLAUDE_CONFIG_DIR = rt.mode === "wsl" ? winPathToWsl(iso.configDir) : iso.configDir;
+  }
+
   if (rt.mode === "wsl") {
     const wslCwd = winPathToWsl(cwd || os.homedir());
     // Pass isolated env vars safely into WSL
     const envLines = [];
-    for (const [k, v] of Object.entries(env || {})) {
+    for (const [k, v] of Object.entries(mergedEnv)) {
       if (v === undefined) continue;
       if (v === null) {
         envLines.push(`unset ${k}`);
@@ -174,7 +210,7 @@ function spawnClaudeProcess(rt, args, { cwd, env, stdio = ["pipe", "pipe", "pipe
   }
 
   const finalEnv = { ...process.env };
-  for (const [k, v] of Object.entries(env || {})) {
+  for (const [k, v] of Object.entries(mergedEnv)) {
     if (v === null || v === undefined) delete finalEnv[k];
     else finalEnv[k] = String(v);
   }
@@ -187,18 +223,22 @@ function spawnClaudeProcess(rt, args, { cwd, env, stdio = ["pipe", "pipe", "pipe
 
 function runClaudeSync(rt, args, timeoutMs = 8000) {
   if (rt.mode === "missing") return { status: 127, stdout: "", stderr: "Claude Code 未安装" };
+  const iso = getClaudeIsolationConfig();
   if (rt.mode === "wsl") {
     const quoted = args.map((a) => `'${String(a).replace(/'/g, "'\\''")}'`).join(" ");
+    const isoLine = iso.configDir ? `export CLAUDE_CONFIG_DIR='${winPathToWsl(iso.configDir).replace(/'/g, "'\\''")}'` : "";
     const script = [
       "unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY",
+      isoLine,
       `'${rt.binary.replace(/'/g, "'\\''")}' ${quoted}`,
-    ].join("\n");
+    ].filter(Boolean).join("\n");
     return spawnSync("wsl.exe", wslScriptArgs(script), { encoding: "utf8", timeout: timeoutMs, windowsHide: true });
   }
   const cleanEnv = { ...process.env };
   delete cleanEnv.ANTHROPIC_BASE_URL;
   delete cleanEnv.ANTHROPIC_AUTH_TOKEN;
   delete cleanEnv.ANTHROPIC_API_KEY;
+  if (iso.configDir) cleanEnv.CLAUDE_CONFIG_DIR = iso.configDir;
   if (rt.isCmd) {
     return spawnSync("cmd.exe", ["/c", rt.binary, ...args], { encoding: "utf8", env: cleanEnv, timeout: timeoutMs, windowsHide: true });
   }
@@ -210,12 +250,15 @@ function runClaudeSync(rt, args, timeoutMs = 8000) {
  */
 export function getClaudeRuntimeAndAuth(force = false) {
   const rt = detectClaudeRuntime(force);
+  const iso = getClaudeIsolationConfig();
   if (rt.mode === "missing") {
     return {
       installed: false,
       mode: "missing",
       binary: null,
       version: null,
+      isolation_mode: iso.mode,
+      config_dir: iso.configDir || path.join(os.homedir(), ".claude"),
       auth: { loggedIn: false },
       note: "未检测到原生 Claude Code，可点击下方「一键安装稳定版 / 最新版」自动安装。",
     };
@@ -233,18 +276,28 @@ export function getClaudeRuntimeAndAuth(force = false) {
     // keep default
   }
 
+  const isoNote =
+    iso.mode === "isolated"
+      ? "独立配置沙盒已开启（绝不修改或冲突本机原有 ~/.claude 与命令行 Claude Code）"
+      : "当前为共享系统 ~/.claude 模式（复用系统原有登录态，仍通过独立启动参数保护原有配置）";
+
   return {
     installed: true,
     mode: rt.mode,
     bundled: Boolean(rt.bundled),
+    managed: Boolean(rt.managed),
+    isolation_mode: iso.mode,
+    config_dir: iso.configDir || path.join(os.homedir(), ".claude"),
     binary: rt.binary,
     version: rt.version,
     auth,
-    note: rt.bundled
-      ? `已开箱启用随安装包内置的原生 Claude Code (${rt.version})，零配置即用。`
-      : rt.mode === "wsl"
-        ? `已接入本机 WSL2 原生 Claude Code (${rt.version})。`
-        : `已接入本机原生 Claude Code (${rt.version})。`,
+    note: rt.managed
+      ? `已启用工作台独立升级的原生 Claude Code (${rt.version}) · ${isoNote}`
+      : rt.bundled
+        ? `已开箱启用随安装包内置的原生 Claude Code (${rt.version}) · ${isoNote}`
+        : rt.mode === "wsl"
+          ? `已接入 WSL2 原生 Claude Code (${rt.version}) · ${isoNote}`
+          : `已接入本机原生 Claude Code (${rt.version}) · ${isoNote}`,
   };
 }
 
@@ -290,6 +343,25 @@ function openExternalUrlInHost(url) {
 export function ensureClaudeDirectReady(rt) {
   try {
     if (!rt || rt.mode === "missing") return;
+    const iso = getClaudeIsolationConfig();
+    if (iso.configDir) {
+      // Strictly write onboarding flag ONLY inside OpenCode Studio's isolated CLAUDE_CONFIG_DIR!
+      fs.mkdirSync(iso.configDir, { recursive: true });
+      const cfgPath = path.join(iso.configDir, ".claude.json");
+      let data = {};
+      if (fs.existsSync(cfgPath)) {
+        try {
+          data = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+        } catch {
+          data = {};
+        }
+      }
+      if (!data.hasCompletedOnboarding) {
+        data.hasCompletedOnboarding = true;
+        fs.writeFileSync(cfgPath, JSON.stringify(data, null, 2), "utf8");
+      }
+      return;
+    }
     if (rt.mode === "wsl") {
       const script = `python3 - <<'PY'
 import json, os
@@ -355,8 +427,10 @@ export async function runClaudeAuthLogin({ mode = "claudeai", email = "", onProg
   return await new Promise((resolve) => {
     // On WSL/Linux, wrap inside Python PTY so Claude CLI flushes OAuth URL immediately (<0.5s) instead of buffering!
     let proc;
+    const iso = getClaudeIsolationConfig();
     if (rt.mode === "wsl") {
       const pyArgs = JSON.stringify([rt.binary, ...args]);
+      const pyIsoDir = iso.configDir ? JSON.stringify(winPathToWsl(iso.configDir)) : "None";
       const pyScript = `python3 -u - <<'PY'
 import os, pty, select, subprocess, sys
 m, s = pty.openpty()
@@ -364,6 +438,9 @@ env = os.environ.copy()
 for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
     env.pop(k, None)
 env["DISABLE_TELEMETRY"] = "1"
+iso_dir = ${pyIsoDir}
+if iso_dir:
+    env["CLAUDE_CONFIG_DIR"] = iso_dir
 p = subprocess.Popen(${pyArgs}, stdin=s, stdout=s, stderr=s, env=env, close_fds=True)
 os.close(s)
 while True:
@@ -699,7 +776,28 @@ export function cleanupClaudeSessionFiles(cliSessionIds = []) {
   const sids = [...new Set((cliSessionIds || []).filter((s) => typeof s === "string" && /^[a-z0-9-]{8,}$/i.test(s)))];
   if (!sids.length) return 0;
   let removed = 0;
+  const iso = getClaudeIsolationConfig();
   const rt = detectClaudeRuntime(false);
+
+  if (iso.configDir) {
+    // Only clean session jsonl inside OpenCode Studio's isolated config dir!
+    const projRoot = path.join(iso.configDir, "projects");
+    if (fs.existsSync(projRoot)) {
+      for (const dir of fs.readdirSync(projRoot)) {
+        const sub = path.join(projRoot, dir);
+        for (const sid of sids) {
+          const fp = path.join(sub, `${sid}.jsonl`);
+          if (fs.existsSync(fp)) {
+            try {
+              fs.unlinkSync(fp);
+              removed += 1;
+            } catch {}
+          }
+        }
+      }
+    }
+    return removed;
+  }
 
   if (rt.mode === "wsl") {
     const script = `python3 - <<'PY'
@@ -745,10 +843,15 @@ PY`;
  */
 export async function installOrSwitchClaudeVersion({ channel = "stable", forceNativeWin = false, onProgress } = {}) {
   const target = channel === "latest" ? "latest" : "stable";
+  const iso = getClaudeIsolationConfig();
   const rt = detectClaudeRuntime(true);
 
-  logEvent("INFO", "claude_install", "start", `安装/切换原生 Claude Code -> ${target} (current=${rt.mode})`);
-  onProgress?.(`正在准备安装/切换原生 Claude Code (${target})，将保留您的账号与配置…\n`);
+  logEvent("INFO", "claude_install", "start", `安装/切换原生 Claude Code -> ${target} (current=${rt.mode}, isolation=${iso.mode})`);
+  onProgress?.(
+    iso.mode === "isolated"
+      ? `正在 OpenCode Studio 私有隔离目录 (${iso.runtimeDir}) 中安装/切换原生 Claude Code (${target})，绝不影响系统原有 Claude Code…\n`
+      : `正在安装/切换原生 Claude Code (${target})，将保留您的账号与配置…\n`,
+  );
 
   const runCmd = (spawnFn) =>
     new Promise((resolve) => {
@@ -766,7 +869,30 @@ export async function installOrSwitchClaudeVersion({ channel = "stable", forceNa
     });
 
   let runRes;
-  if (rt.mode !== "missing" && !(forceNativeWin && rt.mode === "wsl")) {
+  if (iso.mode === "isolated") {
+    // Strictly install/upgrade inside OpenCode Studio's private runtime folder — NEVER touches user's ~/.local/bin/claude or global npm!
+    fs.mkdirSync(iso.runtimeDir, { recursive: true });
+    const pkgJsonPath = path.join(iso.runtimeDir, "package.json");
+    if (!fs.existsSync(pkgJsonPath)) {
+      fs.writeFileSync(pkgJsonPath, JSON.stringify({ name: "opencode-studio-claude-runtime", private: true }, null, 2), "utf8");
+    }
+    const se = getAllSettings().search_engine || {};
+    const npmArgs = ["install", "--prefix", iso.runtimeDir, "--no-audit", "--no-fund", `@anthropic-ai/claude-code@${target}`];
+    if (se.mode === "cn") {
+      npmArgs.push("--registry=https://registry.npmmirror.com");
+    }
+    onProgress?.(`执行私有隔离安装：npm ${npmArgs.join(" ")}\n`);
+    runRes = await runCmd(() =>
+      process.platform === "win32"
+        ? spawn("cmd.exe", ["/c", "npm", ...npmArgs], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
+        : spawn("npm", npmArgs, { stdio: ["ignore", "pipe", "pipe"] }),
+    );
+    // Remove duplicate bin/claude.exe hardlink inside private dir to keep footprint minimal
+    try {
+      const dupBin = path.join(iso.runtimeDir, "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe");
+      if (fs.existsSync(dupBin)) fs.unlinkSync(dupBin);
+    } catch {}
+  } else if (rt.mode !== "missing" && !(forceNativeWin && rt.mode === "wsl")) {
     runRes = await runCmd(() =>
       spawnClaudeProcess(rt, ["install", target, "--force"], {
         cwd: os.homedir(),
@@ -813,11 +939,15 @@ export async function installOrSwitchClaudeVersion({ channel = "stable", forceNa
   let cleanup = { removed: 0, freed_mb: 0 };
   if (runRes.code === 0 && nextRt.installed) {
     ensureClaudeDirectReady(nextRt);
-    cleanup = cleanupOldClaudeVersions(nextRt);
-    if (cleanup.removed > 0) {
-      onProgress?.(`\n[自动清理] 已保留现有配置完成迁移，并清理 ${cleanup.removed} 个旧版本二进制，释放约 ${cleanup.freed_mb} MB 空间。\n`);
+    if (iso.mode === "isolated") {
+      onProgress?.("\n[隔离切换完成] 已在工作台私有目录完成版本更新，您的系统原有 Claude Code 与配置完全未受影响。\n");
     } else {
-      onProgress?.("\n[迁移完成] 已保留原有账号与配置，无冗余旧版本残留。\n");
+      cleanup = cleanupOldClaudeVersions(nextRt);
+      if (cleanup.removed > 0) {
+        onProgress?.(`\n[自动清理] 已保留现有配置完成迁移，并清理 ${cleanup.removed} 个旧版本二进制，释放约 ${cleanup.freed_mb} MB 空间。\n`);
+      } else {
+        onProgress?.("\n[迁移完成] 已保留原有账号与配置，无冗余旧版本残留。\n");
+      }
     }
   }
 
@@ -1039,19 +1169,46 @@ export async function runNativeClaudeCodeTurn({
     resumeCliSid ? latestUser.content_text || "" : buildBridgeHistoryPrefix(historyItems) + (latestUser.content_text || "");
 
   const contentBlocks = [];
+  const attachedFileNotes = [];
   for (const im of latestUser.images || []) {
-    if (im.path && fs.existsSync(im.path)) {
-      contentBlocks.push({
-        type: "image",
-        source: {
-          type: "base64",
-          media_type: im.media_type || "image/png",
-          data: fs.readFileSync(im.path).toString("base64"),
-        },
-      });
+    const isImg = im.kind === "image" || (!im.kind && String(im.media_type || "").startsWith("image/"));
+    if (isImg) {
+      if (im.path && fs.existsSync(im.path)) {
+        contentBlocks.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: im.media_type || "image/png",
+            data: fs.readFileSync(im.path).toString("base64"),
+          },
+        });
+      }
+    } else if (im.kind === "text" && im.path && fs.existsSync(im.path)) {
+      const hostPath = rt.mode === "wsl" ? winPathToWsl(im.path) : im.path;
+      try {
+        const raw = fs.readFileSync(im.path, "utf8");
+        if (raw.length <= 65536) {
+          attachedFileNotes.push(
+            `[用户附带文件: ${im.name || path.basename(im.path)} | 本地路径: ${hostPath}]\n\`\`\`\n${raw}\n\`\`\``,
+          );
+        } else {
+          attachedFileNotes.push(
+            `[用户附带大型文本文件: ${im.name || path.basename(im.path)} (${Math.round(raw.length / 1024)} KB) | 完整路径: ${hostPath}]\n前 8KB 预览如下，如需完整内容请使用 Read 工具读取上述路径：\n\`\`\`\n${raw.slice(0, 8192)}\n\`\`\``,
+          );
+        }
+      } catch {
+        attachedFileNotes.push(`[用户附带文件: ${im.name || path.basename(im.path)} | 本地路径: ${hostPath}]`);
+      }
+    } else if (im.path || im.name) {
+      const hostPath = im.path ? (rt.mode === "wsl" ? winPathToWsl(im.path) : im.path) : "";
+      const sizeKb = im.size ? `${(im.size / 1024).toFixed(1)} KB` : "";
+      attachedFileNotes.push(
+        `[用户附带文件: ${im.name || "attachment"}${sizeKb ? ` (${sizeKb})` : ""} | 类型: ${im.media_type || "application/octet-stream"} | 本地路径: ${hostPath} — 请直接读取并分析该文件]`,
+      );
     }
   }
-  contentBlocks.push({ type: "text", text: promptBody || "请查看图片。" });
+  const finalUserText = [promptBody, ...attachedFileNotes].filter(Boolean).join("\n\n") || "请查看附带的文件或图片。";
+  contentBlocks.push({ type: "text", text: finalUserText });
 
   appendTurnLog(
     sessionId,

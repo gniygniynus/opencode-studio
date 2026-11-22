@@ -274,6 +274,15 @@
     if ($("ap-sidebar-opacity-val")) $("ap-sidebar-opacity-val").textContent = `${Math.round(sidebarAlpha * 100)}%`;
   }
 
+  function renderWallpaperStorage(st) {
+    if (st) state.wallpaperStorage = st;
+    const info = state.wallpaperStorage;
+    const el = $("wp-storage-info");
+    if (!el || !info) return;
+    el.textContent =
+      `离线壁纸快照 ${info.active_mb} MB · 已上传 ${info.uploads_mb} MB · 预览缓存 ${info.cache_mb}/${info.cache_limit_mb} MB（断网可用 · 切换自动删旧）`;
+  }
+
   let apSaveTimer = null;
   function updateAppearance(patch) {
     const next = { ...(state.settings.appearance || {}), ...patch };
@@ -281,7 +290,15 @@
     applyAppearance(next);
     clearTimeout(apSaveTimer);
     apSaveTimer = setTimeout(() => {
-      apiJson("/api/settings", { method: "PUT", body: JSON.stringify({ appearance: next }) }).catch(() => {});
+      apiJson("/api/settings", { method: "PUT", body: JSON.stringify({ appearance: next }) })
+        .then((res) => {
+          if (res?.settings?.appearance) {
+            state.settings.appearance = res.settings.appearance;
+            applyAppearance(res.settings.appearance);
+          }
+          if (res?.wallpaper_storage) renderWallpaperStorage(res.wallpaper_storage);
+        })
+        .catch(() => {});
     }, 260);
   }
 
@@ -806,13 +823,27 @@
           `</span>`
         : "";
 
-    const imgsHtml = (item.images || []).length
-      ? `<div class="msg-images">${item.images.map((im) => `<img src="${escHtml(im.url)}" alt="图片" />`).join("")}</div>`
+    const isAttImg = (im) => im.kind === "image" || (!im.kind && String(im.media_type || "").startsWith("image/"));
+    const imgAtts = (item.images || []).filter(isAttImg);
+    const fileAtts = (item.images || []).filter((im) => !isAttImg(im));
+
+    const imgsHtml = imgAtts.length
+      ? `<div class="msg-images">${imgAtts.map((im) => `<img src="${escHtml(im.url)}" alt="${escHtml(im.name || "图片")}" />`).join("")}</div>`
+      : "";
+    const filesHtml = fileAtts.length
+      ? `<div class="msg-files">${fileAtts
+          .map((f) => {
+            const ico = f.kind === "text" ? "📄" : "📎";
+            const sz = f.size >= 1024 * 1024 ? `${(f.size / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round((f.size || 0) / 1024))} KB`;
+            return `<a class="msg-file-chip" href="${escHtml(f.url || "#")}" target="_blank" rel="noopener noreferrer" title="${escHtml(f.path || f.name || "")}">` +
+              `<span>${ico}</span><span>${escHtml(f.name || "附件")}</span><span class="mf-size">${sz}</span></a>`;
+          })
+          .join("")}</div>`
       : "";
 
     const clockStr = fmtClock(item.created_at);
     wrap.innerHTML =
-      `<div class="msg-user-card">${imgsHtml}<div class="msg-user-text">${escHtml(item.content_text || "")}</div></div>` +
+      `<div class="msg-user-card">${imgsHtml}${filesHtml}<div class="msg-user-text">${escHtml(item.content_text || "")}</div></div>` +
       `<div class="msg-footer-bar">` +
         (clockStr ? `<span class="msg-footer-time">${clockStr}</span>` : "") +
         branchBar +
@@ -1426,18 +1457,32 @@
     toast("正在重新生成回复（旧版本将作为分支保留）…");
   }
 
-  async function uploadChatImage(file) {
-    if (!file || !file.type.startsWith("image/")) return toast("仅支持 PNG / JPG / WebP / GIF");
+  function fmtFileSize(bytes) {
+    if (!bytes || bytes < 1024) return `${bytes || 0} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  async function uploadChatAttachment(file) {
+    if (!file) return;
+    if (file.size > 25 * 1024 * 1024) return toast(`文件「${file.name}」超过 25MB 上限`, 3500);
     const b64 = await fileToDataUrl(file);
     try {
       const data = await apiJson("/api/upload", {
         method: "POST",
-        body: JSON.stringify({ media_type: file.type, data: b64, name: file.name || "pasted.png" }),
+        body: JSON.stringify({
+          media_type: file.type || "application/octet-stream",
+          data: b64,
+          name: file.name || (file.type?.startsWith("image/") ? "pasted.png" : "pasted.txt"),
+        }),
       });
       state.attachments.push(data);
       renderAttachments();
+      if (data.kind !== "image") {
+        toast(`已附加文件：${data.name} (${fmtFileSize(data.size)})`, 2200);
+      }
     } catch (err) {
-      toast("图片上传失败: " + err.message);
+      toast("文件附加失败: " + err.message, 4000);
     }
   }
 
@@ -1460,9 +1505,21 @@
     strip.classList.remove("hidden");
     strip.innerHTML = "";
     state.attachments.forEach((att, idx) => {
+      const isImg = att.kind === "image" || (!att.kind && String(att.media_type || "").startsWith("image/"));
       const el = document.createElement("div");
-      el.className = "att-thumb";
-      el.innerHTML = `<img src="${escHtml(att.url)}" /><button class="att-remove">×</button>`;
+      if (isImg) {
+        el.className = "att-thumb";
+        el.innerHTML = `<img src="${escHtml(att.url)}" alt="${escHtml(att.name || "图片")}" /><button class="att-remove" title="移除">×</button>`;
+      } else {
+        el.className = "att-file-chip";
+        const icon = att.kind === "text" ? "📄" : "📎";
+        el.title = att.preview ? `${att.name}\n${att.preview}` : att.name || "";
+        el.innerHTML =
+          `<span class="att-file-icon">${icon}</span>` +
+          `<span class="att-file-meta"><span class="att-file-name">${escHtml(att.name || "文件")}</span>` +
+          `<span class="att-file-size">${fmtFileSize(att.size)} · ${att.kind === "text" ? "直读内容" : "原生读取"}</span></span>` +
+          `<button class="att-remove" title="移除">×</button>`;
+      }
       el.querySelector(".att-remove").addEventListener("click", () => {
         state.attachments.splice(idx, 1);
         renderAttachments();
@@ -1805,7 +1862,11 @@
     $("store-pane-wallpapers").classList.toggle("hidden", tab !== "wallpapers");
     if (tab === "mcp") { loadInstalledMcps(); searchMcp($("mcp-search-input").value.trim()); }
     if (tab === "skills") { loadInstalledSkills(); searchSkills($("skills-search-input").value.trim()); }
-    if (tab === "wallpapers") { renderCustomBgs(); searchWallpapers($("wp-search-input").value.trim()); }
+    if (tab === "wallpapers") {
+      renderCustomBgs();
+      apiJson("/api/backgrounds/storage").then((r) => renderWallpaperStorage(r.storage)).catch(() => {});
+      searchWallpapers($("wp-search-input").value.trim());
+    }
   }
 
   async function loadInstalledMcps() {
@@ -1997,7 +2058,9 @@
         e.stopPropagation();
         const res = await apiJson(`/api/backgrounds/${encodeURIComponent(bg.id)}`, { method: "DELETE" });
         state.customBackgrounds = res.backgrounds || [];
+        if (res.storage) renderWallpaperStorage(res.storage);
         renderCustomBgs();
+        toast("已删除该背景并清理本地文件");
       });
       grid.appendChild(card);
     }
@@ -2009,7 +2072,7 @@
     const isActive =
       (w.type === "none" && (!ap.bgType || ap.bgType === "none")) ||
       (w.type === "live" && ap.bgType === "live" && ap.liveBg === w.liveBg) ||
-      (w.url && ap.bgUrl === w.url);
+      (w.url && (ap.bgUrl === w.url || ap.sourceUrl === w.url));
     const card = document.createElement("div");
     card.className = "wp-card" + (isActive ? " active" : "");
     const thumbStyle = w.preview_css ? `background:${w.preview_css}` : `background-image:url('${escHtml(w.thumb || w.url)}')`;
@@ -2114,6 +2177,7 @@
     $("set-system-prompt").value = state.settings.system_prompt || "";
     if ($("set-prompt-mode")) $("set-prompt-mode").value = state.settings.prompt_mode || "replace";
     if ($("set-search-mode")) $("set-search-mode").value = state.settings.search_engine?.mode || "auto";
+    if ($("set-claude-isolation")) $("set-claude-isolation").value = state.settings.claude_isolation || "isolated";
     $("set-permission-mode").value = state.settings.permission_mode || "auto";
     $("set-default-cwd").value = state.settings.default_cwd || "";
     $("set-update-channel").value = state.settings.update_channel || "stable";
@@ -2256,13 +2320,70 @@
     if ($("cwd-custom-preview")) $("cwd-custom-preview").textContent = preview || "请选择盘符并输入文件夹名";
   }
 
+  let explorerCurrentPath = "";
+  let explorerParentPath = "";
+
+  async function loadInlineExplorer(targetPath, hintText = "") {
+    const box = $("cwd-inline-explorer");
+    const listEl = $("cwd-explorer-list");
+    const pathEl = $("cwd-explorer-path");
+    const hintEl = $("cwd-explorer-hint");
+    if (!box || !listEl) return;
+    box.classList.remove("hidden");
+    if (hintEl && hintText) hintEl.textContent = hintText;
+    listEl.innerHTML = `<div class="muted-text" style="padding:8px;">加载文件夹中…</div>`;
+    try {
+      const data = await apiJson(`/api/dirs?path=${encodeURIComponent(targetPath || "")}`);
+      explorerCurrentPath = data.path || targetPath || "";
+      explorerParentPath = data.parent || "";
+      if (pathEl) pathEl.textContent = explorerCurrentPath;
+      listEl.innerHTML = "";
+      const children = data.children || [];
+      if (!children.length) {
+        listEl.innerHTML = `<div class="muted-text" style="padding:8px;">该目录下没有子文件夹，可直接点击上方「选择此文件夹」。</div>`;
+        return;
+      }
+      for (const ch of children) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "cwd-dir-row";
+        row.innerHTML = `<span>📁</span><span>${escHtml(ch.name)}</span>`;
+        row.addEventListener("click", () => loadInlineExplorer(ch.path));
+        listEl.appendChild(row);
+      }
+    } catch (err) {
+      listEl.innerHTML = `<div class="muted-text" style="color:var(--err);padding:8px;">读取目录失败：${escHtml(err.message)}</div>`;
+    }
+  }
+
   async function openCwdModal() {
     $("modal-cwd").classList.remove("hidden");
+    $("cwd-inline-explorer")?.classList.add("hidden");
     const cur = state.activeCwd || state.settings.default_cwd || "";
     if ($("cwd-active-hint")) $("cwd-active-hint").textContent = `当前工作目录：${cur || "未设置"}`;
     try {
       const info = await apiJson("/api/dirs/drives");
       const sel = $("cwd-drive-select");
+      const drivesBar = $("cwd-explorer-drives");
+      if (drivesBar) {
+        drivesBar.innerHTML = "";
+        for (const d of info.drives || []) {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "chip-btn";
+          chip.textContent = info.platform === "win32" ? `💾 ${d}` : d;
+          chip.addEventListener("click", () => loadInlineExplorer(d));
+          drivesBar.appendChild(chip);
+        }
+        if (info.home) {
+          const homeChip = document.createElement("button");
+          homeChip.type = "button";
+          homeChip.className = "chip-btn";
+          homeChip.textContent = "🏠 用户目录";
+          homeChip.addEventListener("click", () => loadInlineExplorer(info.home));
+          drivesBar.prepend(homeChip);
+        }
+      }
       if (sel) {
         sel.innerHTML = "";
         for (const d of info.drives || []) {
@@ -2498,11 +2619,22 @@
       }
     });
     $("composer-input").addEventListener("paste", (ev) => {
+      const files = Array.from(ev.clipboardData?.files || []);
+      if (files.length) {
+        ev.preventDefault();
+        for (const f of files) uploadChatAttachment(f);
+        return;
+      }
+      const itemFiles = [];
       for (const item of ev.clipboardData?.items || []) {
-        if (item.type?.startsWith("image/")) {
-          ev.preventDefault();
-          uploadChatImage(item.getAsFile());
+        if (item.kind === "file") {
+          const f = item.getAsFile();
+          if (f) itemFiles.push(f);
         }
+      }
+      if (itemFiles.length) {
+        ev.preventDefault();
+        for (const f of itemFiles) uploadChatAttachment(f);
       }
     });
     $("composer-box").addEventListener("dragover", (e) => { e.preventDefault(); $("composer-box").classList.add("drag-over"); });
@@ -2510,11 +2642,11 @@
     $("composer-box").addEventListener("drop", (e) => {
       e.preventDefault();
       $("composer-box").classList.remove("drag-over");
-      for (const f of e.dataTransfer?.files || []) if (f.type.startsWith("image/")) uploadChatImage(f);
+      for (const f of e.dataTransfer?.files || []) uploadChatAttachment(f);
     });
     $("btn-attach-image").addEventListener("click", () => $("file-upload-input").click());
     $("file-upload-input").addEventListener("change", () => {
-      for (const f of $("file-upload-input").files || []) uploadChatImage(f);
+      for (const f of $("file-upload-input").files || []) uploadChatAttachment(f);
       $("file-upload-input").value = "";
     });
     $("btn-send").addEventListener("click", sendCurrentMessage);
@@ -2555,13 +2687,30 @@
     $("cwd-subpath-input")?.addEventListener("keydown", (e) => {
       if (e.key === "Enter") $("btn-cwd-create-apply")?.click();
     });
+    $("btn-cwd-inline-toggle")?.addEventListener("click", () => {
+      const box = $("cwd-inline-explorer");
+      if (!box) return;
+      if (box.classList.contains("hidden")) {
+        loadInlineExplorer(state.activeCwd || state.settings.default_cwd || "", "点击任意文件夹进入，或点击右侧「选择此文件夹」直接设为工作目录：");
+      } else {
+        box.classList.add("hidden");
+      }
+    });
+    $("btn-cwd-up")?.addEventListener("click", () => {
+      if (explorerParentPath) loadInlineExplorer(explorerParentPath);
+    });
+    $("btn-cwd-pick-current")?.addEventListener("click", () => {
+      if (explorerCurrentPath) applyCwd(explorerCurrentPath);
+    });
     $("btn-cwd-native").addEventListener("click", async () => {
       const btn = $("btn-cwd-native");
       btn.disabled = true;
       const oldTxt = btn.textContent;
-      btn.textContent = "请在弹出的系统窗口中选择文件夹…";
+      btn.textContent = "正在唤起本机文件夹选择窗口…";
       try {
         let picked = "";
+        let nonInteractive = false;
+        let reason = "";
         if (window.opencodeDesktop?.pickDirectory) {
           picked = await window.opencodeDesktop.pickDirectory();
         } else {
@@ -2570,14 +2719,20 @@
             body: JSON.stringify({ initial_dir: state.activeCwd || state.settings.default_cwd || "" }),
           });
           picked = res.path || "";
+          nonInteractive = Boolean(res.non_interactive);
+          reason = res.error || "";
         }
         if (picked) {
           await applyCwd(picked);
+        } else if (nonInteractive) {
+          toast("当前后台服务处于非交互桌面，已自动展开内置全盘文件夹浏览器", 4200);
+          loadInlineExplorer(state.activeCwd || state.settings.default_cwd || "", reason);
         } else {
           toast("已取消选择文件夹");
         }
       } catch (err) {
-        toast("打开系统目录选择框失败: " + err.message);
+        toast("打开系统目录选择框失败，已切换至内置文件夹浏览", 3600);
+        loadInlineExplorer(state.activeCwd || state.settings.default_cwd || "", err.message);
       } finally {
         btn.disabled = false;
         btn.textContent = oldTxt;
@@ -2738,6 +2893,15 @@
     $("ap-sidebar-opacity")?.addEventListener("input", () => {
       updateAppearance({ sidebarOpacity: Number($("ap-sidebar-opacity").value) });
     });
+    $("btn-wp-clear-cache")?.addEventListener("click", async () => {
+      try {
+        const res = await apiJson("/api/backgrounds/clear-cache", { method: "POST" });
+        if (res.storage) renderWallpaperStorage(res.storage);
+        toast(`已清理 ${res.removed || 0} 个预览缓存，释放 ${res.freed_mb || 0} MB（当前生效壁纸与上传壁纸完好保留）`, 3500);
+      } catch (err) {
+        toast("清理缓存失败: " + err.message);
+      }
+    });
     $("btn-upload-bg").addEventListener("click", () => $("bg-upload-input").click());
     $("bg-upload-input").addEventListener("change", async () => {
       const file = $("bg-upload-input").files?.[0];
@@ -2750,6 +2914,7 @@
           body: JSON.stringify({ name: file.name, media_type: file.type, data: dataUrl }),
         });
         state.customBackgrounds = res.backgrounds || [];
+        if (res.storage) renderWallpaperStorage(res.storage);
         const isVideo = Boolean(res.is_video || file.type.startsWith("video/"));
         updateAppearance({ bgType: isVideo ? "video" : "upload", bgUrl: res.background.url, liveBg: "", bgName: res.background.name });
         renderCustomBgs();
@@ -2800,18 +2965,24 @@
     );
     $("btn-save-settings").addEventListener("click", async () => {
       const searchMode = $("set-search-mode")?.value || state.settings.search_engine?.mode || "auto";
+      const claudeIsolation = $("set-claude-isolation")?.value || state.settings.claude_isolation || "isolated";
       const res = await apiJson("/api/settings", {
         method: "PUT",
         body: JSON.stringify({
           system_prompt: $("set-system-prompt").value,
           prompt_mode: $("set-prompt-mode")?.value || "replace",
           permission_mode: $("set-permission-mode").value,
+          claude_isolation: claudeIsolation,
           search_engine: { ...(state.settings.search_engine || {}), mode: searchMode },
           default_cwd: $("set-default-cwd").value.trim(),
           update_channel: $("set-update-channel").value,
         }),
       });
       state.settings = res.settings;
+      if (res.claude_native) {
+        state.claudeNative = res.claude_native;
+        renderClaudeStatusViews();
+      }
       if ($("store-search-engine")) $("store-search-engine").value = searchMode;
       updateThinkingSelector();
       toast("设置已保存并立即生效");
@@ -2921,6 +3092,7 @@
     state.installedMcps = boot.installed_mcps || [];
     state.installedSkills = boot.installed_skills || [];
     state.customBackgrounds = boot.custom_backgrounds || [];
+    if (boot.wallpaper_storage) renderWallpaperStorage(boot.wallpaper_storage);
     state.activeCwd = state.settings.default_cwd || "";
 
     $("app-version-badge").textContent = `v${state.version} · 开源透明`;

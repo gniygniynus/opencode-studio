@@ -91,17 +91,32 @@ function buildAnthropicMessages(historyItems) {
     }
     if (item.role === "user") {
       const blocks = [];
+      const fileNotes = [];
       for (const im of item.images || []) {
-        const b64 = loadImageAsBase64(im);
-        if (b64) {
-          blocks.push({
-            type: "image",
-            source: { type: "base64", media_type: b64.media_type, data: b64.data },
-          });
+        const isImg = im.kind === "image" || (!im.kind && String(im.media_type || "").startsWith("image/"));
+        if (isImg) {
+          const b64 = loadImageAsBase64(im);
+          if (b64) {
+            blocks.push({
+              type: "image",
+              source: { type: "base64", media_type: b64.media_type, data: b64.data },
+            });
+          }
+        } else if (im.kind === "text" && im.path && fs.existsSync(im.path)) {
+          try {
+            const raw = fs.readFileSync(im.path, "utf8");
+            const capped = raw.length > 65536 ? `${raw.slice(0, 8192)}\n...[文件较大已截断预览，完整路径: ${im.path}]` : raw;
+            fileNotes.push(`[附带文本文件: ${im.name || "file"} | 路径: ${im.path}]\n\`\`\`\n${capped}\n\`\`\``);
+          } catch {
+            fileNotes.push(`[附带文件: ${im.name || "file"} | 路径: ${im.path}]`);
+          }
+        } else if (im.path || im.name) {
+          fileNotes.push(`[附带文件: ${im.name || "file"} (${im.media_type || "binary"}, ${im.size || 0} bytes) | 本地路径: ${im.path || ""}]`);
         }
       }
-      if (item.content_text) {
-        blocks.push({ type: "text", text: item.content_text });
+      const combinedText = [item.content_text || "", ...fileNotes].filter(Boolean).join("\n\n");
+      if (combinedText) {
+        blocks.push({ type: "text", text: combinedText });
       }
       if (!blocks.length) continue;
       out.push({ role: "user", content: blocks.length === 1 && blocks[0].type === "text" ? blocks[0].text : blocks });

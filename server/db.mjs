@@ -230,6 +230,7 @@ function seedInitialData(db) {
   ensureKv("system_prompt", DEFAULT_SYSTEM_PROMPT);
   ensureKv("prompt_mode", "replace"); // replace | append | native
   ensureKv("permission_mode", "auto"); // auto | confirm_dangerous
+  ensureKv("claude_isolation", "isolated"); // isolated (零冲突独立目录) | shared (共享系统 ~/.claude)
   ensureKv("update_channel", "stable"); // stable | latest
   ensureKv("appearance", DEFAULT_APPEARANCE);
   ensureKv("search_engine", DEFAULT_SEARCH_ENGINE);
@@ -279,6 +280,7 @@ export function getAllSettings() {
     system_prompt: getSetting("system_prompt", DEFAULT_SYSTEM_PROMPT),
     prompt_mode: getSetting("prompt_mode", "replace"),
     permission_mode: getSetting("permission_mode", "auto"),
+    claude_isolation: getSetting("claude_isolation", "isolated"),
     update_channel: getSetting("update_channel", "stable"),
     appearance: { ...DEFAULT_APPEARANCE, ...(getSetting("appearance", DEFAULT_APPEARANCE) || {}) },
     search_engine: { ...DEFAULT_SEARCH_ENGINE, ...(getSetting("search_engine", DEFAULT_SEARCH_ENGINE) || {}) },
@@ -945,8 +947,10 @@ export function addCustomBackground({ name, url, source = "upload" }) {
 }
 
 export function deleteCustomBackground(id) {
-  getDb().prepare("DELETE FROM custom_backgrounds WHERE id=?").run(id);
-  return true;
+  const db = getDb();
+  const row = db.prepare("SELECT * FROM custom_backgrounds WHERE id=?").get(id);
+  db.prepare("DELETE FROM custom_backgrounds WHERE id=?").run(id);
+  return row || null;
 }
 
 function safeJsonParse(str, fallback) {

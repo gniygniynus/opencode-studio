@@ -109,7 +109,11 @@ export class SessionOrchestrator {
     let sid = sessionId;
     let meta = sid ? getSessionMeta(sid) : null;
     if (!meta) {
-      const titlePreview = (cleanText || `[图片 × ${images.length}]`).replace(/\s+/g, " ").slice(0, 60);
+      const firstAtt = images?.[0];
+      const attFallback = firstAtt?.kind === "text" || firstAtt?.kind === "file"
+        ? `[文件: ${firstAtt.name || "附件"}]${images.length > 1 ? ` 等 ${images.length} 个` : ""}`
+        : `[附件 × ${images.length}]`;
+      const titlePreview = (cleanText || attFallback).replace(/\s+/g, " ").slice(0, 60);
       meta = createSession({
         title: titlePreview,
         cwd: cwd || "",

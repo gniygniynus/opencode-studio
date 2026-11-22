@@ -17,6 +17,7 @@ import { handleProviderProxyRequest } from "./api_proxy.mjs";
 import {
   checkClaudeVersions,
   cleanupClaudeSessionFiles,
+  clearRuntimeCache,
   getClaudeRuntimeAndAuth,
   installOrSwitchClaudeVersion,
   runClaudeAuthLogin,
@@ -106,6 +107,223 @@ const ALLOWED_BG_MIMES = {
   "video/webm": ".webm",
 };
 
+const TEXT_FILE_EXTS = new Set([
+  ".txt", ".md", ".markdown", ".json", ".jsonl", ".csv", ".tsv", ".log", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env",
+  ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".pyw", ".java", ".kt", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".go", ".rs",
+  ".rb", ".php", ".sh", ".bash", ".zsh", ".bat", ".cmd", ".ps1", ".sql", ".html", ".htm", ".css", ".scss", ".less", ".vue", ".svelte",
+  ".svg", ".tex", ".r", ".lua", ".dart", ".swift", ".gradle", ".properties", ".dockerfile", ".gitignore", ".editorconfig",
+]);
+
+function isLikelyUtf8TextBuffer(buf) {
+  const sample = buf.subarray(0, Math.min(buf.length, 4096));
+  if (!sample.length) return true;
+  let bad = 0;
+  for (let i = 0; i < sample.length; i++) {
+    const b = sample[i];
+    if (b === 0) return false; // NUL byte => binary
+    if (b < 7 || (b > 14 && b < 32 && b !== 27)) bad++;
+  }
+  return bad / sample.length < 0.05;
+}
+
+function enforceUploadsBudget(dir, maxBytes = 200 * 1024 * 1024) {
+  try {
+    const files = fs
+      .readdirSync(dir)
+      .map((f) => {
+        const full = path.join(dir, f);
+        const st = fs.statSync(full);
+        return st.isFile() ? { full, size: st.size, mtimeMs: st.mtimeMs } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.mtimeMs - b.mtimeMs);
+    let total = files.reduce((s, f) => s + f.size, 0);
+    while (total > maxBytes && files.length > 0) {
+      const oldest = files.shift();
+      try { fs.unlinkSync(oldest.full); } catch {}
+      total -= oldest.size;
+    }
+  } catch {}
+}
+
+function cleanupOldActiveWallpapers(dir, keepName = "") {
+  let removed = 0;
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (f.startsWith("active_wallpaper_") && f !== keepName) {
+        try {
+          fs.unlinkSync(path.join(dir, f));
+          removed++;
+        } catch {}
+      }
+    }
+  } catch {}
+  return removed;
+}
+
+function getWallpaperStorageStats(dir) {
+  let activeBytes = 0;
+  let uploadBytes = 0;
+  let cacheBytes = 0;
+  let cacheCount = 0;
+  let uploadCount = 0;
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      const full = path.join(dir, f);
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      if (!st.isFile()) continue;
+      if (f.startsWith("active_wallpaper_")) {
+        activeBytes += st.size;
+      } else if (f.startsWith("wp_cache_")) {
+        cacheBytes += st.size;
+        if (!f.endsWith(".mime")) cacheCount++;
+      } else if (f.startsWith("bg_")) {
+        uploadBytes += st.size;
+        uploadCount++;
+      }
+    }
+  } catch {}
+  const toMb = (b) => Math.round((b / (1024 * 1024)) * 100) / 100;
+  return {
+    active_mb: toMb(activeBytes),
+    uploads_mb: toMb(uploadBytes),
+    cache_mb: toMb(cacheBytes),
+    total_mb: toMb(activeBytes + uploadBytes + cacheBytes),
+    cache_count: cacheCount,
+    upload_count: uploadCount,
+    cache_limit_mb: 35,
+  };
+}
+
+function clearWallpaperPreviewCache(dir) {
+  let removed = 0;
+  let freedBytes = 0;
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.startsWith("wp_cache_")) continue;
+      const full = path.join(dir, f);
+      try {
+        freedBytes += fs.statSync(full).size || 0;
+        fs.unlinkSync(full);
+        if (!f.endsWith(".mime")) removed++;
+      } catch {}
+    }
+  } catch {}
+  return { removed, freed_mb: Math.round((freedBytes / (1024 * 1024)) * 100) / 100 };
+}
+
+function extFromMediaMime(mime, urlHint = "") {
+  const m = String(mime || "").toLowerCase().split(";")[0].trim();
+  const map = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/avif": ".avif",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+  };
+  if (map[m]) return map[m];
+  const extMatch = String(urlHint || "").match(/\.(jpg|jpeg|png|webp|gif|mp4|webm)(?:[?#]|$)/i);
+  return extMatch ? `.${extMatch[1].toLowerCase()}` : ".jpg";
+}
+
+async function fetchPublicMediaBuffer(rawUrl, fbUrl = "") {
+  const tryFetch = async (targetUrl) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 14000);
+    try {
+      const originRef = new URL(targetUrl).origin + "/";
+      const upstream = await fetch(targetUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+          Referer: originRef,
+          Accept: "image/avif,image/webp,image/apng,image/gif,image/*,video/webm,video/mp4,*/*;q=0.8",
+        },
+        signal: controller.signal,
+      });
+      if (!upstream.ok) throw new Error(`HTTP ${upstream.status}`);
+      const mime = (upstream.headers.get("content-type") || "image/jpeg").split(";")[0];
+      if (!mime.startsWith("image/") && !mime.startsWith("video/")) throw new Error(`不支持的媒体类型 ${mime}`);
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      if (buf.length > 35 * 1024 * 1024) throw new Error("超过 35MB 限制");
+      return { buf, mime };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  try {
+    return await tryFetch(rawUrl);
+  } catch (e1) {
+    if (fbUrl && isPublicMediaUrl(fbUrl)) return await tryFetch(fbUrl);
+    throw e1;
+  }
+}
+
+async function pinActiveWallpaperIfNeeded(appearance, bgDir) {
+  if (!appearance || typeof appearance !== "object") return appearance;
+  const next = { ...appearance };
+  const bgType = next.bgType || "none";
+  const bgUrl = String(next.bgUrl || "");
+
+  // When switching to solid color, local 60fps Canvas, gradient, or user upload, immediately remove old pinned online wallpaper
+  if (bgType === "none" || bgType === "live" || bgType === "gradient" || !bgUrl) {
+    cleanupOldActiveWallpapers(bgDir, "");
+    next.sourceUrl = "";
+    return next;
+  }
+  if (bgUrl.startsWith("/api/bg-files/active_wallpaper_")) {
+    const keep = path.basename(bgUrl);
+    cleanupOldActiveWallpapers(bgDir, keep);
+    return next;
+  }
+  if (bgUrl.startsWith("/api/bg-files/")) {
+    cleanupOldActiveWallpapers(bgDir, "");
+    next.sourceUrl = bgUrl;
+    return next;
+  }
+
+  // Online wallpaper via `/api/wallpaper-proxy?url=...` or direct `https://...` -> pin ONE offline local copy & delete old one!
+  let rawUrl = bgUrl;
+  let fbUrl = "";
+  if (bgUrl.startsWith("/api/wallpaper-proxy?")) {
+    try {
+      const sp = new URL(bgUrl, "http://127.0.0.1").searchParams;
+      rawUrl = sp.get("url") || "";
+      fbUrl = sp.get("fb") || "";
+    } catch {}
+  }
+  if (!isPublicMediaUrl(rawUrl)) return next;
+
+  try {
+    const hash = crypto.createHash("sha1").update(rawUrl).digest("hex");
+    const cachePath = path.join(bgDir, `wp_cache_${hash}`);
+    const metaPath = `${cachePath}.mime`;
+    let buf;
+    let mime;
+    if (fs.existsSync(cachePath) && fs.existsSync(metaPath)) {
+      buf = fs.readFileSync(cachePath);
+      mime = fs.readFileSync(metaPath, "utf8").trim() || "image/jpeg";
+    } else {
+      const fetched = await fetchPublicMediaBuffer(rawUrl, fbUrl);
+      buf = fetched.buf;
+      mime = fetched.mime;
+    }
+    const ext = extFromMediaMime(mime, rawUrl);
+    const keepName = `active_wallpaper_${hash.slice(0, 12)}${ext}`;
+    fs.writeFileSync(path.join(bgDir, keepName), buf);
+    cleanupOldActiveWallpapers(bgDir, keepName);
+    next.sourceUrl = bgUrl;
+    next.bgUrl = `/api/bg-files/${keepName}`;
+    next.offlineReady = true;
+  } catch (err) {
+    logEvent("WARN", "wallpapers", "pin_offline_failed", `固化离线壁纸失败: ${err.message}`);
+  }
+  return next;
+}
+
 function spawnAsyncStdout(cmd, args, opts = {}) {
   return new Promise((resolve) => {
     let stdout = "";
@@ -124,8 +342,12 @@ function spawnAsyncStdout(cmd, args, opts = {}) {
 
 /**
  * Async, non-blocking, FOREGROUND native OS directory picker dialog.
- * Windows: uses Win32 modern IFileOpenDialog (FOS_PICKFOLDERS — same Explorer picker as VS Code / Chrome!)
- * with IntPtr.Zero so it pops cleanly to the foreground on any Windows 10/11 desktop!
+ * Windows: first checks Win32 GetThreadDesktop name:
+ *  - If running on the user's visible "Default" desktop: shows Win32 modern IFileOpenDialog
+ *    parented to a TopMost transparent owner Form so Explorer pops strictly ABOVE the browser!
+ *  - If running inside a non-interactive / background virtual desktop (e.g., exebox / service):
+ *    fails fast (<300ms) with `non_interactive: true` so the UI immediately opens the built-in
+ *    interactive full-disk folder explorer instead of hanging!
  */
 async function pickNativeDirectoryDialog(initialDir = "") {
   if (process.platform === "win32") {
@@ -134,9 +356,18 @@ async function pickNativeDirectoryDialog(initialDir = "") {
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $cs = @'
 using System;
+using System.Text;
+using System.Drawing;
+using System.Windows.Forms;
 using System.Runtime.InteropServices;
 
 public static class ModernFolderPicker {
+    [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint tid);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+
     [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")]
     private class FileOpenDialog {}
 
@@ -167,36 +398,59 @@ public static class ModernFolderPicker {
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
     private static extern void SHCreateItemFromParsingName(string pszPath, IntPtr pbc, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out IShellItem ppv);
 
+    public static string GetDesktopName() {
+        var sb = new StringBuilder(256); int n;
+        GetUserObjectInformation(GetThreadDesktop(GetCurrentThreadId()), 2, sb, sb.Capacity * 2, out n);
+        return sb.ToString();
+    }
+
     public static string Pick(string initialDir) {
-        var dlg = (IFileOpenDialog)new FileOpenDialog();
-        uint opts;
-        dlg.GetOptions(out opts);
-        // FOS_PICKFOLDERS (0x20) | FOS_FORCEFILESYSTEM (0x40) | FOS_PATHMUSTEXIST (0x800)
-        dlg.SetOptions(opts | 0x20u | 0x40u | 0x800u);
-        dlg.SetTitle("选择 OpenCode Studio 工作目录");
-        if (!string.IsNullOrEmpty(initialDir)) {
-            try {
-                Guid g = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE");
-                IShellItem item;
-                SHCreateItemFromParsingName(initialDir, IntPtr.Zero, ref g, out item);
-                if (item != null) dlg.SetFolder(item);
-            } catch {}
+        string desk = GetDesktopName();
+        if (!Environment.UserInteractive || (!string.IsNullOrEmpty(desk) && !string.Equals(desk, "Default", StringComparison.OrdinalIgnoreCase))) {
+            return "__NON_INTERACTIVE__:" + desk;
         }
-        int hr = dlg.Show(IntPtr.Zero);
-        if (hr == 0) {
-            IShellItem res;
-            dlg.GetResult(out res);
-            if (res != null) {
-                string path;
-                res.GetDisplayName(0x80058000u, out path);
-                return path;
+        using (var owner = new Form()) {
+            owner.FormBorderStyle = FormBorderStyle.None;
+            owner.ShowInTaskbar = false;
+            owner.TopMost = true;
+            owner.Opacity = 0.01;
+            owner.StartPosition = FormStartPosition.Manual;
+            owner.Location = new Point(-2000, -2000);
+            owner.Size = new Size(1, 1);
+            owner.Show();
+            owner.Activate();
+            SetForegroundWindow(owner.Handle);
+
+            var dlg = (IFileOpenDialog)new FileOpenDialog();
+            uint opts;
+            dlg.GetOptions(out opts);
+            // FOS_PICKFOLDERS (0x20) | FOS_FORCEFILESYSTEM (0x40) | FOS_PATHMUSTEXIST (0x800)
+            dlg.SetOptions(opts | 0x20u | 0x40u | 0x800u);
+            dlg.SetTitle("选择 OpenCode Studio 工作目录");
+            if (!string.IsNullOrEmpty(initialDir)) {
+                try {
+                    Guid g = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE");
+                    IShellItem item;
+                    SHCreateItemFromParsingName(initialDir, IntPtr.Zero, ref g, out item);
+                    if (item != null) dlg.SetFolder(item);
+                } catch {}
             }
+            int hr = dlg.Show(owner.Handle);
+            if (hr == 0) {
+                IShellItem res;
+                dlg.GetResult(out res);
+                if (res != null) {
+                    string path;
+                    res.GetDisplayName(0x80058000u, out path);
+                    return path;
+                }
+            }
+            return "";
         }
-        return "";
     }
 }
 '@
-Add-Type -TypeDefinition $cs
+Add-Type -TypeDefinition $cs -ReferencedAssemblies System.Windows.Forms,System.Drawing
 $init = '${safeInit}'
 if ($init -and -not (Test-Path -LiteralPath $init)) { $init = '' }
 $picked = [ModernFolderPicker]::Pick($init)
@@ -205,20 +459,35 @@ if ($picked) { Write-Output $picked }
     const encoded = Buffer.from(ps, "utf16le").toString("base64");
     const res = await spawnAsyncStdout("powershell.exe", ["-NoProfile", "-STA", "-EncodedCommand", encoded], {
       windowsHide: false,
+      timeout: 180000,
     });
+    const out = res.stdout.trim();
+    if (out.startsWith("__NON_INTERACTIVE__:")) {
+      const desk = out.slice("__NON_INTERACTIVE__:".length);
+      logEvent("INFO", "dirs", "pick_native_non_interactive", `服务运行于非交互桌面 (${desk})，已自动切至内置本地文件夹浏览器`);
+      return {
+        ok: false,
+        path: null,
+        non_interactive: true,
+        desktop: desk,
+        error: "当前本地服务由后台会话启动，系统弹窗被隔离在后台桌面；已为您自动展开下方全盘本地文件夹浏览器（双击桌面 OpenCode Studio.bat 或使用桌面安装包可恢复原生资源管理器弹窗）。",
+      };
+    }
     if (res.stderr.trim()) {
       logEvent("WARN", "dirs", "pick_native_stderr", res.stderr.trim().slice(0, 300));
     }
-    return res.stdout.trim() || null;
+    return { ok: Boolean(out), path: out || null, non_interactive: false };
   }
   if (process.platform === "darwin") {
     const res = await spawnAsyncStdout("osascript", ["-e", 'POSIX path of (choose folder with prompt "选择工作目录")']);
-    return res.stdout.trim() || null;
+    const out = res.stdout.trim();
+    return { ok: Boolean(out), path: out || null, non_interactive: false };
   }
   const z = await spawnAsyncStdout("zenity", ["--file-selection", "--directory", "--title=选择工作目录"]);
-  if (z.status === 0 && z.stdout.trim()) return z.stdout.trim();
+  if (z.status === 0 && z.stdout.trim()) return { ok: true, path: z.stdout.trim(), non_interactive: false };
   const k = await spawnAsyncStdout("kdialog", ["--getexistingdirectory"]);
-  return k.status === 0 ? k.stdout.trim() || null : null;
+  if (k.status === 0 && k.stdout.trim()) return { ok: true, path: k.stdout.trim(), non_interactive: false };
+  return { ok: false, path: null, non_interactive: !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY };
 }
 
 function isPublicMediaUrl(rawUrl) {
@@ -442,6 +711,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           installed_mcps: mcpManager.getStatusList(),
           installed_skills: listInstalledSkills(),
           custom_backgrounds: listCustomBackgrounds(),
+          wallpaper_storage: getWallpaperStorageStats(paths.backgroundsDir),
           running_sessions: orchestrator.runningSessionIds(),
         });
       }
@@ -492,12 +762,25 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       }
       if (method === "PUT" && pathname === "/api/settings") {
         const body = await readJsonBody(req);
-        for (const key of ["system_prompt", "prompt_mode", "permission_mode", "update_channel", "appearance", "search_engine", "default_cwd"]) {
+        if (body.appearance && typeof body.appearance === "object") {
+          body.appearance = await pinActiveWallpaperIfNeeded(body.appearance, paths.backgroundsDir);
+        }
+        const isolationChanged = body.claude_isolation !== undefined;
+        for (const key of ["system_prompt", "prompt_mode", "permission_mode", "claude_isolation", "update_channel", "appearance", "search_engine", "default_cwd"]) {
           if (body[key] !== undefined) setSetting(key, body[key]);
         }
         const next = getAllSettings();
         broadcast({ type: "settings_updated", settings: next });
-        return sendJson(res, 200, { ok: true, settings: next });
+        if (isolationChanged) {
+          clearRuntimeCache();
+          broadcast({ type: "claude_status_updated", claude_native: getClaudeRuntimeAndAuth(true) });
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          settings: next,
+          wallpaper_storage: getWallpaperStorageStats(paths.backgroundsDir),
+          ...(isolationChanged ? { claude_native: getClaudeRuntimeAndAuth(false) } : {}),
+        });
       }
 
       // ==================== PROVIDERS & MODEL CAPABILITIES ====================
@@ -735,48 +1018,23 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           return serveCachedFile();
         }
 
-        const tryFetchMedia = async (targetUrl) => {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 14000);
-          try {
-            const originRef = new URL(targetUrl).origin + "/";
-            const upstream = await fetch(targetUrl, {
-              headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-                Referer: originRef,
-                Accept: "image/avif,image/webp,image/apng,image/gif,image/*,video/webm,video/mp4,*/*;q=0.8",
-              },
-              signal: controller.signal,
-            });
-            if (!upstream.ok) throw new Error(`HTTP ${upstream.status}`);
-            const mime = (upstream.headers.get("content-type") || "image/jpeg").split(";")[0];
-            if (!mime.startsWith("image/") && !mime.startsWith("video/")) throw new Error(`不支持的媒体类型 ${mime}`);
-            const buf = Buffer.from(await upstream.arrayBuffer());
-            if (buf.length > 35 * 1024 * 1024) throw new Error("超过 35MB 限制");
-            return { buf, mime };
-          } finally {
-            clearTimeout(timer);
-          }
-        };
-
         try {
-          let fetched;
-          try {
-            fetched = await tryFetchMedia(rawUrl);
-          } catch (e1) {
-            if (fbUrl && isPublicMediaUrl(fbUrl)) {
-              fetched = await tryFetchMedia(fbUrl);
-            } else {
-              throw e1;
-            }
-          }
+          const fetched = await fetchPublicMediaBuffer(rawUrl, fbUrl);
           fs.writeFileSync(cachePath, fetched.buf);
           fs.writeFileSync(metaPath, fetched.mime, "utf8");
-          enforceWallpaperCacheBudget(paths.backgroundsDir, 80 * 1024 * 1024);
+          // Strictly cap browse thumbnail cache to 35MB (NEVER touches active_wallpaper_* or user uploads!)
+          enforceWallpaperCacheBudget(paths.backgroundsDir, 35 * 1024 * 1024);
           return serveCachedFile();
         } catch (err) {
           return sendJson(res, 502, { error: `拉取壁纸资源失败: ${err.message}` });
         }
+      }
+      if (method === "GET" && pathname === "/api/backgrounds/storage") {
+        return sendJson(res, 200, { ok: true, storage: getWallpaperStorageStats(paths.backgroundsDir) });
+      }
+      if (method === "POST" && pathname === "/api/backgrounds/clear-cache") {
+        const cleared = clearWallpaperPreviewCache(paths.backgroundsDir);
+        return sendJson(res, 200, { ok: true, ...cleared, storage: getWallpaperStorageStats(paths.backgroundsDir) });
       }
       if (method === "POST" && pathname === "/api/backgrounds/upload") {
         const body = await readJsonBody(req, 65 * 1024 * 1024);
@@ -794,42 +1052,120 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           url: `/api/bg-files/${fileName}`,
           source: isVideo ? "video" : "upload",
         });
-        return sendJson(res, 200, { ok: true, is_video: isVideo, background: bg, backgrounds: listCustomBackgrounds() });
+        return sendJson(res, 200, {
+          ok: true,
+          is_video: isVideo,
+          background: bg,
+          backgrounds: listCustomBackgrounds(),
+          storage: getWallpaperStorageStats(paths.backgroundsDir),
+        });
       }
       if (method === "DELETE" && pathname.match(/^\/api\/backgrounds\/([^/]+)$/)) {
         const id = pathname.split("/")[3];
-        deleteCustomBackground(id);
-        return sendJson(res, 200, { ok: true, backgrounds: listCustomBackgrounds() });
+        const deleted = deleteCustomBackground(id);
+        // Also remove the physical file from disk so deleting custom wallpapers frees 100% space!
+        if (deleted?.url?.startsWith("/api/bg-files/")) {
+          const fname = path.basename(deleted.url.slice("/api/bg-files/".length));
+          const fp = path.join(paths.backgroundsDir, fname);
+          if (fname.startsWith("bg_") && fs.existsSync(fp)) {
+            try { fs.unlinkSync(fp); } catch {}
+          }
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          backgrounds: listCustomBackgrounds(),
+          storage: getWallpaperStorageStats(paths.backgroundsDir),
+        });
       }
       if (method === "GET" && pathname.startsWith("/api/bg-files/")) {
         const fname = path.basename(pathname.slice("/api/bg-files/".length));
         const fp = path.join(paths.backgroundsDir, fname);
         if (!fs.existsSync(fp)) return sendJson(res, 404, { error: "not found" });
         const ext = path.extname(fp).toLowerCase();
-        res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream", "Cache-Control": "public, max-age=31536000" });
+        const total = fs.statSync(fp).size;
+        const mime = MIME[ext] || "application/octet-stream";
+        const range = req.headers.range;
+        if (range && mime.startsWith("video/")) {
+          const m = range.match(/bytes=(\d*)-(\d*)/);
+          const start = m && m[1] ? Number(m[1]) : 0;
+          const end = m && m[2] ? Math.min(Number(m[2]), total - 1) : total - 1;
+          res.writeHead(206, {
+            "Content-Type": mime,
+            "Content-Range": `bytes ${start}-${end}/${total}`,
+            "Accept-Ranges": "bytes",
+            "Content-Length": end - start + 1,
+            "Cache-Control": "public, max-age=31536000",
+          });
+          return fs.createReadStream(fp, { start, end }).pipe(res);
+        }
+        res.writeHead(200, {
+          "Content-Type": mime,
+          "Content-Length": total,
+          "Accept-Ranges": "bytes",
+          "Cache-Control": "public, max-age=31536000",
+        });
         return fs.createReadStream(fp).pipe(res);
       }
 
-      // ==================== CHAT IMAGE UPLOADS ====================
+      // ==================== UNIVERSAL CHAT ATTACHMENTS (IMAGES + TXT/CODE + ANY FILES) ====================
       if (method === "POST" && pathname === "/api/upload") {
-        const body = await readJsonBody(req);
-        const mediaType = String(body.media_type || "image/png").toLowerCase();
-        const ext = ALLOWED_IMAGE_MIMES[mediaType];
-        if (!ext) return sendJson(res, 400, { ok: false, error: `不支持的图片类型: ${mediaType}` });
-        const b64 = String(body.data || "").replace(/^data:[^,]+,/, "");
+        const body = await readJsonBody(req, 36 * 1024 * 1024);
+        const rawName = String(body.name || "attachment").trim() || "attachment";
+        const origExt = path.extname(rawName).toLowerCase();
+        const mediaType = String(body.media_type || "").toLowerCase().split(";")[0].trim();
+        const b64 = String(body.data || "").replace(/^data:[^,]*,/, "");
         const buf = Buffer.from(b64, "base64");
-        if (buf.length > 15 * 1024 * 1024) return sendJson(res, 400, { ok: false, error: "图片不能超过 15MB" });
-        const fname = `${Date.now()}_${crypto.randomBytes(4).toString("hex")}${ext}`;
+
+        const imgExt = ALLOWED_IMAGE_MIMES[mediaType] || ([".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(origExt) ? origExt : "");
+        let kind = "file";
+        let finalExt = origExt && /^\.[a-z0-9]{1,12}$/i.test(origExt) ? origExt : ".bin";
+        let finalMime = mediaType || "application/octet-stream";
+
+        if (imgExt) {
+          kind = "image";
+          finalExt = imgExt === ".jpeg" ? ".jpg" : imgExt;
+          finalMime = mediaType && mediaType.startsWith("image/") ? mediaType : MIME[finalExt] || "image/png";
+          if (buf.length > 15 * 1024 * 1024) return sendJson(res, 400, { ok: false, error: "图片不能超过 15MB" });
+        } else {
+          const isTextByType =
+            TEXT_FILE_EXTS.has(origExt) ||
+            mediaType.startsWith("text/") ||
+            mediaType === "application/json" ||
+            mediaType === "application/xml" ||
+            mediaType === "application/javascript" ||
+            mediaType === "application/x-sh";
+          const isTextByContent = !origExt && buf.length <= 2 * 1024 * 1024 && isLikelyUtf8TextBuffer(buf);
+          if (isTextByType || isTextByContent) {
+            kind = "text";
+            if (!origExt) finalExt = ".txt";
+            if (!mediaType || mediaType === "application/octet-stream") finalMime = "text/plain; charset=utf-8";
+            if (buf.length > 20 * 1024 * 1024) return sendJson(res, 400, { ok: false, error: "文本/代码文件不能超过 20MB" });
+          } else {
+            kind = "file";
+            if (buf.length > 25 * 1024 * 1024) return sendJson(res, 400, { ok: false, error: "附件文件不能超过 25MB" });
+          }
+        }
+
+        const safeBase = path
+          .basename(rawName, origExt)
+          .replace(/[^\w\u4e00-\u9fa5.-]+/g, "_")
+          .slice(0, 48) || "file";
+        const fname = `${Date.now()}_${crypto.randomBytes(3).toString("hex")}_${safeBase}${finalExt}`;
         const dest = path.join(paths.uploadsDir, fname);
         fs.writeFileSync(dest, buf);
+        enforceUploadsBudget(paths.uploadsDir, 200 * 1024 * 1024);
+
+        const preview = kind === "text" ? buf.subarray(0, 240).toString("utf8").replace(/\s+/g, " ").trim() : "";
         return sendJson(res, 200, {
           ok: true,
+          kind,
           id: fname,
-          name: body.name || fname,
-          media_type: mediaType,
+          name: rawName,
+          media_type: finalMime,
           size: buf.length,
           path: dest,
-          url: `/api/uploads/${fname}`,
+          url: `/api/uploads/${encodeURIComponent(fname)}`,
+          preview,
         });
       }
       if (method === "GET" && pathname.startsWith("/api/uploads/")) {
@@ -837,7 +1173,8 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         const fp = path.join(paths.uploadsDir, fname);
         if (!fs.existsSync(fp)) return sendJson(res, 404, { error: "not found" });
         const ext = path.extname(fp).toLowerCase();
-        res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream" });
+        const contentType = MIME[ext] || (TEXT_FILE_EXTS.has(ext) ? "text/plain; charset=utf-8" : "application/octet-stream");
+        res.writeHead(200, { "Content-Type": contentType });
         return fs.createReadStream(fp).pipe(res);
       }
 
@@ -866,8 +1203,8 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       }
       if (method === "POST" && pathname === "/api/dirs/pick-native") {
         const body = await readJsonBody(req).catch(() => ({}));
-        const picked = await pickNativeDirectoryDialog(body.initial_dir || "");
-        return sendJson(res, 200, { ok: Boolean(picked), path: picked });
+        const result = await pickNativeDirectoryDialog(body.initial_dir || "");
+        return sendJson(res, 200, result);
       }
       if (method === "GET" && pathname === "/api/files") {
         const cwd = urlObj.searchParams.get("cwd") || paths.defaultCwd;
