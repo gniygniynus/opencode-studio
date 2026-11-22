@@ -223,6 +223,7 @@
 
     const layer = $("wallpaper-layer");
     const videoEl = $("wallpaper-video");
+    const webEl = $("wallpaper-web");
     if (!state.liveBgEngine && window.OpenCodeLiveBg) {
       state.liveBgEngine = new window.OpenCodeLiveBg($("wallpaper-canvas"));
     }
@@ -230,12 +231,19 @@
     const bgType = ap.bgType || "none";
     const hasBg = bgType !== "none" && (ap.bgUrl || ap.liveBg);
 
-    // Reset all three layers cleanly first
+    // Reset all four layers cleanly first
     layer.style.backgroundImage = "none";
     state.liveBgEngine?.setMode("");
     if (videoEl) {
       videoEl.pause();
       videoEl.classList.add("hidden");
+      videoEl.muted = state.settings.wallpaper_engine?.video_muted !== false;
+    }
+    if (webEl) {
+      if (bgType !== "web") {
+        webEl.removeAttribute("src");
+        webEl.classList.add("hidden");
+      }
     }
 
     if (hasBg) {
@@ -244,8 +252,12 @@
 
       if (bgType === "live" && ap.liveBg) {
         state.liveBgEngine?.setMode(ap.liveBg);
+      } else if (bgType === "web" && ap.bgUrl && webEl) {
+        if (webEl.getAttribute("src") !== ap.bgUrl) webEl.setAttribute("src", ap.bgUrl);
+        webEl.classList.remove("hidden");
       } else if (bgType === "video" && ap.bgUrl && videoEl) {
         if (videoEl.getAttribute("src") !== ap.bgUrl) videoEl.setAttribute("src", ap.bgUrl);
+        videoEl.muted = state.settings.wallpaper_engine?.video_muted !== false;
         videoEl.classList.remove("hidden");
         videoEl.play().catch(() => {});
       } else if (bgType === "gradient" || String(ap.bgUrl || "").startsWith("linear-gradient") || String(ap.bgUrl || "").startsWith("radial-gradient")) {
@@ -1865,6 +1877,7 @@
     if (tab === "wallpapers") {
       renderCustomBgs();
       apiJson("/api/backgrounds/storage").then((r) => renderWallpaperStorage(r.storage)).catch(() => {});
+      loadWallpaperEngineLibrary(false);
       searchWallpapers($("wp-search-input").value.trim());
     }
   }
@@ -2025,6 +2038,112 @@
     } catch (err) {
       if (seq !== skillReqSeq) return;
       el.innerHTML = `<div class="muted-text" style="color:var(--err);">Skills 联网搜索失败：${escHtml(err.message)}</div>`;
+    }
+  }
+
+  async function loadWallpaperEngineLibrary(refresh = false) {
+    try {
+      const data = await apiJson(`/api/we/status?refresh=${refresh ? "1" : "0"}`);
+      state.weLibrary = data;
+      renderWallpaperEngineSection(data);
+    } catch {}
+  }
+
+  function renderWallpaperEngineSection(data) {
+    if (!data) return;
+    const authorized = Boolean(data.authorized && data.dirs?.length);
+    const dirsBar = $("we-dirs-bar");
+    const grid = $("we-grid");
+    const sub = $("we-bridge-sub");
+    const btnSteam = $("btn-we-authorize-steam");
+    const btnRef = $("btn-we-refresh");
+    const btnMute = $("btn-we-toggle-mute");
+    const btnRevoke = $("btn-we-revoke");
+
+    btnRef?.classList.toggle("hidden", !authorized);
+    btnMute?.classList.toggle("hidden", !authorized);
+    btnRevoke?.classList.toggle("hidden", !authorized);
+    if (btnSteam) btnSteam.textContent = authorized ? "🔄 重新探测 Steam (431960)" : "🔐 授权连接 Steam (431960)";
+    if (btnMute) {
+      const muted = data.video_muted !== false;
+      btnMute.textContent = muted ? "🔇 视频静音" : "🔊 视频有声";
+    }
+
+    if (!authorized) {
+      if (sub) {
+        sub.innerHTML =
+          `需您显式授权后才读取 · <b>零拷贝本地流式直连</b>（高达数百 MB / 数 GB 的 4K 60fps 长动画均留在原目录，0 额外占用，断网离线照常用，随时可撤销授权）`;
+      }
+      dirsBar?.classList.add("hidden");
+      grid?.classList.add("hidden");
+      return;
+    }
+
+    if (sub) {
+      sub.innerHTML =
+        `<span style="color:var(--ok);font-weight:600;">● 已授权零拷贝直连</span> · 共扫描到 <b>${data.count || 0}</b> 个壁纸（原文件保留在原目录，0 MB 额外磁盘复制 · 支持 4K 数 GB 长动画视频 &amp; Web 互动壁纸 &amp; Scene 原画）`;
+    }
+
+    if (dirsBar) {
+      dirsBar.classList.remove("hidden");
+      dirsBar.innerHTML = "";
+      for (const d of data.dirs || []) {
+        const chip = document.createElement("span");
+        chip.className = "we-dir-chip";
+        chip.title = d;
+        chip.innerHTML = `<span>📁 ${escHtml(d)}</span><button type="button" title="移除此目录授权">×</button>`;
+        chip.querySelector("button").addEventListener("click", async () => {
+          const res = await apiJson("/api/we/revoke", { method: "POST", body: JSON.stringify({ remove_dir: d }) });
+          state.weLibrary = res;
+          renderWallpaperEngineSection(res);
+          toast("已移除该目录授权");
+        });
+        dirsBar.appendChild(chip);
+      }
+    }
+
+    if (!grid) return;
+    grid.classList.remove("hidden");
+    grid.innerHTML = "";
+    const items = data.items || [];
+    if (!items.length) {
+      grid.innerHTML = `<div class="muted-text" style="white-space:normal;">已授权目录内暂未发现可播放的壁纸（支持 Wallpaper Engine 的 Video / Web / Scene 项目，以及任意 .mp4 / .webm / .mov / .gif / 图片文件）。</div>`;
+      return;
+    }
+    const ap = state.settings.appearance || {};
+    for (const it of items) {
+      const isActive = ap.bgUrl === it.stream_url || (it.hd_url && ap.bgUrl === it.hd_url);
+      const card = document.createElement("div");
+      card.className = "wp-card" + (isActive ? " active" : "");
+      const thumbHtml =
+        it.we_type === "video" && !it.preview_url.includes("kind=preview")
+          ? `<div class="wp-thumb"><video class="wp-thumb-vid" src="${escHtml(it.stream_url)}#t=0.5" muted playsinline preload="metadata"></video><span class="wp-live-badge">${escHtml(it.badge)}</span></div>`
+          : `<div class="wp-thumb" style="background-image:url('${escHtml(it.preview_url || it.stream_url)}')">` +
+              `<span class="wp-live-badge">${escHtml(it.badge)}</span>` +
+              (it.has_pkg_hd ? `<button type="button" class="we-hd-btn" title="直接零拷贝提取该 Scene 内嵌的 4K 无损原画">🖼️ 4K原画</button>` : "") +
+            `</div>`;
+      card.innerHTML =
+        thumbHtml +
+        `<div class="wp-meta"><div class="wp-name">${escHtml(it.title)}</div>` +
+        `<div class="wp-sub">${escHtml(it.source_label || "Wallpaper Engine")} · ${escHtml(it.description || "")}</div></div>`;
+
+      card.addEventListener("click", (e) => {
+        if (e.target.closest(".we-hd-btn")) return;
+        updateAppearance({ bgType: it.play_mode, bgUrl: it.stream_url, liveBg: "", bgName: it.title });
+        grid.querySelectorAll(".wp-card").forEach((c) => c.classList.remove("active"));
+        card.classList.add("active");
+        toast(`已应用零拷贝壁纸：${it.title}`, 2800);
+      });
+
+      card.querySelector(".we-hd-btn")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        updateAppearance({ bgType: "image", bgUrl: it.hd_url, liveBg: "", bgName: `${it.title} (4K 原画)` });
+        grid.querySelectorAll(".wp-card").forEach((c) => c.classList.remove("active"));
+        card.classList.add("active");
+        toast(`已提取并应用 4K 无损原画：${it.title}`, 2800);
+      });
+
+      grid.appendChild(card);
     }
   }
 
@@ -2893,6 +3012,74 @@
     $("ap-sidebar-opacity")?.addEventListener("input", () => {
       updateAppearance({ sidebarOpacity: Number($("ap-sidebar-opacity").value) });
     });
+    $("btn-we-authorize-steam")?.addEventListener("click", async () => {
+      if (
+        !window.confirm(
+          "授权 OpenCode Studio 只读连接本机 Steam Wallpaper Engine (AppID 431960) 壁纸库？\n\n" +
+            "• 仅只读扫描您的 Steam 创意工坊 (431960) 与 Wallpaper Engine 项目目录\n" +
+            "• 采用「零拷贝本地流式直连」：几百 MB ~ 数 GB 的 4K 长动画均留在原目录，0 额外硬盘复制，断网照常播放\n" +
+            "• 您随时可以一键撤销授权",
+        )
+      ) {
+        return;
+      }
+      toast("正在探测并扫描 Steam Wallpaper Engine (431960) 壁纸库…");
+      try {
+        const res = await apiJson("/api/we/authorize", { method: "POST", body: JSON.stringify({ auto_detect: true }) });
+        state.weLibrary = res;
+        renderWallpaperEngineSection(res);
+        toast(res.message || `已连接，发现 ${res.count || 0} 个壁纸`, 4200);
+      } catch (err) {
+        toast("授权连接失败: " + err.message, 4200);
+      }
+    });
+    $("btn-we-add-dir")?.addEventListener("click", async () => {
+      let dir = "";
+      try {
+        if (window.opencodeDesktop?.pickDirectory) {
+          dir = await window.opencodeDesktop.pickDirectory();
+        } else {
+          const pick = await apiJson("/api/dirs/pick-native", { method: "POST", body: JSON.stringify({}) });
+          if (pick.ok && pick.path) dir = pick.path;
+        }
+      } catch {}
+      if (!dir) {
+        dir = window.prompt("请输入要授权的本地 4K 壁纸/视频目录或 Steam 431960 目录路径（零拷贝流式直连，不复制文件）：", "") || "";
+      }
+      if (!dir.trim()) return;
+      try {
+        const res = await apiJson("/api/we/authorize", { method: "POST", body: JSON.stringify({ add_dir: dir.trim() }) });
+        state.weLibrary = res;
+        renderWallpaperEngineSection(res);
+        toast(res.message || `已授权目录，共 ${res.count || 0} 个壁纸`, 3800);
+      } catch (err) {
+        toast("添加壁纸目录失败: " + err.message, 4200);
+      }
+    });
+    $("btn-we-refresh")?.addEventListener("click", async () => {
+      toast("正在刷新授权壁纸库…");
+      await loadWallpaperEngineLibrary(true);
+      toast(`刷新完成，共 ${state.weLibrary?.count || 0} 个壁纸`);
+    });
+    $("btn-we-toggle-mute")?.addEventListener("click", async () => {
+      const curWe = state.settings.wallpaper_engine || { authorized: true, dirs: state.weLibrary?.dirs || [], video_muted: true };
+      const nextMuted = !(curWe.video_muted !== false);
+      const nextWe = { ...curWe, video_muted: nextMuted };
+      state.settings.wallpaper_engine = nextWe;
+      if (state.weLibrary) state.weLibrary.video_muted = nextMuted;
+      const vid = $("wallpaper-video");
+      if (vid) vid.muted = nextMuted;
+      renderWallpaperEngineSection(state.weLibrary || nextWe);
+      apiJson("/api/settings", { method: "PUT", body: JSON.stringify({ wallpaper_engine: nextWe }) }).catch(() => {});
+      toast(nextMuted ? "视频壁纸已静音" : "已开启视频壁纸音频");
+    });
+    $("btn-we-revoke")?.addEventListener("click", async () => {
+      if (!window.confirm("确定撤销所有 Wallpaper Engine / 本地壁纸目录授权？\n撤销后 OpenCode Studio 将不再读取这些目录。")) return;
+      const res = await apiJson("/api/we/revoke", { method: "POST", body: JSON.stringify({}) });
+      state.weLibrary = res;
+      renderWallpaperEngineSection(res);
+      toast("已撤销本地壁纸库授权");
+    });
     $("btn-wp-clear-cache")?.addEventListener("click", async () => {
       try {
         const res = await apiJson("/api/backgrounds/clear-cache", { method: "POST" });
@@ -2906,6 +3093,10 @@
     $("bg-upload-input").addEventListener("change", async () => {
       const file = $("bg-upload-input").files?.[0];
       if (!file) return;
+      if (file.size > 50 * 1024 * 1024) {
+        $("bg-upload-input").value = "";
+        return toast("该视频超过 50MB，请点击上方「📂 添加本地壁纸文件夹」零拷贝直连播放（支持数 GB 4K 长动画，0 硬盘复制！）", 5500);
+      }
       toast(`正在上传${file.type.startsWith("video/") ? "动态视频壁纸" : "壁纸"}…`);
       try {
         const dataUrl = await fileToDataUrl(file);

@@ -27,6 +27,7 @@ const { detectModelCapabilities } = await import("../server/model_registry.mjs")
 const { executeBuiltinTool, isDangerousCommand } = await import("../server/tools.mjs");
 const { compareSemver } = await import("../server/updater.mjs");
 const { CURATED_MCPS, CURATED_SKILLS, CURATED_WALLPAPERS } = await import("../server/stores.mjs");
+const { isPathInsideDir, scanAuthorizedWallpaperLibrary } = await import("../server/wallpaper_engine.mjs");
 const { startServer } = await import("../server/index.mjs");
 
 let mockLlmServer;
@@ -338,5 +339,27 @@ describe("OpenCode Studio Core Suite", () => {
     assert.equal(compareSemver("1.1.0", "1.0.0"), 1);
     assert.equal(compareSemver("1.0.0", "1.0.0-beta.1"), 1);
     assert.equal(compareSemver("1.0.1-beta.1", "1.0.0"), 1);
+  });
+
+  it("enforces Wallpaper Engine directory jail and zero-copy scans video/web items", () => {
+    const weDir = path.join(tmpWorkdir, "we_mock_431960");
+    const vidProj = path.join(weDir, "1001");
+    const webProj = path.join(weDir, "1002");
+    fs.mkdirSync(vidProj, { recursive: true });
+    fs.mkdirSync(webProj, { recursive: true });
+    fs.writeFileSync(path.join(vidProj, "project.json"), JSON.stringify({ title: "4K Anime Loop", type: "video", file: "loop.mp4", preview: "preview.jpg" }));
+    fs.writeFileSync(path.join(vidProj, "loop.mp4"), Buffer.alloc(1024, 0x41));
+    fs.writeFileSync(path.join(vidProj, "preview.jpg"), Buffer.alloc(256, 0xff));
+    fs.writeFileSync(path.join(webProj, "project.json"), JSON.stringify({ title: "WebGL Matrix", type: "web", file: "index.html" }));
+    fs.writeFileSync(path.join(webProj, "index.html"), "<html><body>ok</body></html>");
+
+    // Directory jail must reject parent traversal
+    assert.equal(isPathInsideDir(path.join(vidProj, "loop.mp4"), weDir), true);
+    assert.equal(isPathInsideDir(path.resolve(weDir, "..", "outside.mp4"), weDir), false);
+
+    const items = scanAuthorizedWallpaperLibrary([weDir], true);
+    assert.equal(items.length, 2);
+    assert.equal(items.some((i) => i.title === "4K Anime Loop" && i.we_type === "video" && i.play_mode === "video"), true);
+    assert.equal(items.some((i) => i.title === "WebGL Matrix" && i.we_type === "web" && i.play_mode === "web"), true);
   });
 });

@@ -46,6 +46,12 @@ export const DEFAULT_SEARCH_ENGINE = {
   proxy_url: "",            // 可选代理地址，如 http://127.0.0.1:7897
 };
 
+export const DEFAULT_WALLPAPER_ENGINE = {
+  authorized: false,        // 必须用户显式授权后才扫描本地 Steam 431960 / 大视频目录
+  dirs: [],                 // 已授权的绝对目录列表（零拷贝只读流式播放）
+  video_muted: true,        // 视频壁纸默认静音循环，可随时手动开关声音
+};
+
 function getLocalKey() {
   if (_secretKey) return _secretKey;
   const p = getPaths();
@@ -234,6 +240,7 @@ function seedInitialData(db) {
   ensureKv("update_channel", "stable"); // stable | latest
   ensureKv("appearance", DEFAULT_APPEARANCE);
   ensureKv("search_engine", DEFAULT_SEARCH_ENGINE);
+  ensureKv("wallpaper_engine", DEFAULT_WALLPAPER_ENGINE);
   ensureKv("default_cwd", getPaths().defaultCwd);
 
   // Ensure the optional "Claude 原生登录" provider entry exists out of the box (inactive until chosen)
@@ -284,6 +291,7 @@ export function getAllSettings() {
     update_channel: getSetting("update_channel", "stable"),
     appearance: { ...DEFAULT_APPEARANCE, ...(getSetting("appearance", DEFAULT_APPEARANCE) || {}) },
     search_engine: { ...DEFAULT_SEARCH_ENGINE, ...(getSetting("search_engine", DEFAULT_SEARCH_ENGINE) || {}) },
+    wallpaper_engine: { ...DEFAULT_WALLPAPER_ENGINE, ...(getSetting("wallpaper_engine", DEFAULT_WALLPAPER_ENGINE) || {}) },
     default_cwd: getSetting("default_cwd", getPaths().defaultCwd),
   };
 }

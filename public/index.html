@@ -7,10 +7,11 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <!-- Wallpaper Background Layers (Static / Live 60fps Canvas / Live Video) -->
+  <!-- Wallpaper Background Layers (Static / Live 60fps Canvas / Live 4K Video / Wallpaper Engine Web) -->
   <div id="wallpaper-layer" class="wallpaper-layer"></div>
   <canvas id="wallpaper-canvas" class="wallpaper-canvas hidden"></canvas>
   <video id="wallpaper-video" class="wallpaper-video hidden" autoplay muted loop playsinline></video>
+  <iframe id="wallpaper-web" class="wallpaper-web hidden" sandbox="allow-scripts allow-same-origin" title="互动动态壁纸"></iframe>
   <div id="wallpaper-scrim" class="wallpaper-scrim"></div>
 
   <div id="app" class="app-shell">
@@ -491,6 +492,27 @@
             <button class="chip-btn wp-cat" data-q="赛博朋克">赛博朋克</button>
             <button class="chip-btn wp-cat" data-q="极简">极简抽象</button>
             <span id="wp-search-meta" class="muted-text" style="margin-left:auto;"></span>
+          </div>
+
+          <!-- Steam Wallpaper Engine (AppID 431960) & Local 4K Large-Video Zero-Copy Bridge -->
+          <div id="we-bridge-card" class="we-bridge-card">
+            <div class="we-bridge-head">
+              <div>
+                <div class="we-bridge-title">🎮 连接 Wallpaper Engine (Steam 431960) &amp; 本地 4K 大视频库</div>
+                <div id="we-bridge-sub" class="we-bridge-sub">
+                  需您显式授权后才读取 · <b>零拷贝本地流式直连</b>（高达数百 MB / 数 GB 的 4K 60fps 长动画均留在原目录，0 额外占用，断网离线照常用，随时可撤销授权）
+                </div>
+              </div>
+              <div class="we-bridge-actions">
+                <button id="btn-we-authorize-steam" class="btn-primary sm">🔐 授权连接 Steam (431960)</button>
+                <button id="btn-we-add-dir" class="btn-secondary sm">📂 添加本地壁纸文件夹</button>
+                <button id="btn-we-refresh" class="btn-secondary sm hidden">🔄 刷新</button>
+                <button id="btn-we-toggle-mute" class="btn-secondary sm hidden" title="切换视频壁纸是否静音">🔇 视频静音</button>
+                <button id="btn-we-revoke" class="btn-danger sm hidden">🔓 撤销授权</button>
+              </div>
+            </div>
+            <div id="we-dirs-bar" class="we-dirs-bar hidden"></div>
+            <div id="we-grid" class="wp-grid hidden" style="margin-top:10px;"></div>
           </div>
 
           <div id="custom-bg-section" class="hidden">

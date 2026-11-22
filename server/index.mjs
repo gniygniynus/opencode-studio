@@ -75,6 +75,14 @@ import {
   searchWallpaperStore,
 } from "./stores.mjs";
 import { checkForUpdates, getAppVersion } from "./updater.mjs";
+import {
+  detectSteamWallpaperEngineDirs,
+  getAuthorizedWallpaperItem,
+  scanAuthorizedWallpaperLibrary,
+  serializeWeItemForClient,
+  serveAuthorizedWebAsset,
+  streamAuthorizedMedia,
+} from "./wallpaper_engine.mjs";
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -282,6 +290,13 @@ async function pinActiveWallpaperIfNeeded(appearance, bgDir) {
   if (bgUrl.startsWith("/api/bg-files/")) {
     cleanupOldActiveWallpapers(bgDir, "");
     next.sourceUrl = bgUrl;
+    return next;
+  }
+  if (bgUrl.startsWith("/api/we/")) {
+    // Zero-copy Wallpaper Engine / local 4K video streaming: NEVER duplicate multi-hundred-MB files!
+    cleanupOldActiveWallpapers(bgDir, "");
+    next.sourceUrl = bgUrl;
+    next.offlineReady = true;
     return next;
   }
 
@@ -766,7 +781,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           body.appearance = await pinActiveWallpaperIfNeeded(body.appearance, paths.backgroundsDir);
         }
         const isolationChanged = body.claude_isolation !== undefined;
-        for (const key of ["system_prompt", "prompt_mode", "permission_mode", "claude_isolation", "update_channel", "appearance", "search_engine", "default_cwd"]) {
+        for (const key of ["system_prompt", "prompt_mode", "permission_mode", "claude_isolation", "update_channel", "appearance", "search_engine", "wallpaper_engine", "default_cwd"]) {
           if (body[key] !== undefined) setSetting(key, body[key]);
         }
         const next = getAllSettings();
@@ -1035,6 +1050,112 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       if (method === "POST" && pathname === "/api/backgrounds/clear-cache") {
         const cleared = clearWallpaperPreviewCache(paths.backgroundsDir);
         return sendJson(res, 200, { ok: true, ...cleared, storage: getWallpaperStorageStats(paths.backgroundsDir) });
+      }
+
+      // ==================== WALLPAPER ENGINE (STEAM 431960) & LOCAL 4K ZERO-COPY BRIDGE ====================
+      if (method === "GET" && pathname === "/api/we/status") {
+        const weCfg = getAllSettings().wallpaper_engine || { authorized: false, dirs: [], video_muted: true };
+        const force = urlObj.searchParams.get("refresh") === "1";
+        const q = (urlObj.searchParams.get("q") || "").trim().toLowerCase();
+        const items =
+          weCfg.authorized && weCfg.dirs?.length
+            ? scanAuthorizedWallpaperLibrary(weCfg.dirs, force)
+                .map(serializeWeItemForClient)
+                .filter((it) => !q || it.title.toLowerCase().includes(q) || (it.tags || []).some((t) => t.toLowerCase().includes(q)))
+            : [];
+        return sendJson(res, 200, {
+          ok: true,
+          authorized: Boolean(weCfg.authorized),
+          dirs: weCfg.dirs || [],
+          video_muted: weCfg.video_muted !== false,
+          count: items.length,
+          items,
+        });
+      }
+      if (method === "POST" && pathname === "/api/we/authorize") {
+        const body = await readJsonBody(req);
+        const cur = getAllSettings().wallpaper_engine || { authorized: false, dirs: [], video_muted: true };
+        const dirSet = new Set((cur.dirs || []).map((d) => path.resolve(d)).filter((d) => fs.existsSync(d)));
+        let detected = [];
+        if (body.auto_detect) {
+          detected = detectSteamWallpaperEngineDirs();
+          for (const d of detected) dirSet.add(path.resolve(d.path));
+        }
+        if (body.add_dir) {
+          const target = path.resolve(String(body.add_dir).trim());
+          if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) {
+            return sendJson(res, 400, { ok: false, error: `目录不存在或不是有效文件夹：${target}` });
+          }
+          dirSet.add(target);
+        }
+        const nextDirs = [...dirSet];
+        const nextCfg = {
+          authorized: nextDirs.length > 0,
+          dirs: nextDirs,
+          video_muted: body.video_muted !== undefined ? Boolean(body.video_muted) : cur.video_muted !== false,
+        };
+        setSetting("wallpaper_engine", nextCfg);
+        const items = nextDirs.length ? scanAuthorizedWallpaperLibrary(nextDirs, true).map(serializeWeItemForClient) : [];
+        broadcast({ type: "settings_updated", settings: getAllSettings() });
+        return sendJson(res, 200, {
+          ok: true,
+          authorized: nextCfg.authorized,
+          dirs: nextDirs,
+          detected_count: detected.length,
+          video_muted: nextCfg.video_muted,
+          count: items.length,
+          items,
+          message:
+            nextDirs.length === 0
+              ? "未在本机 Steam 默认路径自动检测到 Wallpaper Engine (431960)，您可点击「手动添加目录」授权任意 Steam 创意工坊目录或本地 4K 壁纸文件夹。"
+              : `已授权 ${nextDirs.length} 个本地目录，扫描到 ${items.length} 个壁纸（零拷贝流式直连，0 额外占用）。`,
+        });
+      }
+      if (method === "POST" && pathname === "/api/we/revoke") {
+        const body = await readJsonBody(req).catch(() => ({}));
+        const cur = getAllSettings().wallpaper_engine || { authorized: false, dirs: [], video_muted: true };
+        let nextDirs = [];
+        if (body.remove_dir) {
+          const rm = path.resolve(String(body.remove_dir)).toLowerCase();
+          nextDirs = (cur.dirs || []).filter((d) => path.resolve(d).toLowerCase() !== rm);
+        }
+        const nextCfg = {
+          authorized: nextDirs.length > 0,
+          dirs: nextDirs,
+          video_muted: cur.video_muted !== false,
+        };
+        setSetting("wallpaper_engine", nextCfg);
+        const items = nextDirs.length ? scanAuthorizedWallpaperLibrary(nextDirs, true).map(serializeWeItemForClient) : [];
+        broadcast({ type: "settings_updated", settings: getAllSettings() });
+        return sendJson(res, 200, {
+          ok: true,
+          authorized: nextCfg.authorized,
+          dirs: nextDirs,
+          count: items.length,
+          items,
+        });
+      }
+      if (method === "GET" && pathname === "/api/we/media") {
+        const weCfg = getAllSettings().wallpaper_engine || {};
+        if (!weCfg.authorized || !weCfg.dirs?.length) {
+          return sendJson(res, 403, { error: "尚未授权访问 Wallpaper Engine / 本地壁纸库" });
+        }
+        const id = urlObj.searchParams.get("id") || "";
+        const kind = urlObj.searchParams.get("kind") || "file";
+        const item = getAuthorizedWallpaperItem(id, weCfg.dirs);
+        return streamAuthorizedMedia(req, res, item, kind, weCfg.dirs);
+      }
+      if (method === "GET" && pathname.startsWith("/api/we/web/")) {
+        const weCfg = getAllSettings().wallpaper_engine || {};
+        if (!weCfg.authorized || !weCfg.dirs?.length) {
+          return sendJson(res, 403, { error: "尚未授权访问 Wallpaper Engine 壁纸库" });
+        }
+        const rest = pathname.slice("/api/we/web/".length);
+        const slashIdx = rest.indexOf("/");
+        const itemId = slashIdx >= 0 ? rest.slice(0, slashIdx) : rest;
+        const subRel = slashIdx >= 0 ? rest.slice(slashIdx + 1) : "index.html";
+        const item = getAuthorizedWallpaperItem(itemId, weCfg.dirs);
+        return serveAuthorizedWebAsset(req, res, item, subRel, weCfg.dirs);
       }
       if (method === "POST" && pathname === "/api/backgrounds/upload") {
         const body = await readJsonBody(req, 65 * 1024 * 1024);
