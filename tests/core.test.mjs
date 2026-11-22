@@ -367,7 +367,7 @@ describe("OpenCode Studio Core Suite", () => {
     assert.equal(items.length, 3);
     assert.equal(items.some((i) => i.title === "4K Anime Loop" && i.we_type === "video" && i.lossless_in_browser === true), true);
     assert.equal(items.some((i) => i.title === "WebGL Matrix" && i.we_type === "web" && i.lossless_in_browser === true), true);
-    // Scene (.pkg) must NEVER fake 4K with preview.gif — requires lossless desktop passthrough!
-    assert.equal(items.some((i) => i.title === "4K DirectX Scene" && i.we_type === "scene" && i.play_mode === "passthrough" && i.lossless_in_browser === false), true);
+    // Scene (.pkg) must NEVER fake 4K with preview.gif and NEVER touch user's desktop!
+    assert.equal(items.some((i) => i.title === "4K DirectX Scene" && i.we_type === "scene" && i.playable === false && i.lossless_in_browser === false), true);
   });
 });

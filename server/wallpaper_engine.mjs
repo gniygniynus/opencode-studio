@@ -1,26 +1,18 @@
 /**
- * Steam Wallpaper Engine (AppID 431960) Live Sync & Zero-Copy Lossless Bridge.
+ * Steam Wallpaper Engine (AppID 431960) & Local 4K Large-Video Independent Zero-Copy Bridge.
  *
- * Core Principles (Zero Quality Loss, Zero Content Tampering):
- *  1. Launch official Wallpaper Engine (`steam://rungameid/431960` or `wallpaper64.exe`)
- *     so the user logs into Steam and chooses any wallpaper directly inside Wallpaper Engine.
- *  2. After explicit user authorization, read & live-watch Wallpaper Engine's `config.json`
- *     (`selectedwallpapers.Monitor0.file`) to automatically detect the user's active wallpaper.
- *  3. True Lossless Rendering:
- *     - `video` (.mp4/.webm/.mov/.mkv — hundreds of MB to multi-GB 4K/8K animations):
- *         Served directly from its original disk location via HTTP 206 Byte-Range streaming
- *         (0 MB copied, 0 transcoding, 0 downscaling, 0 content modification).
- *     - `web` (HTML5/WebGL/Canvas):
- *         Served directly from its original project folder inside a sandboxed iframe (100% original).
- *     - `image` (original local 4K PNG/JPG/WebP):
- *         Served directly from disk with zero compression or downscaling.
- *     - `scene` (Wallpaper Engine proprietary DirectX 3D `.pkg` engine):
- *         NEVER fakes 4K with low-res `preview.gif` or incomplete single-layer textures!
- *         Uses Desktop Native Transparent Passthrough so Wallpaper Engine itself renders the
- *         100% original 4K 60fps 3D scene/particles/shaders/audio directly behind OpenCode Studio.
+ * Strict Non-Interference & Lossless Guarantees:
+ *  - 100% INDEPENDENT from the user's Windows desktop wallpaper: NEVER spawns `wallpaper64.exe`,
+ *    NEVER calls `-control openWallpaper`, NEVER alters or syncs the user's OS desktop!
+ *  - Explicit opt-in ONLY: never reads Steam or local folders until the user clicks Authorize.
+ *  - Zero-copy lossless streaming: 4K/8K `video` (.mp4/.webm/.mov/.mkv — hundreds of MB to multi-GB),
+ *    `web` (HTML5/WebGL), and `image` files stay in their original directory (0 MB duplicated)
+ *    and stream bit-for-bit via HTTP 206 Byte-Range with zero transcoding or content modification.
+ *  - Honest about proprietary DirectX `.pkg` `scene` items: never fakes 4K with low-res preview.gif
+ *    or incomplete textures; clearly marks them as Wallpaper-Engine-native-only.
  */
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -61,8 +53,6 @@ const STREAM_MIME = {
 let _itemIndex = new Map();
 let _lastScanDirsKey = "";
 let _lastScanItems = [];
-let _configWatcher = null;
-let _watchedConfigDir = "";
 
 function hashId(str) {
   return crypto.createHash("sha1").update(String(str)).digest("hex").slice(0, 14);
@@ -155,42 +145,7 @@ function discoverSteamLibraries() {
 }
 
 /**
- * Locate Wallpaper Engine installation root, `config.json`, and `wallpaper64.exe`.
- */
-export function findWallpaperEngineInstall(extraDirs = []) {
-  const libs = discoverSteamLibraries();
-  const candidates = [];
-  for (const lib of libs) {
-    candidates.push(path.join(lib, "steamapps", "common", "wallpaper_engine"));
-  }
-  for (const d of extraDirs || []) {
-    if (!d) continue;
-    const norm = path.resolve(d);
-    if (norm.toLowerCase().includes("wallpaper_engine")) {
-      const idx = norm.toLowerCase().indexOf("wallpaper_engine");
-      candidates.push(norm.slice(0, idx + "wallpaper_engine".length));
-    }
-  }
-
-  for (const dir of [...new Set(candidates)]) {
-    if (!fs.existsSync(dir)) continue;
-    const cfg = path.join(dir, "config.json");
-    const exe64 = path.join(dir, "wallpaper64.exe");
-    const exe32 = path.join(dir, "wallpaper32.exe");
-    const exe = fs.existsSync(exe64) ? exe64 : fs.existsSync(exe32) ? exe32 : "";
-    if (fs.existsSync(cfg) || exe) {
-      return {
-        install_dir: dir,
-        config_path: fs.existsSync(cfg) ? cfg : "",
-        exe_path: exe,
-      };
-    }
-  }
-  return { install_dir: "", config_path: "", exe_path: "" };
-}
-
-/**
- * Detect Steam libraries and locate Wallpaper Engine (AppID 431960) directories.
+ * Read-only detection of Steam Wallpaper Engine (AppID 431960) content folders.
  * Only called after explicit user authorization action!
  */
 export function detectSteamWallpaperEngineDirs() {
@@ -217,279 +172,6 @@ export function detectSteamWallpaperEngineDirs() {
   return foundDirs;
 }
 
-/**
- * Launch official Steam Wallpaper Engine (AppID 431960) so the user can log into Steam
- * and pick/browse wallpapers directly in Wallpaper Engine!
- */
-export function launchWallpaperEngineApp(openFile = "") {
-  const install = findWallpaperEngineInstall();
-  try {
-    if (openFile && install.exe_path && process.platform === "win32") {
-      // Official Wallpaper Engine CLI: seamlessly switch active desktop wallpaper!
-      spawn(install.exe_path, ["-control", "openWallpaper", "-file", path.resolve(openFile)], {
-        detached: true,
-        stdio: "ignore",
-        windowsHide: true,
-      }).unref();
-      return { ok: true, method: "cli_openWallpaper", file: openFile };
-    }
-    if (process.platform === "win32") {
-      // Open Steam Wallpaper Engine UI via official steam://rungameid/431960 protocol
-      const encoded = Buffer.from("Start-Process -FilePath 'steam://rungameid/431960'", "utf16le").toString("base64");
-      spawn("powershell.exe", ["-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", encoded], {
-        detached: true,
-        stdio: "ignore",
-        windowsHide: true,
-      }).unref();
-      return { ok: true, method: "steam_uri", uri: "steam://rungameid/431960", installed: Boolean(install.install_dir) };
-    }
-    if (process.platform === "darwin") {
-      spawn("open", ["steam://rungameid/431960"], { detached: true, stdio: "ignore" }).unref();
-      return { ok: true, method: "steam_uri", uri: "steam://rungameid/431960" };
-    }
-    spawn("xdg-open", ["steam://rungameid/431960"], { detached: true, stdio: "ignore" }).unref();
-    return { ok: true, method: "steam_uri", uri: "steam://rungameid/431960" };
-  } catch (err) {
-    return { ok: false, error: `启动 Wallpaper Engine 失败: ${err.message}` };
-  }
-}
-
-/**
- * Read the user's CURRENTLY SELECTED wallpaper directly from Wallpaper Engine `config.json`!
- * Automatically identifies Video (4K/8K original), Web (HTML5/WebGL), Image, or Scene (DirectX 3D .pkg).
- */
-export function readCurrentWallpaperEngineSelection(authorizedDirs = []) {
-  const install = findWallpaperEngineInstall(authorizedDirs);
-  if (!install.config_path || !fs.existsSync(install.config_path)) {
-    return {
-      found: false,
-      install_dir: install.install_dir,
-      config_path: "",
-      reason: "未检测到本机 Wallpaper Engine 配置文件 (config.json)",
-    };
-  }
-
-  let cfg;
-  try {
-    cfg = JSON.parse(fs.readFileSync(install.config_path, "utf8").replace(/^\uFEFF/, ""));
-  } catch (err) {
-    return { found: false, install_dir: install.install_dir, config_path: install.config_path, reason: `解析 config.json 失败: ${err.message}` };
-  }
-
-  const curUser = os.userInfo().username;
-  const userKeys = Object.keys(cfg).filter((k) => !k.startsWith("?") && typeof cfg[k] === "object");
-  const chosenKey = userKeys.find((k) => k.toLowerCase() === curUser.toLowerCase()) || userKeys[0];
-  const userCfg = chosenKey ? cfg[chosenKey] : null;
-  const selMap = userCfg?.general?.wallpaperconfig?.selectedwallpapers || {};
-  const monitors = Object.keys(selMap).sort();
-  const primaryMonitor = monitors[0] || "";
-  const rawFile = primaryMonitor ? String(selMap[primaryMonitor]?.file || "").trim() : "";
-  const playbackMaximized = String(userCfg?.general?.user?.playbackmaximized || "");
-
-  if (!rawFile) {
-    return {
-      found: false,
-      install_dir: install.install_dir,
-      config_path: install.config_path,
-      reason: "Wallpaper Engine 当前未选中任何壁纸，请先打开 Wallpaper Engine 选择一张壁纸。",
-    };
-  }
-
-  const absFile = path.resolve(rawFile.replace(/\//g, path.sep));
-  const projDir = path.dirname(absFile);
-  const exists = fs.existsSync(absFile);
-  const ext = path.extname(absFile).toLowerCase();
-
-  // Read project.json metadata if present
-  let proj = {};
-  const pjPath = path.join(projDir, "project.json");
-  if (fs.existsSync(pjPath)) {
-    try {
-      proj = JSON.parse(fs.readFileSync(pjPath, "utf8").replace(/^\uFEFF/, ""));
-    } catch {}
-  }
-
-  const title = String(proj.title || path.basename(absFile, ext) || path.basename(projDir)).trim();
-  const projType = String(proj.type || "").toLowerCase();
-  const st = exists ? fs.statSync(absFile) : null;
-  const sizeMb = st ? Math.round((st.size / (1024 * 1024)) * 10) / 10 : 0;
-
-  let weType = "unknown";
-  let playMode = "passthrough";
-  let losslessInBrowser = false;
-  let streamUrl = "";
-
-  // Ensure the selected file is indexed and authorized before giving a direct stream URL
-  const id = hashId(safeRealpath(projDir));
-  const isAuthorized = isPathInsideAuthorizedDirs(absFile, authorizedDirs);
-
-  if (VIDEO_EXTS.has(ext) || projType === "video") {
-    weType = "video";
-    playMode = "video";
-    losslessInBrowser = true;
-    if (exists && isAuthorized) {
-      const fileItem = {
-        id,
-        title,
-        we_type: "video",
-        play_mode: "video",
-        dir_path: projDir,
-        file_path: absFile,
-        preview_path: proj.preview ? path.resolve(projDir, proj.preview) : "",
-        size_bytes: st.size,
-        size_mb: sizeMb,
-        ext,
-        tags: Array.isArray(proj.tags) ? proj.tags : [],
-        source_label: "Wallpaper Engine 当前选用",
-        stream_url: `/api/we/media?id=${id}&kind=file`,
-        preview_url: `/api/we/media?id=${id}&kind=file`,
-        badge: `🎬 原版视频 · ${sizeMb >= 1024 ? `${(sizeMb / 1024).toFixed(2)} GB` : `${sizeMb} MB`}`,
-        description: "Wallpaper Engine 原版无损视频（零拷贝 0 处理直出）",
-      };
-      _itemIndex.set(id, fileItem);
-      streamUrl = fileItem.stream_url;
-    }
-  } else if (ext === ".html" || ext === ".htm" || projType === "web") {
-    weType = "web";
-    playMode = "web";
-    losslessInBrowser = true;
-    if (exists && isAuthorized) {
-      const relWeb = path.relative(projDir, absFile).replace(/\\/g, "/");
-      const webItem = {
-        id,
-        title,
-        we_type: "web",
-        play_mode: "web",
-        dir_path: projDir,
-        file_path: absFile,
-        preview_path: proj.preview ? path.resolve(projDir, proj.preview) : "",
-        size_bytes: 0,
-        size_mb: 0,
-        ext,
-        tags: Array.isArray(proj.tags) ? proj.tags : [],
-        source_label: "Wallpaper Engine 当前选用",
-        stream_url: `/api/we/web/${id}/${relWeb.split("/").map(encodeURIComponent).join("/")}`,
-        preview_url: "",
-        badge: "🌐 原版 Web 互动壁纸",
-        description: "Wallpaper Engine 原版 HTML5/WebGL 互动壁纸（0 处理直出）",
-      };
-      _itemIndex.set(id, webItem);
-      streamUrl = webItem.stream_url;
-    }
-  } else if (IMAGE_EXTS.has(ext)) {
-    weType = "image";
-    playMode = "image";
-    losslessInBrowser = true;
-    if (exists && isAuthorized) {
-      const imgItem = {
-        id,
-        title,
-        we_type: "image",
-        play_mode: "image",
-        dir_path: projDir,
-        file_path: absFile,
-        preview_path: absFile,
-        size_bytes: st.size,
-        size_mb: sizeMb,
-        ext,
-        tags: [],
-        source_label: "Wallpaper Engine 当前选用",
-        stream_url: `/api/we/media?id=${id}&kind=file`,
-        preview_url: `/api/we/media?id=${id}&kind=file`,
-        badge: `🖼️ 原版无损图片 · ${sizeMb} MB`,
-        description: "原版无损图片（0 压缩 0 处理直出）",
-      };
-      _itemIndex.set(id, imgItem);
-      streamUrl = imgItem.stream_url;
-    }
-  } else if (ext === ".pkg" || ext === ".json" || projType === "scene") {
-    weType = "scene";
-    playMode = "passthrough";
-    losslessInBrowser = false; // DirectX 3D engine: ONLY native Desktop Passthrough gives 100% lossless 4K 60fps!
-  } else {
-    weType = projType || "application";
-    playMode = "passthrough";
-    losslessInBrowser = false;
-  }
-
-  return {
-    found: true,
-    id,
-    monitor: primaryMonitor,
-    title,
-    we_type: weType,
-    play_mode: playMode,
-    lossless_in_browser: losslessInBrowser,
-    requires_desktop_passthrough: !losslessInBrowser,
-    file_path: absFile,
-    dir_path: projDir,
-    exists,
-    authorized: isAuthorized,
-    size_mb: sizeMb,
-    ext,
-    stream_url: streamUrl,
-    install_dir: install.install_dir,
-    config_path: install.config_path,
-    playback_maximized: playbackMaximized,
-    note: losslessInBrowser
-      ? `已识别您当前在 Wallpaper Engine 选用的原版${weType === "video" ? "视频" : weType === "web" ? "互动网页" : "原图"}「${title}」，支持 100% 原画质 0 损耗零拷贝直连！`
-      : `已识别您当前在 Wallpaper Engine 选用的 DirectX 3D 实时场景「${title}」（${ext || "scene"}）。为保证清晰度 0 损耗、粒子与人物内容不做任何删减处理，请使用 OpenCode Studio 桌面版开启「✨ 原生无损透视」，由 Wallpaper Engine 原生引擎直接 4K 60fps 呈现！`,
-  };
-}
-
-/**
- * Watch Wallpaper Engine's `config.json` in real time so any wallpaper switch inside
- * Wallpaper Engine immediately pushes an update to OpenCode Studio (<500ms)!
- */
-export function syncWallpaperEngineWatcher({ enabled, authorizedDirs, onSelectionChange }) {
-  if (!enabled || !authorizedDirs?.length) {
-    stopWallpaperEngineWatcher();
-    return;
-  }
-  const install = findWallpaperEngineInstall(authorizedDirs);
-  if (!install.install_dir || !install.config_path) return;
-  if (_configWatcher && _watchedConfigDir.toLowerCase() === install.install_dir.toLowerCase()) {
-    return;
-  }
-  stopWallpaperEngineWatcher();
-
-  let debounce = null;
-  let lastFileSig = "";
-  try {
-    const initial = readCurrentWallpaperEngineSelection(authorizedDirs);
-    if (initial.found) lastFileSig = `${initial.file_path}|${initial.we_type}`;
-
-    _watchedConfigDir = install.install_dir;
-    _configWatcher = fs.watch(install.install_dir, { persistent: false }, (_ev, filename) => {
-      if (filename && !String(filename).toLowerCase().startsWith("config.json")) return;
-      clearTimeout(debounce);
-      debounce = setTimeout(() => {
-        try {
-          const next = readCurrentWallpaperEngineSelection(authorizedDirs);
-          const sig = next.found ? `${next.file_path}|${next.we_type}` : "";
-          if (sig && sig !== lastFileSig) {
-            lastFileSig = sig;
-            logEvent("INFO", "wallpaper_engine", "selection_changed", `检测到 Wallpaper Engine 切换壁纸: ${next.title} (${next.we_type})`);
-            onSelectionChange?.(next);
-          }
-        } catch {}
-      }, 450);
-    });
-    _configWatcher.on("error", () => {});
-    logEvent("INFO", "wallpaper_engine", "watcher_started", `已开启 Wallpaper Engine 实时壁纸变动监听: ${install.config_path}`);
-  } catch {
-    stopWallpaperEngineWatcher();
-  }
-}
-
-export function stopWallpaperEngineWatcher() {
-  if (_configWatcher) {
-    try { _configWatcher.close(); } catch {}
-    _configWatcher = null;
-    _watchedConfigDir = "";
-  }
-}
-
 function scanWallpaperProjectFolder(dirPath, rootLabel) {
   const projJsonPath = path.join(dirPath, "project.json");
   if (!fs.existsSync(projJsonPath)) return null;
@@ -512,7 +194,7 @@ function scanWallpaperProjectFolder(dirPath, rootLabel) {
   const hasPreview = previewPath && isPathInsideDir(previewPath, dirPath) && fs.existsSync(previewPath);
   const id = hashId(safeRealpath(dirPath));
 
-  // 1. VIDEO Wallpaper (100% lossless original file streaming — hundreds of MB to multi-GB 4K/8K!)
+  // 1. VIDEO Wallpaper: 100% lossless independent original-file streaming (hundreds of MB ~ multi-GB 4K/8K!)
   if (rawType === "video" || (filePath && VIDEO_EXTS.has(path.extname(filePath).toLowerCase()))) {
     if (!filePath || !isPathInsideDir(filePath, dirPath) || !fs.existsSync(filePath)) return null;
     const st = fs.statSync(filePath);
@@ -523,6 +205,7 @@ function scanWallpaperProjectFolder(dirPath, rootLabel) {
       title,
       we_type: "video",
       play_mode: "video",
+      playable: true,
       lossless_in_browser: true,
       dir_path: dirPath,
       file_path: filePath,
@@ -535,11 +218,11 @@ function scanWallpaperProjectFolder(dirPath, rootLabel) {
       stream_url: `/api/we/media?id=${id}&kind=file`,
       preview_url: hasPreview ? `/api/we/media?id=${id}&kind=preview` : `/api/we/media?id=${id}&kind=file`,
       badge: `🎬 原版视频 · ${sizeMb >= 1024 ? `${(sizeMb / 1024).toFixed(2)} GB` : `${sizeMb} MB`}`,
-      description: `原文件零拷贝流式直读 (${ext.slice(1).toUpperCase()}，0 压缩 0 损耗)`,
+      description: `独立播放原文件 (${ext.slice(1).toUpperCase()} · 0 压缩 0 拷贝，不影响桌面壁纸)`,
     };
   }
 
-  // 2. WEB Wallpaper (100% original HTML5 / WebGL / Canvas interactive)
+  // 2. WEB Wallpaper: 100% lossless independent HTML5 / WebGL interactive rendering
   if (rawType === "web" || (filePath && /\.(html?|xhtml)$/i.test(filePath))) {
     if (!filePath || !isPathInsideDir(filePath, dirPath) || !fs.existsSync(filePath)) return null;
     const relWeb = path.relative(dirPath, filePath).replace(/\\/g, "/");
@@ -548,6 +231,7 @@ function scanWallpaperProjectFolder(dirPath, rootLabel) {
       title,
       we_type: "web",
       play_mode: "web",
+      playable: true,
       lossless_in_browser: true,
       dir_path: dirPath,
       file_path: filePath,
@@ -560,11 +244,11 @@ function scanWallpaperProjectFolder(dirPath, rootLabel) {
       stream_url: `/api/we/web/${id}/${relWeb.split("/").map(encodeURIComponent).join("/")}`,
       preview_url: hasPreview ? `/api/we/media?id=${id}&kind=preview` : "",
       badge: "🌐 原版 Web 互动",
-      description: "HTML5 / WebGL 原版动态互动壁纸（0 损耗，断网可用）",
+      description: "独立运行 HTML5 / WebGL 原版互动壁纸（0 损耗，不影响桌面壁纸）",
     };
   }
 
-  // 3. SCENE Wallpaper (DirectX 3D .pkg — NEVER degraded to preview.gif! Uses native Desktop Passthrough!)
+  // 3. SCENE (.pkg DirectX 3D engine): honestly mark as native-only — NEVER fake 4K with preview.gif, NEVER alter desktop!
   if (rawType === "scene" || fs.existsSync(path.join(dirPath, "scene.pkg")) || fs.existsSync(path.join(dirPath, "scene.json"))) {
     const pkgPath = path.join(dirPath, "scene.pkg");
     const sceneTarget = fs.existsSync(pkgPath) ? pkgPath : fs.existsSync(filePath) ? filePath : "";
@@ -574,7 +258,8 @@ function scanWallpaperProjectFolder(dirPath, rootLabel) {
       id,
       title,
       we_type: "scene",
-      play_mode: "passthrough",
+      play_mode: "unsupported_scene",
+      playable: false,
       lossless_in_browser: false,
       dir_path: dirPath,
       file_path: sceneTarget,
@@ -586,8 +271,8 @@ function scanWallpaperProjectFolder(dirPath, rootLabel) {
       source_label: rootLabel,
       stream_url: "",
       preview_url: hasPreview ? `/api/we/media?id=${id}&kind=preview` : "",
-      badge: "✨ 3D Scene · 原生无损透视",
-      description: "DirectX 3D 实时场景（桌面版开启无损透视 100% 4K 原版呈现，不做任何降质）",
+      badge: "🔒 DirectX 3D (.pkg)",
+      description: "专有 DirectX 场景包（为保证不降质且不改您桌面，请在创意工坊选「视频 / 网页」类型壁纸）",
     };
   }
 
@@ -595,7 +280,7 @@ function scanWallpaperProjectFolder(dirPath, rootLabel) {
 }
 
 /**
- * Scan all user-authorized Wallpaper Engine & custom local 4K media folders.
+ * Scan all user-authorized Wallpaper Engine & custom local 4K media folders (strictly read-only).
  */
 export function scanAuthorizedWallpaperLibrary(authorizedDirs = [], force = false) {
   const dirs = (authorizedDirs || []).filter((d) => d && fs.existsSync(d));
@@ -653,6 +338,7 @@ export function scanAuthorizedWallpaperLibrary(authorizedDirs = [], force = fals
             title: path.basename(e.name, ext),
             we_type: isVid ? "video" : "image",
             play_mode: isVid ? "video" : "image",
+            playable: true,
             lossless_in_browser: true,
             dir_path: rootDir,
             file_path: full,
@@ -660,27 +346,28 @@ export function scanAuthorizedWallpaperLibrary(authorizedDirs = [], force = fals
             size_bytes: st.size,
             size_mb: sizeMb,
             ext,
-            tags: [isVid ? "本地原版视频" : "本地原图"],
+            tags: [isVid ? "本地原版视频" : "本地无损原图"],
             source_label: label,
             stream_url: `/api/we/media?id=${id}&kind=file`,
             preview_url: `/api/we/media?id=${id}&kind=file`,
             badge: isVid
               ? `🎬 原版视频 · ${sizeMb >= 1024 ? `${(sizeMb / 1024).toFixed(2)} GB` : `${sizeMb} MB`}`
-              : `🖼️ 原版无损图 · ${sizeMb} MB`,
-            description: "本地原文件零拷贝直读（0 压缩 0 额外占用，断网可用）",
+              : `🖼️ 无损原图 · ${sizeMb} MB`,
+            description: "本地原文件零拷贝直读（0 压缩 0 额外占用，与桌面壁纸完全独立）",
           });
         } catch {}
       }
     }
   }
 
+  // Playable lossless items (video/web/image) first, unsupported DirectX .pkg scenes last
   const order = { video: 0, web: 1, image: 2, scene: 3 };
   items.sort((a, b) => (order[a.we_type] ?? 9) - (order[b.we_type] ?? 9) || b.size_bytes - a.size_bytes || a.title.localeCompare(b.title));
 
   _itemIndex = nextIndex;
   _lastScanDirsKey = key;
   _lastScanItems = items;
-  logEvent("INFO", "wallpaper_engine", "scan_done", `已扫描授权壁纸库 (${dirs.length} 个目录, 共 ${items.length} 个壁纸)`);
+  logEvent("INFO", "wallpaper_engine", "scan_done", `已只读扫描授权壁纸库 (${dirs.length} 个目录, 共 ${items.length} 个条目)`);
   return items;
 }
 
@@ -773,8 +460,8 @@ export function serializeWeItemForClient(it) {
     title: it.title,
     we_type: it.we_type,
     play_mode: it.play_mode,
+    playable: Boolean(it.playable),
     lossless_in_browser: Boolean(it.lossless_in_browser),
-    file_path: it.file_path,
     size_mb: it.size_mb,
     ext: it.ext,
     tags: it.tags,

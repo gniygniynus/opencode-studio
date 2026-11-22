@@ -14,21 +14,6 @@
   <iframe id="wallpaper-web" class="wallpaper-web hidden" sandbox="allow-scripts allow-same-origin" title="互动动态壁纸"></iframe>
   <div id="wallpaper-scrim" class="wallpaper-scrim"></div>
 
-  <!-- Desktop Transparent Passthrough Frameless Drag Bar (shown ONLY in Electron native lossless passthrough mode) -->
-  <div id="desktop-passthrough-bar" class="desktop-pt-bar hidden">
-    <div class="desktop-pt-left">
-      <span class="desktop-pt-dot"></span>
-      <span id="desktop-pt-label">Wallpaper Engine 原生无损透视中（100% 原画质 · 0 损耗）</span>
-    </div>
-    <div class="desktop-pt-actions">
-      <button id="btn-pt-open-we" class="pt-pill-btn" title="打开 Wallpaper Engine 切换壁纸">🚀 换壁纸</button>
-      <button id="btn-pt-exit" class="pt-pill-btn" title="恢复常规不透明窗口">退出透视</button>
-      <button id="btn-win-min" class="pt-win-btn" title="最小化">─</button>
-      <button id="btn-win-max" class="pt-win-btn" title="最大化 / 还原">□</button>
-      <button id="btn-win-close" class="pt-win-btn close" title="关闭">×</button>
-    </div>
-  </div>
-
   <div id="app" class="app-shell">
     <!-- ==================== LEFT SIDEBAR ==================== -->
     <aside id="sidebar" class="sidebar glass-panel">
@@ -509,27 +494,24 @@
             <span id="wp-search-meta" class="muted-text" style="margin-left:auto;"></span>
           </div>
 
-          <!-- Steam Wallpaper Engine (AppID 431960) Live Sync & Zero-Copy Lossless Bridge -->
+          <!-- Steam Wallpaper Engine (AppID 431960) & Local 4K Independent Zero-Copy Library -->
           <div id="we-bridge-card" class="we-bridge-card">
             <div class="we-bridge-head">
               <div>
-                <div class="we-bridge-title">🎮 Wallpaper Engine (Steam 431960) 原版无损联动</div>
+                <div class="we-bridge-title">🎮 独立导入 Wallpaper Engine (Steam 431960) &amp; 本地 4K 壁纸库</div>
                 <div id="we-bridge-sub" class="we-bridge-sub">
-                  支持一键打开 Wallpaper Engine 登录并自由选壁纸 · <b>自动实时识别您所选壁纸</b> · 清晰度 0 损耗、内容不做任何删减或降质处理（4K/8K 长动画视频零拷贝直连，DirectX 3D Scene 支持桌面版原生无损透视）
+                  <b>与您的 Windows 桌面壁纸完全独立、互不同步、绝不改动您系统桌面</b> · 只读零拷贝直连原版 4K/8K 视频（支持数百 MB ~ 数 GB 长动画）与 Web 互动壁纸，0 压缩、0 拷贝、断网可用
                 </div>
               </div>
               <div class="we-bridge-actions">
-                <button id="btn-we-launch" class="btn-primary sm" title="一键打开官方正版 Wallpaper Engine (Steam 431960) 登录并挑选壁纸">🚀 打开 Wallpaper Engine 选壁纸</button>
-                <button id="btn-we-authorize-steam" class="btn-secondary sm">🔐 授权自动识别当前壁纸</button>
+                <a id="btn-we-launch" class="btn-primary sm" style="text-decoration:none;" href="steam://rungameid/431960" title="通过您本机真实 Steam 客户端打开 Wallpaper Engine 浏览并下载 4K 视频 / Web 创意工坊壁纸">🚀 打开 Steam 小红车逛工坊</a>
+                <button id="btn-we-authorize-steam" class="btn-secondary sm">🔐 只读授权壁纸目录</button>
                 <button id="btn-we-add-dir" class="btn-secondary sm">📂 添加本地 4K 目录</button>
-                <button id="btn-we-passthrough" class="btn-secondary sm" title="Electron 桌面版专用：透明直透 Wallpaper Engine 实时渲染画面，100% 4K 60fps 0 损耗呈现所有 3D Scene / 视频 / Web 壁纸">✨ 桌面无损透视</button>
-                <button id="btn-we-autosync" class="btn-secondary sm hidden" title="在 Wallpaper Engine 里切换壁纸后自动识别同步">🔄 自动同步：开</button>
                 <button id="btn-we-toggle-mute" class="btn-secondary sm hidden" title="切换视频壁纸是否静音">🔇 视频静音</button>
-                <button id="btn-we-refresh" class="btn-secondary sm hidden">刷新</button>
+                <button id="btn-we-refresh" class="btn-secondary sm hidden">🔄 刷新</button>
                 <button id="btn-we-revoke" class="btn-danger sm hidden">🔓 撤销授权</button>
               </div>
             </div>
-            <div id="we-current-box" class="we-current-box hidden"></div>
             <div id="we-dirs-bar" class="we-dirs-bar hidden"></div>
             <div id="we-grid" class="wp-grid hidden" style="margin-top:10px;"></div>
           </div>
