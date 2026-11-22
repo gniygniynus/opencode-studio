@@ -1157,9 +1157,12 @@ export async function runNativeClaudeCodeTurn({
   if (["low", "medium", "high", "xhigh", "max"].includes(thinkingLevel)) {
     args.push("--effort", thinkingLevel);
   }
-  if (promptText) {
-    if (promptMode === "replace") args.push("--system-prompt", promptText);
-    else if (promptMode === "append") args.push("--append-system-prompt", promptText);
+  if (promptMode === "replace") {
+    const safePrompt = rt.isCmd ? promptText.replace(/\r?\n/g, " ") : promptText;
+    args.push("--system-prompt", safePrompt);
+  } else if (promptMode === "append" && promptText) {
+    const safePrompt = rt.isCmd ? promptText.replace(/\r?\n/g, " ") : promptText;
+    args.push("--append-system-prompt", safePrompt);
   }
   if (mcpConfigPath) {
     args.push("--mcp-config", mcpConfigPath);

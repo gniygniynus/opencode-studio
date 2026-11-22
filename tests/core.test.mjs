@@ -370,4 +370,40 @@ describe("OpenCode Studio Core Suite", () => {
     // Scene (.pkg) must NEVER fake 4K with preview.gif and NEVER touch user's desktop!
     assert.equal(items.some((i) => i.title === "4K DirectX Scene" && i.we_type === "scene" && i.playable === false && i.lossless_in_browser === false), true);
   });
+
+  it("persists custom system_prompt (multiline, empty, numeric/JSON text) reliably via PUT /api/settings", async () => {
+    const customPrompt = "你是我的专属编程架构师。\n要求：\n1. 只输出核心思路\n2. 严禁废话";
+    const r1 = await fetch(`${studioServer.url}/api/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ system_prompt: customPrompt, prompt_mode: "append" }),
+    }).then((r) => r.json());
+    assert.equal(r1.ok, true);
+    assert.equal(r1.settings.system_prompt, customPrompt);
+    assert.equal(r1.settings.prompt_mode, "append");
+
+    // Read back via GET /api/settings to confirm SQLite persistence
+    const g1 = await fetch(`${studioServer.url}/api/settings`).then((r) => r.json());
+    assert.equal(g1.system_prompt, customPrompt);
+    assert.equal(g1.prompt_mode, "append");
+
+    // Pure numeric / JSON-like prompt must stay string (never coerced by JSON.parse)
+    const r2 = await fetch(`${studioServer.url}/api/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ system_prompt: "12345" }),
+    }).then((r) => r.json());
+    assert.equal(typeof r2.settings.system_prompt, "string");
+    assert.equal(r2.settings.system_prompt, "12345");
+
+    // Empty custom prompt must persist as "" and never silently revert to default
+    const r3 = await fetch(`${studioServer.url}/api/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ system_prompt: "", prompt_mode: "replace" }),
+    }).then((r) => r.json());
+    assert.equal(r3.settings.system_prompt, "");
+    const g3 = await fetch(`${studioServer.url}/api/settings`).then((r) => r.json());
+    assert.equal(g3.system_prompt, "");
+  });
 });

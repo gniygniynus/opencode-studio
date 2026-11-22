@@ -780,7 +780,9 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         if (body.appearance && typeof body.appearance === "object") {
           body.appearance = await pinActiveWallpaperIfNeeded(body.appearance, paths.backgroundsDir);
         }
-        const isolationChanged = body.claude_isolation !== undefined;
+        const prevIsolation = getAllSettings().claude_isolation;
+        const isolationChanged =
+          body.claude_isolation !== undefined && body.claude_isolation !== prevIsolation;
         for (const key of ["system_prompt", "prompt_mode", "permission_mode", "claude_isolation", "update_channel", "appearance", "search_engine", "wallpaper_engine", "default_cwd"]) {
           if (body[key] !== undefined) setSetting(key, body[key]);
         }
@@ -788,7 +790,12 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         broadcast({ type: "settings_updated", settings: next });
         if (isolationChanged) {
           clearRuntimeCache();
-          broadcast({ type: "claude_status_updated", claude_native: getClaudeRuntimeAndAuth(true) });
+          // Refresh Claude runtime asynchronously so saving settings never blocks for seconds
+          setImmediate(() => {
+            try {
+              broadcast({ type: "claude_status_updated", claude_native: getClaudeRuntimeAndAuth(true) });
+            } catch {}
+          });
         }
         return sendJson(res, 200, {
           ok: true,

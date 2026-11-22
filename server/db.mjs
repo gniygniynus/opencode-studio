@@ -261,10 +261,22 @@ function seedInitialData(db) {
 
 // ==================== KV SETTINGS ====================
 
+const RAW_STRING_SETTING_KEYS = new Set([
+  "system_prompt",
+  "prompt_mode",
+  "permission_mode",
+  "claude_isolation",
+  "update_channel",
+  "default_cwd",
+]);
+
 export function getSetting(key, fallback = null) {
   const db = getDb();
   const row = db.prepare("SELECT value FROM kv_settings WHERE key=?").get(key);
   if (!row) return fallback;
+  if (RAW_STRING_SETTING_KEYS.has(key)) {
+    return typeof row.value === "string" ? row.value : String(row.value ?? "");
+  }
   try {
     return JSON.parse(row.value);
   } catch {

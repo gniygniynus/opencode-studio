@@ -65,6 +65,10 @@
 
     // Live wallpaper & pagination
     liveBgEngine: null,
+    _activeBgSig: "",
+    _activeStaticSlot: "a",
+    _bgSwapToken: 0,
+    _liveRafId: null,
     wpCategory: "all",
     wpPage: 1,
     wpHasMore: false,
@@ -119,15 +123,82 @@
     return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
   }
 
+  const _layerTimers = new WeakMap();
+
+  function openAnimatedLayer(el) {
+    if (!el) return;
+    const prev = _layerTimers.get(el);
+    if (prev) {
+      clearTimeout(prev);
+      _layerTimers.delete(el);
+    }
+    if (!el.classList.contains("hidden") && el.classList.contains("is-open")) {
+      el.classList.remove("is-closing");
+      return;
+    }
+    el.classList.remove("hidden", "is-closing");
+    // Double rAF guarantees the browser paints the initial state before transitioning
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (!el.classList.contains("hidden")) el.classList.add("is-open");
+      });
+    });
+  }
+
+  function closeAnimatedLayer(el, dur = 190) {
+    if (!el || el.classList.contains("hidden")) return;
+    const prev = _layerTimers.get(el);
+    if (prev) clearTimeout(prev);
+    el.classList.remove("is-open");
+    el.classList.add("is-closing");
+    const tid = setTimeout(() => {
+      _layerTimers.delete(el);
+      el.classList.add("hidden");
+      el.classList.remove("is-closing");
+    }, dur);
+    _layerTimers.set(el, tid);
+  }
+
+  function openModal(idOrEl) {
+    const el = typeof idOrEl === "string" ? $(idOrEl) : idOrEl;
+    openAnimatedLayer(el);
+  }
+
+  function closeModal(idOrEl) {
+    const el = typeof idOrEl === "string" ? $(idOrEl) : idOrEl;
+    if (el && el.id === "modal-settings" && state._promptDirty) {
+      flushPromptAutoSave(true);
+    }
+    closeAnimatedLayer(el, 180);
+  }
+
+  function triggerViewFade(el) {
+    if (!el) return;
+    el.classList.remove("view-fade-in");
+    void el.offsetWidth;
+    el.classList.add("view-fade-in");
+  }
+
   function toast(msg, ms = 2600) {
+    const root = $("toast-root");
+    if (!root) return;
+    // Keep toast stack clean (max 3 active toasts)
+    const active = root.querySelectorAll(".toast:not(.is-closing)");
+    if (active.length >= 3) {
+      const oldest = active[0];
+      oldest.classList.remove("is-open");
+      oldest.classList.add("is-closing");
+      setTimeout(() => oldest.remove(), 220);
+    }
     const el = document.createElement("div");
     el.className = "toast";
     el.textContent = msg;
-    $("toast-root").appendChild(el);
+    root.appendChild(el);
+    requestAnimationFrame(() => el.classList.add("is-open"));
     setTimeout(() => {
-      el.style.opacity = "0";
-      el.style.transition = "opacity 0.2s";
-      setTimeout(() => el.remove(), 220);
+      el.classList.remove("is-open");
+      el.classList.add("is-closing");
+      setTimeout(() => el.remove(), 240);
     }, ms);
   }
 
@@ -202,7 +273,47 @@
     requestAnimationFrame(doScroll);
   }
 
-  // ==================== APPEARANCE & WALLPAPER (HD / SUBTLE / BORDERLESS / CUSTOM ALPHA) ====================
+  // ==================== APPEARANCE & WALLPAPER (ZERO-FLICKER DUAL-BUFFER CROSSFADE) ====================
+
+  function _hideStaticWallpaperLayers() {
+    const layerA = $("wallpaper-layer");
+    const layerB = $("wallpaper-layer-b");
+    layerA?.classList.remove("wp-visible");
+    layerB?.classList.remove("wp-visible");
+    setTimeout(() => {
+      if (layerA && !layerA.classList.contains("wp-visible")) layerA.style.backgroundImage = "none";
+      if (layerB && !layerB.classList.contains("wp-visible")) layerB.style.backgroundImage = "none";
+    }, 450);
+  }
+
+  function _crossfadeStaticBg(cssBgValue, token) {
+    if (token !== state._bgSwapToken) return;
+    const layerA = $("wallpaper-layer");
+    const layerB = $("wallpaper-layer-b");
+    if (!layerA) return;
+    if (!layerB) {
+      layerA.style.backgroundImage = cssBgValue;
+      layerA.classList.add("wp-visible");
+      return;
+    }
+    const nextSlot = state._activeStaticSlot === "a" ? "b" : "a";
+    const incoming = nextSlot === "a" ? layerA : layerB;
+    const outgoing = nextSlot === "a" ? layerB : layerA;
+
+    incoming.style.backgroundImage = cssBgValue;
+    // Ensure incoming is painted before crossfading in, keeping outgoing visible underneath so 0 white flash occurs
+    requestAnimationFrame(() => {
+      if (token !== state._bgSwapToken) return;
+      incoming.classList.add("wp-visible");
+      outgoing.classList.remove("wp-visible");
+      state._activeStaticSlot = nextSlot;
+      setTimeout(() => {
+        if (!outgoing.classList.contains("wp-visible")) {
+          outgoing.style.backgroundImage = "none";
+        }
+      }, 460);
+    });
+  }
 
   function applyAppearance(ap = {}) {
     const theme = ap.theme === "dark" ? "dark" : "light";
@@ -211,6 +322,7 @@
     const bubbleAlpha = ap.bubbleOpacity !== undefined ? Number(ap.bubbleOpacity) : (ap.bgOpacity ?? 0.88);
     const sidebarAlpha = ap.sidebarOpacity !== undefined ? Number(ap.sidebarOpacity) : (bgMode === "hd" ? 0.52 : 0.84);
 
+    // 1. Update CSS tokens & body classes (instant, zero media disruption!)
     document.documentElement.setAttribute("data-theme", theme);
     document.documentElement.style.setProperty("--font-size-base", `${ap.fontSize || 14.5}px`);
 
@@ -221,7 +333,6 @@
     document.body.classList.toggle("bg-mode-hd", bgMode === "hd");
     document.body.classList.toggle("bubble-text-only", bubbleStyle === "text");
 
-    const layer = $("wallpaper-layer");
     const videoEl = $("wallpaper-video");
     const webEl = $("wallpaper-web");
     if (!state.liveBgEngine && window.OpenCodeLiveBg) {
@@ -229,60 +340,137 @@
     }
 
     const bgType = ap.bgType || "none";
-    const hasBg = bgType !== "none" && (ap.bgUrl || ap.liveBg);
+    const hasBg = bgType !== "none" && Boolean(ap.bgUrl || ap.liveBg);
+    const isGrad =
+      bgType === "gradient" ||
+      String(ap.bgUrl || "").startsWith("linear-gradient") ||
+      String(ap.bgUrl || "").startsWith("radial-gradient");
+    const normKind = !hasBg
+      ? "none"
+      : bgType === "live" && ap.liveBg
+        ? "live"
+        : bgType === "web" && ap.bgUrl
+          ? "web"
+          : bgType === "video" && ap.bgUrl
+            ? "video"
+            : isGrad
+              ? "gradient"
+              : "image";
+    const mediaVal = normKind === "live" ? String(ap.liveBg || "") : String(ap.bgUrl || "");
+    const nextSig = normKind === "none" ? "none" : `${normKind}|${mediaVal}`;
 
-    // Reset all four layers cleanly first
-    layer.style.backgroundImage = "none";
-    state.liveBgEngine?.setMode("");
+    document.body.classList.toggle("has-wallpaper", hasBg);
+    document.documentElement.style.setProperty("--glass-alpha", hasBg ? String(bubbleAlpha) : "0.98");
+
+    // Always keep mute preference in sync without ever pausing playback
     if (videoEl) {
-      videoEl.pause();
-      videoEl.classList.add("hidden");
       videoEl.muted = state.settings.wallpaper_engine?.video_muted !== false;
     }
-    if (webEl) {
-      if (bgType !== "web") {
-        webEl.removeAttribute("src");
-        webEl.classList.add("hidden");
-      }
-    }
 
-    if (hasBg) {
-      document.body.classList.add("has-wallpaper");
-      document.documentElement.style.setProperty("--glass-alpha", String(bubbleAlpha));
+    // 2. Dirty-check wallpaper media: dragging sliders / switching themes / async settings save NEVER restarts video or flashes wallpaper!
+    if (nextSig !== state._activeBgSig) {
+      state._activeBgSig = nextSig;
+      const token = ++state._bgSwapToken;
 
-      if (bgType === "live" && ap.liveBg) {
+      const stopNonTarget = (keep) => {
+        if (keep !== "static") _hideStaticWallpaperLayers();
+        if (keep !== "live") state.liveBgEngine?.setMode("");
+        if (keep !== "video" && videoEl) {
+          videoEl.classList.remove("wp-visible");
+          setTimeout(() => {
+            if (token === state._bgSwapToken && !videoEl.classList.contains("wp-visible")) {
+              videoEl.pause();
+              videoEl.classList.add("hidden");
+            }
+          }, 360);
+        }
+        if (keep !== "web" && webEl) {
+          webEl.classList.remove("wp-visible");
+          setTimeout(() => {
+            if (token === state._bgSwapToken && !webEl.classList.contains("wp-visible")) {
+              webEl.removeAttribute("src");
+              webEl.classList.add("hidden");
+            }
+          }, 360);
+        }
+      };
+
+      if (normKind === "none") {
+        stopNonTarget("");
+      } else if (normKind === "live") {
+        stopNonTarget("live");
         state.liveBgEngine?.setMode(ap.liveBg);
-      } else if (bgType === "web" && ap.bgUrl && webEl) {
+      } else if (normKind === "web" && webEl) {
+        stopNonTarget("web");
+        webEl.classList.remove("hidden", "wp-visible");
+        const revealWeb = () => {
+          if (token === state._bgSwapToken) webEl.classList.add("wp-visible");
+        };
+        webEl.onload = revealWeb;
         if (webEl.getAttribute("src") !== ap.bgUrl) webEl.setAttribute("src", ap.bgUrl);
-        webEl.classList.remove("hidden");
-      } else if (bgType === "video" && ap.bgUrl && videoEl) {
-        if (videoEl.getAttribute("src") !== ap.bgUrl) videoEl.setAttribute("src", ap.bgUrl);
+        setTimeout(revealWeb, 160);
+      } else if (normKind === "video" && videoEl) {
+        stopNonTarget("video");
+        const sameSrc = videoEl.getAttribute("src") === ap.bgUrl;
         videoEl.muted = state.settings.wallpaper_engine?.video_muted !== false;
         videoEl.classList.remove("hidden");
-        videoEl.play().catch(() => {});
-      } else if (bgType === "gradient" || String(ap.bgUrl || "").startsWith("linear-gradient") || String(ap.bgUrl || "").startsWith("radial-gradient")) {
-        layer.style.backgroundImage = ap.bgUrl;
-      } else if (ap.bgUrl) {
-        layer.style.backgroundImage = `url("${ap.bgUrl.replace(/"/g, '\\"')}")`;
+        const revealVideo = () => {
+          if (token === state._bgSwapToken) videoEl.classList.add("wp-visible");
+        };
+        if (!sameSrc) {
+          videoEl.classList.remove("wp-visible");
+          videoEl.addEventListener("loadeddata", revealVideo, { once: true });
+          videoEl.addEventListener("canplay", revealVideo, { once: true });
+          videoEl.setAttribute("src", ap.bgUrl);
+        } else if (videoEl.readyState >= 2) {
+          requestAnimationFrame(revealVideo);
+        }
+        videoEl.play().then(revealVideo).catch(() => {});
+        setTimeout(revealVideo, 450);
+      } else if (normKind === "gradient") {
+        stopNonTarget("static");
+        _crossfadeStaticBg(ap.bgUrl, token);
+      } else if (normKind === "image") {
+        stopNonTarget("static");
+        const targetUrl = ap.bgUrl;
+        const cssUrl = `url("${targetUrl.replace(/"/g, '\\"')}")`;
+        const preloader = new Image();
+        let done = false;
+        const commit = () => {
+          if (done || token !== state._bgSwapToken) return;
+          done = true;
+          _crossfadeStaticBg(cssUrl, token);
+        };
+        preloader.onload = () => {
+          if (typeof preloader.decode === "function") {
+            preloader.decode().then(commit).catch(commit);
+          } else {
+            commit();
+          }
+        };
+        preloader.onerror = commit;
+        preloader.src = targetUrl;
+        if (preloader.complete && preloader.naturalWidth > 0) commit();
       }
-    } else {
-      document.body.classList.remove("has-wallpaper");
-      document.documentElement.style.setProperty("--glass-alpha", "0.98");
     }
 
-    // Sync controls
-    if ($("ap-theme")) $("ap-theme").value = theme;
+    // 3. Sync controls cleanly (never fight the user while actively dragging a range slider)
+    const setIfIdle = (id, val) => {
+      const el = $(id);
+      if (el && document.activeElement !== el) el.value = String(val);
+    };
+    setIfIdle("ap-theme", theme);
     $("btn-bgmode-hd")?.classList.toggle("active", bgMode === "hd");
     $("btn-bgmode-subtle")?.classList.toggle("active", bgMode !== "hd");
     $("btn-bubble-card")?.classList.toggle("active", bubbleStyle !== "text");
     $("btn-bubble-text")?.classList.toggle("active", bubbleStyle === "text");
-    if ($("ap-fontsize")) $("ap-fontsize").value = String(ap.fontSize || 14.5);
+    setIfIdle("ap-fontsize", ap.fontSize || 14.5);
     if ($("ap-fontsize-val")) $("ap-fontsize-val").textContent = `${ap.fontSize || 14.5}px`;
-    if ($("ap-blur")) $("ap-blur").value = String(ap.bgBlur ?? 10);
+    setIfIdle("ap-blur", ap.bgBlur ?? 10);
     if ($("ap-blur-val")) $("ap-blur-val").textContent = `${blurPx}px`;
-    if ($("ap-bubble-opacity")) $("ap-bubble-opacity").value = String(bubbleAlpha);
+    setIfIdle("ap-bubble-opacity", bubbleAlpha);
     if ($("ap-bubble-opacity-val")) $("ap-bubble-opacity-val").textContent = `${Math.round(bubbleAlpha * 100)}%`;
-    if ($("ap-sidebar-opacity")) $("ap-sidebar-opacity").value = String(sidebarAlpha);
+    setIfIdle("ap-sidebar-opacity", sidebarAlpha);
     if ($("ap-sidebar-opacity-val")) $("ap-sidebar-opacity-val").textContent = `${Math.round(sidebarAlpha * 100)}%`;
   }
 
@@ -296,14 +484,17 @@
   }
 
   let apSaveTimer = null;
+  let apSaveSeq = 0;
   function updateAppearance(patch) {
     const next = { ...(state.settings.appearance || {}), ...patch };
     state.settings.appearance = next;
     applyAppearance(next);
     clearTimeout(apSaveTimer);
+    const seq = ++apSaveSeq;
     apSaveTimer = setTimeout(() => {
       apiJson("/api/settings", { method: "PUT", body: JSON.stringify({ appearance: next }) })
         .then((res) => {
+          if (seq !== apSaveSeq) return;
           if (res?.settings?.appearance) {
             state.settings.appearance = res.settings.appearance;
             applyAppearance(res.settings.appearance);
@@ -436,7 +627,8 @@
   function closeAllGlassDropdowns() {
     document.querySelectorAll(".glass-dropdown.open").forEach((dd) => {
       dd.classList.remove("open");
-      dd.querySelector(".gd-menu")?.classList.add("hidden");
+      const menu = dd.querySelector(".gd-menu");
+      if (menu) closeAnimatedLayer(menu, 160);
     });
   }
 
@@ -877,14 +1069,14 @@
       if (targetId) switchToBranch(targetId);
     });
     wrap.querySelectorAll(".msg-images img").forEach((img) => {
-      img.addEventListener("click", () => { $("lightbox-img").src = img.src; $("lightbox").classList.remove("hidden"); });
+      img.addEventListener("click", () => { $("lightbox-img").src = img.src; openModal("lightbox"); });
     });
     return wrap;
   }
 
   function createAssistantMsgEl(item, isLive = false) {
     const wrap = document.createElement("div");
-    wrap.className = "msg-assistant" + (isLive ? " live-node" : "");
+    wrap.className = "msg-assistant" + (isLive ? " live-node msg-enter" : "");
     if (item.id) wrap.id = item.id;
 
     const head = document.createElement("div");
@@ -897,27 +1089,30 @@
       (isLive ? `<span class="pulse-dot"></span><span>思考与执行中…</span>` : `<span>${fmtClock(item.created_at)}</span>`);
     wrap.appendChild(head);
 
-    const blocks = item.blocks || [];
-    if (isLive && !blocks.length && !item.error) {
-      const ph = document.createElement("div");
-      ph.className = "md-body streaming-cursor";
-      ph.style.color = "var(--text-muted)";
-      ph.textContent = "等待 Claude Code 响应";
-      wrap.appendChild(ph);
+    if (isLive) {
+      const liveBody = document.createElement("div");
+      liveBody.className = "live-blocks";
+      liveBody.style.display = "flex";
+      liveBody.style.flexDirection = "column";
+      liveBody.style.gap = "10px";
+      wrap.appendChild(liveBody);
+      patchLiveBlocksContainer(liveBody, item);
+      return wrap;
     }
 
+    const blocks = item.blocks || [];
     for (const blk of blocks) {
       if (blk.type === "thinking") {
         const det = document.createElement("details");
         det.className = "thinking-card";
-        det.open = isLive;
+        det.open = false;
         det.innerHTML = `<summary>思考过程（${String(blk.text || "").length} 字）</summary><div class="thinking-body">${escHtml(blk.text || "")}</div>`;
         wrap.appendChild(det);
       } else if (blk.type === "tool_use") {
-        wrap.appendChild(createToolCardEl(blk, isLive && blk.status === "running"));
+        wrap.appendChild(createToolCardEl(blk, false));
       } else if (blk.type === "text") {
         const div = document.createElement("div");
-        div.className = "md-body" + (isLive ? " streaming-cursor" : "");
+        div.className = "md-body";
         div.innerHTML = renderMarkdown(blk.text || "");
         wrap.appendChild(div);
       }
@@ -1011,15 +1206,163 @@
     renderActivity(tl?.activity || null);
   }
 
-  function renderLiveOnly() {
-    const box = $("messages-container");
-    const live = state.activeSessionId ? state.liveStream.get(state.activeSessionId) : null;
-    box.querySelectorAll(".live-node").forEach((n) => n.remove());
-    if (live) {
-      const stick = isNearBottom();
-      box.appendChild(createAssistantMsgEl(live, true));
-      if (stick) scrollToBottom(false);
+  function patchLiveBlocksContainer(container, live) {
+    const blocks = live.blocks || [];
+    const existingByKey = new Map();
+    for (const ch of Array.from(container.children)) {
+      if (ch.dataset.blkKey) existingByKey.set(ch.dataset.blkKey, ch);
     }
+
+    const desired = [];
+    if (!blocks.length && !live.error) {
+      let ph = existingByKey.get("__waiting__");
+      if (!ph) {
+        ph = document.createElement("div");
+        ph.dataset.blkKey = "__waiting__";
+        ph.className = "md-body streaming-cursor";
+        ph.style.color = "var(--text-muted)";
+        ph.textContent = "等待 Claude Code 响应";
+      }
+      desired.push(ph);
+    } else {
+      let lastTextIdx = -1;
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        if (blocks[i].type === "text") { lastTextIdx = i; break; }
+      }
+      blocks.forEach((blk, idx) => {
+        if (blk.type === "thinking") {
+          const key = `think-${idx}`;
+          let det = existingByKey.get(key);
+          const txt = String(blk.text || "");
+          if (!det) {
+            det = document.createElement("details");
+            det.dataset.blkKey = key;
+            det.className = "thinking-card";
+            det.open = true;
+            const sum = document.createElement("summary");
+            const body = document.createElement("div");
+            body.className = "thinking-body";
+            det.appendChild(sum);
+            det.appendChild(body);
+          }
+          if (det._lastText !== txt) {
+            det._lastText = txt;
+            const sum = det.querySelector("summary");
+            const body = det.querySelector(".thinking-body");
+            if (sum) sum.textContent = `思考过程（${txt.length} 字）`;
+            if (body) body.textContent = txt;
+          }
+          desired.push(det);
+        } else if (blk.type === "tool_use") {
+          const key = `tool-${blk.id || idx}`;
+          let det = existingByKey.get(key);
+          const status = blk.status || (blk.is_error ? "error" : "done");
+          const sig = `${status}|${blk.is_error ? 1 : 0}|${String(blk.result ?? "").length}|${summarizeTool(blk.name, blk.input)}`;
+          if (!det) {
+            det = createToolCardEl(blk, status === "running");
+            det.dataset.blkKey = key;
+            det._lastSig = sig;
+          } else if (det._lastSig !== sig) {
+            det._lastSig = sig;
+            det.className = "tool-card" + (blk.is_error ? " is-error" : "");
+            const stEl = det.querySelector(".tool-status");
+            if (stEl) {
+              stEl.className = `tool-status ${status}`;
+              stEl.textContent = status === "running" ? "◌" : status === "error" || blk.is_error ? "✕" : "✓";
+            }
+            const sumEl = det.querySelector(".tool-summary");
+            if (sumEl) sumEl.textContent = summarizeTool(blk.name, blk.input);
+            const bodyEl = det.querySelector(".tool-body");
+            if (bodyEl) bodyEl.innerHTML = renderToolBodyHtml(blk);
+            else if (det.open || blk.is_error) {
+              if (blk.is_error) det.open = true;
+              const b = document.createElement("div");
+              b.className = "tool-body";
+              b.innerHTML = renderToolBodyHtml(blk);
+              det.appendChild(b);
+            }
+          }
+          desired.push(det);
+        } else if (blk.type === "text") {
+          const key = `text-${idx}`;
+          let div = existingByKey.get(key);
+          const txt = String(blk.text || "");
+          if (!div) {
+            div = document.createElement("div");
+            div.dataset.blkKey = key;
+          }
+          const wantClass = "md-body" + (idx === lastTextIdx && !live.error ? " streaming-cursor" : "");
+          if (div.className !== wantClass) div.className = wantClass;
+          if (div._lastText !== txt) {
+            div._lastText = txt;
+            div.innerHTML = renderMarkdown(txt);
+          }
+          desired.push(div);
+        }
+      });
+    }
+
+    if (live.error) {
+      const errKey = "__error__";
+      const errSig = JSON.stringify(live.error);
+      let errEl = existingByKey.get(errKey);
+      if (!errEl || errEl._lastSig !== errSig) {
+        errEl = createErrorCardEl(live.error);
+        errEl.dataset.blkKey = errKey;
+        errEl._lastSig = errSig;
+      }
+      desired.push(errEl);
+    }
+
+    // Reconcile children in-place without tearing down unchanged DOM nodes
+    const desiredSet = new Set(desired);
+    for (const ch of Array.from(container.children)) {
+      if (!desiredSet.has(ch)) ch.remove();
+    }
+    desired.forEach((node, i) => {
+      if (container.children[i] !== node) {
+        container.insertBefore(node, container.children[i] || null);
+      }
+    });
+  }
+
+  function renderLiveOnly() {
+    if (state._liveRafId) return;
+    state._liveRafId = requestAnimationFrame(() => {
+      state._liveRafId = null;
+      const box = $("messages-container");
+      const welcomeEl = $("welcome-view");
+      const live = state.activeSessionId ? state.liveStream.get(state.activeSessionId) : null;
+      if (!live) {
+        box.querySelectorAll(".live-node").forEach((n) => n.remove());
+        return;
+      }
+      welcomeEl?.classList.add("hidden");
+      const stick = isNearBottom();
+      const existing = box.querySelector(".live-node");
+      if (existing) {
+        const liveBody = existing.querySelector(".live-blocks");
+        if (liveBody) {
+          patchLiveBlocksContainer(liveBody, live);
+        } else {
+          existing.replaceWith(createAssistantMsgEl(live, true));
+        }
+      } else {
+        box.appendChild(createAssistantMsgEl(live, true));
+      }
+      if (stick) scrollToBottom(false);
+      syncScrollBottomBtn();
+    });
+  }
+
+  function syncScrollBottomBtn() {
+    const btn = $("btn-scroll-bottom");
+    if (!btn) return;
+    const sc = $("messages-scroll");
+    const hasOverflow = sc && sc.scrollHeight - sc.clientHeight > 80;
+    const show = Boolean(hasOverflow && !isNearBottom());
+    btn.classList.toggle("is-visible", show);
+    btn.setAttribute("aria-hidden", show ? "false" : "true");
   }
 
   async function openSession(sid, opts = {}) {
@@ -1044,6 +1387,7 @@
       }
 
       renderConversation();
+      triggerViewFade(data?.items?.length ? $("messages-container") : $("welcome-view"));
       if (opts.jumpMessageId) {
         jumpToElement(opts.jumpMessageId);
         if (opts.highlightQuery) {
@@ -1054,6 +1398,7 @@
       } else {
         scrollToBottom(false);
       }
+      syncScrollBottomBtn();
     } catch (err) {
       toast("加载会话失败: " + err.message);
     }
@@ -1071,6 +1416,8 @@
     renderAttachments();
     renderSessionList();
     renderConversation();
+    triggerViewFade($("welcome-view"));
+    syncScrollBottomBtn();
     updateRunningButtons();
     restoreDraft();
     $("composer-input").focus();
@@ -1091,19 +1438,19 @@
     }
   }
 
-  // ==================== RIGHT DRAWER (EXACT JUMP!) ====================
+  // ==================== RIGHT DRAWER (SMOOTH SLIDE + EXACT JUMP!) ====================
 
   function openDrawer(tab) {
     state.drawerOpen = true;
     state.drawerTab = tab;
-    $("right-drawer").classList.remove("hidden");
+    openAnimatedLayer($("right-drawer"));
     syncDrawerTabs();
-    if (tab === "find") setTimeout(() => { $("thread-find-input").focus(); $("thread-find-input").select(); }, 20);
+    if (tab === "find") setTimeout(() => { $("thread-find-input").focus(); $("thread-find-input").select(); }, 90);
   }
 
   function closeDrawer() {
     state.drawerOpen = false;
-    $("right-drawer").classList.add("hidden");
+    closeAnimatedLayer($("right-drawer"), 260);
     document.querySelectorAll(".seg-btn").forEach((b) => b.classList.remove("active"));
   }
 
@@ -1278,7 +1625,9 @@
       return;
     }
     if (t === "settings_updated" && msg.settings) {
+      const keepPrompt = state._promptDirty ? state.settings.system_prompt : undefined;
       state.settings = msg.settings;
+      if (keepPrompt !== undefined) state.settings.system_prompt = keepPrompt;
       applyAppearance(msg.settings.appearance);
       return;
     }
@@ -1392,7 +1741,7 @@
       state.activeConfirmId = msg.confirm_id;
       $("confirm-reason").textContent = msg.reason || "请确认是否允许执行以下命令：";
       $("confirm-cmd").textContent = msg.command || "";
-      $("modal-confirm").classList.remove("hidden");
+      openModal("modal-confirm");
     }
   }
 
@@ -1673,7 +2022,7 @@
   }
 
   async function openProvidersModal(focusProviderId = null) {
-    $("modal-providers").classList.remove("hidden");
+    openModal("modal-providers");
     const data = await apiJson("/api/providers");
     state.providers = data.providers || [];
     state.claudeNative = data.claude_native;
@@ -1865,7 +2214,7 @@
 
   function openStoresModal(tab = "mcp") {
     state.activeStoreTab = tab;
-    $("modal-stores").classList.remove("hidden");
+    openModal("modal-stores");
     const se = state.settings.search_engine?.mode || "auto";
     if ($("store-search-engine")) $("store-search-engine").value = se;
     document.querySelectorAll("[data-storetab]").forEach((b) => b.classList.toggle("active", b.dataset.storetab === tab));
@@ -2309,17 +2658,80 @@
 
   // ==================== MODAL: SETTINGS & CLAUDE CORE VERSION / SHELL UPDATER ====================
 
-  function openSettingsModal() {
-    $("modal-settings").classList.remove("hidden");
-    $("set-system-prompt").value = state.settings.system_prompt || "";
-    if ($("set-prompt-mode")) $("set-prompt-mode").value = state.settings.prompt_mode || "replace";
-    if ($("set-search-mode")) $("set-search-mode").value = state.settings.search_engine?.mode || "auto";
-    if ($("set-claude-isolation")) $("set-claude-isolation").value = state.settings.claude_isolation || "isolated";
-    $("set-permission-mode").value = state.settings.permission_mode || "auto";
-    $("set-default-cwd").value = state.settings.default_cwd || "";
-    $("set-update-channel").value = state.settings.update_channel || "stable";
+  let promptSaveTimer = null;
+  let promptSaveSeq = 0;
+
+  function setPromptSaveBadge(kind, text) {
+    const el = $("prompt-save-status");
+    if (!el) return;
+    el.textContent = text;
+    el.style.color =
+      kind === "ok" ? "var(--ok)" : kind === "err" ? "var(--err)" : "var(--brand)";
+  }
+
+  async function flushPromptAutoSave(silent = true) {
+    clearTimeout(promptSaveTimer);
+    promptSaveTimer = null;
+    const ta = $("set-system-prompt");
+    if (!ta) return;
+    const val = ta.value;
+    const mode = $("set-prompt-mode")?.value || "replace";
+    state._promptDirty = false;
+    const seq = ++promptSaveSeq;
+    setPromptSaveBadge("saving", "保存中…");
+    try {
+      const res = await apiJson("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify({ system_prompt: val, prompt_mode: mode }),
+      });
+      if (seq !== promptSaveSeq) return;
+      if (res?.settings) state.settings = res.settings;
+      setPromptSaveBadge("ok", "● 已自动保存");
+      if (!silent) toast("自定义系统提示词已保存并立即生效");
+    } catch (err) {
+      if (seq !== promptSaveSeq) return;
+      state._promptDirty = true;
+      setPromptSaveBadge("err", "保存失败，请重试");
+      toast("提示词保存失败: " + err.message, 4000);
+    }
+  }
+
+  function schedulePromptAutoSave() {
+    state._promptDirty = true;
+    setPromptSaveBadge("saving", "编辑中…");
+    clearTimeout(promptSaveTimer);
+    promptSaveTimer = setTimeout(() => {
+      flushPromptAutoSave(true);
+    }, 550);
+  }
+
+  async function openSettingsModal() {
+    openModal("modal-settings");
+    const syncFieldsFromSettings = (s) => {
+      const savedPrompt = s.system_prompt !== undefined && s.system_prompt !== null ? String(s.system_prompt) : "";
+      if (!state._promptDirty) $("set-system-prompt").value = savedPrompt;
+      if ($("set-prompt-mode")) $("set-prompt-mode").value = s.prompt_mode || "replace";
+      if ($("set-search-mode")) $("set-search-mode").value = s.search_engine?.mode || "auto";
+      if ($("set-claude-isolation")) $("set-claude-isolation").value = s.claude_isolation || "isolated";
+      $("set-permission-mode").value = s.permission_mode || "auto";
+      $("set-default-cwd").value = s.default_cwd || "";
+      $("set-update-channel").value = s.update_channel || "stable";
+    };
+    state._promptDirty = false;
+    syncFieldsFromSettings(state.settings || {});
+    setPromptSaveBadge("ok", "● 已保存");
     $("updater-current-line").textContent = `当前外壳版本：v${state.version} · 仓库：github.com/gniygniynus/opencode-studio`;
     renderClaudeStatusViews();
+    // Always fetch fresh persisted settings from SQLite so opening early or across tabs NEVER shows stale/empty values
+    try {
+      const fresh = await apiJson("/api/settings");
+      if (fresh && typeof fresh === "object") {
+        state.settings = { ...(state.settings || {}), ...fresh };
+        if (!state._promptDirty && document.activeElement !== $("set-system-prompt")) {
+          syncFieldsFromSettings(state.settings);
+        }
+      }
+    } catch {}
   }
 
   async function checkClaudeCoreVersions() {
@@ -2494,7 +2906,7 @@
   }
 
   async function openCwdModal() {
-    $("modal-cwd").classList.remove("hidden");
+    openModal("modal-cwd");
     $("cwd-inline-explorer")?.classList.add("hidden");
     const cur = state.activeCwd || state.settings.default_cwd || "";
     if ($("cwd-active-hint")) $("cwd-active-hint").textContent = `当前工作目录：${cur || "未设置"}`;
@@ -2547,7 +2959,7 @@
     if (!clean) return;
     state.activeCwd = clean;
     $("cwd-pill-text").textContent = clean;
-    $("modal-cwd").classList.add("hidden");
+    closeModal("modal-cwd");
     if (state.activeSessionId) {
       await apiJson(`/api/sessions/${encodeURIComponent(state.activeSessionId)}`, {
         method: "PATCH",
@@ -2558,7 +2970,7 @@
   }
 
   async function openMemoryModal() {
-    $("modal-memory").classList.remove("hidden");
+    openModal("modal-memory");
     const q = $("mem-search-input").value.trim();
     const data = await apiJson(`/api/memories?q=${encodeURIComponent(q)}`);
     state.memories = data.memories || [];
@@ -2599,7 +3011,7 @@
   async function openLogsModal(tab = "server") {
     state.activeLogTab = tab;
     $("log-error-dot").classList.add("hidden");
-    $("modal-logs").classList.remove("hidden");
+    openModal("modal-logs");
     document.querySelectorAll("[data-logtab]").forEach((b) => b.classList.toggle("active", b.dataset.logtab === tab));
     $("log-pane-server").classList.toggle("hidden", tab !== "server");
     $("log-pane-turn").classList.toggle("hidden", tab !== "turn");
@@ -2706,7 +3118,7 @@
         closeAllGlassDropdowns();
         if (!wasOpen && dd && menu) {
           dd.classList.add("open");
-          menu.classList.remove("hidden");
+          openAnimatedLayer(menu);
         }
       });
     }
@@ -2797,10 +3209,16 @@
       if (btn) copyText(decodeURIComponent(btn.dataset.code || ""), "已复制代码");
     });
 
-    // Scroll bottom
+    // Scroll bottom (rAF throttled for 60fps over 4K wallpapers)
+    let scrollTicking = false;
     $("messages-scroll").addEventListener("scroll", () => {
-      $("btn-scroll-bottom").classList.toggle("hidden", isNearBottom());
-    });
+      if (scrollTicking) return;
+      scrollTicking = true;
+      requestAnimationFrame(() => {
+        scrollTicking = false;
+        syncScrollBottomBtn();
+      });
+    }, { passive: true });
     $("btn-scroll-bottom").addEventListener("click", () => scrollToBottom(true));
 
     // Drawer
@@ -3177,32 +3595,54 @@
     });
 
     // Settings, Claude Code Core Detector & Safe Switcher + Shell Updater
+    $("set-system-prompt")?.addEventListener("input", schedulePromptAutoSave);
+    $("set-prompt-mode")?.addEventListener("change", () => flushPromptAutoSave(false));
     document.querySelectorAll(".prompt-preset").forEach((b) =>
-      b.addEventListener("click", () => { $("set-system-prompt").value = PROMPT_PRESETS[b.dataset.preset] || ""; }),
+      b.addEventListener("click", () => {
+        $("set-system-prompt").value = PROMPT_PRESETS[b.dataset.preset] || "";
+        flushPromptAutoSave(false);
+      }),
     );
     $("btn-save-settings").addEventListener("click", async () => {
-      const searchMode = $("set-search-mode")?.value || state.settings.search_engine?.mode || "auto";
-      const claudeIsolation = $("set-claude-isolation")?.value || state.settings.claude_isolation || "isolated";
-      const res = await apiJson("/api/settings", {
-        method: "PUT",
-        body: JSON.stringify({
-          system_prompt: $("set-system-prompt").value,
-          prompt_mode: $("set-prompt-mode")?.value || "replace",
-          permission_mode: $("set-permission-mode").value,
-          claude_isolation: claudeIsolation,
-          search_engine: { ...(state.settings.search_engine || {}), mode: searchMode },
-          default_cwd: $("set-default-cwd").value.trim(),
-          update_channel: $("set-update-channel").value,
-        }),
-      });
-      state.settings = res.settings;
-      if (res.claude_native) {
-        state.claudeNative = res.claude_native;
-        renderClaudeStatusViews();
+      const btn = $("btn-save-settings");
+      clearTimeout(promptSaveTimer);
+      promptSaveTimer = null;
+      const oldTxt = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "保存中…";
+      setPromptSaveBadge("saving", "保存中…");
+      try {
+        const searchMode = $("set-search-mode")?.value || state.settings.search_engine?.mode || "auto";
+        const claudeIsolation = $("set-claude-isolation")?.value || state.settings.claude_isolation || "isolated";
+        const res = await apiJson("/api/settings", {
+          method: "PUT",
+          body: JSON.stringify({
+            system_prompt: $("set-system-prompt").value,
+            prompt_mode: $("set-prompt-mode")?.value || "replace",
+            permission_mode: $("set-permission-mode").value,
+            claude_isolation: claudeIsolation,
+            search_engine: { ...(state.settings.search_engine || {}), mode: searchMode },
+            default_cwd: $("set-default-cwd").value.trim(),
+            update_channel: $("set-update-channel").value,
+          }),
+        });
+        state.settings = res.settings;
+        state._promptDirty = false;
+        setPromptSaveBadge("ok", "● 已保存");
+        if (res.claude_native) {
+          state.claudeNative = res.claude_native;
+          renderClaudeStatusViews();
+        }
+        if ($("store-search-engine")) $("store-search-engine").value = searchMode;
+        updateThinkingSelector();
+        toast("设置与自定义提示词已保存并立即生效");
+      } catch (err) {
+        setPromptSaveBadge("err", "保存失败");
+        toast("保存设置失败: " + err.message, 4200);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = oldTxt;
       }
-      if ($("store-search-engine")) $("store-search-engine").value = searchMode;
-      updateThinkingSelector();
-      toast("设置已保存并立即生效");
     });
     $("btn-claude-check-ver")?.addEventListener("click", checkClaudeCoreVersions);
     $("btn-claude-install-stable")?.addEventListener("click", () => installOrSwitchClaudeCore("stable"));
@@ -3254,29 +3694,29 @@
         state.ws.send(JSON.stringify({ type: "confirm_response", confirm_id: state.activeConfirmId, approved: true }));
       }
       state.activeConfirmId = null;
-      $("modal-confirm").classList.add("hidden");
+      closeModal("modal-confirm");
     });
     $("btn-confirm-deny").addEventListener("click", () => {
       if (state.activeConfirmId && state.wsConnected) {
         state.ws.send(JSON.stringify({ type: "confirm_response", confirm_id: state.activeConfirmId, approved: false }));
       }
       state.activeConfirmId = null;
-      $("modal-confirm").classList.add("hidden");
+      closeModal("modal-confirm");
     });
 
-    // Close modals (delegated + Esc)
+    // Close modals (delegated + Esc, with smooth exit animation)
     document.addEventListener("click", (ev) => {
       const closeBtn = ev.target.closest(".modal-close");
       if (closeBtn) {
         const targetId = closeBtn.getAttribute("data-close");
-        if (targetId) $(targetId)?.classList.add("hidden");
-        else closeBtn.closest(".modal-backdrop")?.classList.add("hidden");
+        if (targetId) closeModal(targetId);
+        else closeModal(closeBtn.closest(".modal-backdrop"));
       }
     });
     document.querySelectorAll(".modal-backdrop").forEach((bd) =>
-      bd.addEventListener("click", (e) => { if (e.target === bd && bd.id !== "modal-confirm") bd.classList.add("hidden"); }),
+      bd.addEventListener("click", (e) => { if (e.target === bd && bd.id !== "modal-confirm") closeModal(bd); }),
     );
-    $("lightbox").addEventListener("click", () => $("lightbox").classList.add("hidden"));
+    $("lightbox").addEventListener("click", () => closeModal("lightbox"));
 
     // Shortcuts
     window.addEventListener("keydown", (ev) => {
@@ -3287,10 +3727,11 @@
         ev.preventDefault();
         startNewSession();
       } else if (ev.key === "Escape") {
-        $("lightbox").classList.add("hidden");
+        closeModal("lightbox");
+        closeAllGlassDropdowns();
         closeAutocomplete();
         document.querySelectorAll(".modal-backdrop:not(.hidden)").forEach((bd) => {
-          if (bd.id !== "modal-confirm") bd.classList.add("hidden");
+          if (bd.id !== "modal-confirm") closeModal(bd);
         });
       }
     });

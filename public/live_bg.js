@@ -56,15 +56,22 @@
     }
 
     setMode(mode) {
-      this.mode = mode || "";
+      const next = mode || "";
+      if (next === this.mode) {
+        if (next && !this.raf) this.startLoop();
+        return;
+      }
+      this.mode = next;
       if (!this.mode) {
         this.pauseLoop();
+        this.canvas.classList.remove("wp-visible");
         this.canvas.classList.add("hidden");
         return;
       }
       this.canvas.classList.remove("hidden");
       this.resize();
       this.startLoop();
+      requestAnimationFrame(() => this.canvas.classList.add("wp-visible"));
     }
 
     pauseLoop() {
