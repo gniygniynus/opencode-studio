@@ -388,6 +388,30 @@ export const LIVE_WALLPAPERS = [
     url: "",
     preview_css: "linear-gradient(180deg, #07140d 0%, #0d2b1d 60%, #050a08 100%)",
   },
+  {
+    id: "live-fireflies",
+    name: "动态 · 仲夏森屿流萤",
+    description: "60fps 静谧深林微光萤火虫呼吸漂浮",
+    author: "Live Canvas",
+    license: "60fps 动态",
+    type: "live",
+    liveBg: "live-fireflies",
+    tags: ["森林", "萤火虫", "治愈", "护眼", "夜空", "forest", "fireflies"],
+    url: "",
+    preview_css: "radial-gradient(circle at 50% 65%, #132a24 0%, #091614 65%, #050b0a 100%)",
+  },
+  {
+    id: "live-cybergrid",
+    name: "动态 · 霓虹流光天际线",
+    description: "60fps 复古未来主义透视流光网格",
+    author: "Live Canvas",
+    license: "60fps 动态",
+    type: "live",
+    liveBg: "live-cybergrid",
+    tags: ["赛博", "赛博朋克", "科技", "科幻", "cyberpunk", "neon", "暗黑"],
+    url: "",
+    preview_css: "linear-gradient(180deg, #090d1e 0%, #1e1b4b 52%, #701a75 88%, #0f172a 100%)",
+  },
 ];
 
 // ==================== 3. CURATED OPEN-SOURCE WALLPAPERS ====================
@@ -492,24 +516,96 @@ function translateWallpaperQuery(q) {
   return out.replace(/\s+/g, " ").trim();
 }
 
-// ==================== DOMESTIC DIRECT FULL-WEB ENGINES (BING CN 4K / LIVE GIF / WEB) ====================
+// ==================== OFFICIAL BING DAILY 4K UHD & FILTERED FULL-WEB 2K/4K ENGINES ====================
+const LOW_QUALITY_OR_HOTLINK_DOMAINS =
+  /(?:zhimg\.com|zhihu\.com|xhscdn\.com|xiaohongshu\.com|duitang\.com|sinaimg\.cn|hdslb\.com|bilibili\.com|toutiaoimg\.com|baijiahao|nipic\.com|photophoto\.cn|58pic\.com|699pic\.com|vcg\.com|huaban\.com)/i;
+
+let _bingOfficialUhdCache = { at: 0, items: [] };
+
+export async function fetchBingOfficialUhdWallpapers() {
+  if (_bingOfficialUhdCache.items.length && Date.now() - _bingOfficialUhdCache.at < 30 * 60 * 1000) {
+    return _bingOfficialUhdCache.items;
+  }
+  try {
+    const [batch0, batch1] = await Promise.all([
+      fetchJsonWithTimeout(
+        "https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=8&uhd=1&uhdwidth=3840&uhdheight=2160&mkt=zh-CN",
+        6000,
+        { "Accept-Language": "zh-CN,zh;q=0.9" },
+      ).catch(() => ({ images: [] })),
+      fetchJsonWithTimeout(
+        "https://cn.bing.com/HPImageArchive.aspx?format=js&idx=8&n=8&uhd=1&uhdwidth=3840&uhdheight=2160&mkt=zh-CN",
+        6000,
+        { "Accept-Language": "zh-CN,zh;q=0.9" },
+      ).catch(() => ({ images: [] })),
+    ]);
+
+    const seen = new Set();
+    const items = [];
+    for (const img of [...(batch0.images || []), ...(batch1.images || [])]) {
+      const base = String(img.urlbase || "").trim();
+      if (!base || seen.has(base)) continue;
+      seen.add(base);
+      const uhdRaw = `https://cn.bing.com${base}_UHD.jpg`;
+      const thumbRaw = `https://cn.bing.com${base}_1920x1080.jpg`;
+      const copyRaw = String(img.copyright || "").trim();
+      const copyMain = copyRaw.replace(/\s*\([^)]*\)\s*$/, "").trim();
+      const copyAuthor = copyRaw.match(/\(([^)]+)\)\s*$/)?.[1] || "Microsoft Bing UHD";
+      const title = String(img.title || copyMain || "必应每日 4K 精选").trim();
+      items.push({
+        id: `bing-uhd-${img.startdate || items.length}`,
+        name: title,
+        description: copyMain && copyMain !== title ? copyMain : copyAuthor,
+        author: "必应官方 4K UHD",
+        license: "3840×2160",
+        type: "image",
+        thumb: proxyImageUrl(thumbRaw),
+        url: proxyImageUrl(uhdRaw, thumbRaw),
+        resolution: "4K UHD",
+        tags: ["必应每日4K", "风景", "摄影", title, copyMain],
+      });
+    }
+    if (items.length) {
+      _bingOfficialUhdCache = { at: Date.now(), items };
+    }
+    return items;
+  } catch {
+    return _bingOfficialUhdCache.items || [];
+  }
+}
+
 function parseBingImageCards(html) {
   const out = [];
   const seen = new Set();
-  for (const m of html.matchAll(/m="(\{[^"]+\})"/g)) {
+  for (const m of html.matchAll(/m="(\{[^"]+\})"([\s\S]{0,420})/g)) {
     try {
       const obj = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&#39;/g, "'"));
-      const full = obj.bmurl || obj.murl;
+      const tail = m[2] || "";
+      const full = obj.murl || obj.bmurl;
       const thumb = obj.turl || obj.murl;
       if (!full || !thumb || !/^https?:\/\//i.test(full) || seen.has(full)) continue;
+      if (LOW_QUALITY_OR_HOTLINK_DOMAINS.test(full)) continue;
       seen.add(full);
+
+      const dimMatch = tail.match(/(\d{4})\s*[×x]\s*(\d{3,4})/i);
+      const w = dimMatch ? Number(dimMatch[1]) : 0;
+      const h = dimMatch ? Number(dimMatch[2]) : 0;
+      if (w > 0 && w < 1600) continue;
+      const resLabel = w >= 3800 ? "4K" : w >= 2500 ? "2K+" : w > 0 && h > 0 ? `${w}×${h}` : "HD";
+
+      const cleanTitle = String(obj.t || obj.desc || "全网超清壁纸")
+        .replace(/[-_|—]\s*(知乎|哔哩哔哩|小红书|堆糖|百度|搜狐|网易).*$/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 42);
+
       out.push({
-        id: `bing-${obj.cid || obj.md5 || out.length}`,
-        title: String(obj.t || obj.desc || "全网高清壁纸").replace(/\s+/g, " ").slice(0, 44),
+        id: `bing-${String(obj.cid || obj.md5 || out.length).replace(/[^A-Za-z0-9_-]/g, "")}`,
+        title: cleanTitle || "超清桌面壁纸",
         thumb,
         full,
-        murl: obj.murl || full,
-        bmurl: obj.bmurl || "",
+        murl: full,
+        resolution: resLabel,
       });
     } catch {}
   }
@@ -518,29 +614,29 @@ function parseBingImageCards(html) {
 
 async function searchBingWallpapers(q, pageNum = 1, category = "all") {
   const catKeywords = {
-    all: "4k 超清桌面壁纸 风景 动漫",
-    scenery: "自然风景 山水 4k 电脑壁纸",
-    anime: "二次元 动漫 唯美 4k 桌面壁纸",
+    all: "4k desktop wallpaper landscape scenery uhd",
+    scenery: "自然风景 雪山 极光 森林 4k 超清壁纸",
+    anime: "anime scenery aesthetic 4k wallpaper 唯美二次元壁纸",
   };
-  const kw = q ? `${q} 4k 壁纸` : (catKeywords[category] || catKeywords.all);
-  const first = (pageNum - 1) * 24;
+  const kw = q ? `${q} 4k 超清壁纸 wallpaper` : (catKeywords[category] || catKeywords.all);
+  const first = (pageNum - 1) * 28;
   const url =
     `https://cn.bing.com/images/async?q=${encodeURIComponent(kw)}` +
-    `&first=${first}&count=24&qft=+filterui:imagesize-wallpaper+filterui:aspect-wide&mmasync=1`;
+    `&first=${first}&count=28&qft=+filterui:imagesize-custom_2560_1440+filterui:aspect-wide&mmasync=1`;
   const html = await fetchTextWithTimeout(url, 8000, { "User-Agent": BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9" });
   const cards = parseBingImageCards(html);
   return {
     items: cards.map((c) => ({
       id: c.id,
       name: c.title,
-      author: "必应全网",
-      license: "高清宽屏",
+      author: "全网超清精选",
+      license: c.resolution || "2K/4K",
       type: "image",
       thumb: proxyImageUrl(c.thumb),
       url: proxyImageUrl(c.murl, c.thumb),
-      resolution: "HD",
+      resolution: c.resolution || "2K+",
     })),
-    hasMore: cards.length >= 12,
+    hasMore: cards.length >= 8,
   };
 }
 
@@ -748,13 +844,13 @@ export async function searchMcpStore(query = "", enginePref = "") {
       );
     }
   } else {
-    // Global Proxy Engine: Official MCP Registry + npmjs + GitHub API
+    // Global Proxy Engine: Official MCP Registry v0.1 (deduped latest versions) + npmjs + GitHub API
     tasks.push(
       (async () => {
         try {
           const regUrl = q
-            ? `https://registry.modelcontextprotocol.io/v0/servers?search=${encodeURIComponent(q)}&limit=18`
-            : `https://registry.modelcontextprotocol.io/v0/servers?limit=12`;
+            ? `https://registry.modelcontextprotocol.io/v0.1/servers?search=${encodeURIComponent(q)}&limit=20&version=latest`
+            : `https://registry.modelcontextprotocol.io/v0.1/servers?limit=16&version=latest`;
           const data = await fetchJsonWithTimeout(regUrl, 8000);
           for (const entry of data.servers || []) {
             const parsed = parseRegistryMcpEntry(entry);
@@ -1291,7 +1387,27 @@ export async function searchWallpaperStore(query = "", page = 1, category = "all
   const translated = translateWallpaperQuery(q);
   const engine = await resolveSearchEngine(enginePref);
 
-  // ==================== LIVE WALLPAPERS (12x 60fps + DOMESTIC BING LIVE GIF / PROXY WIKIMEDIA VIDEO) ====================
+  // ==================== OFFICIAL BING DAILY 4K UHD DEDICATED TAB ====================
+  if (category === "bing_uhd") {
+    const uhdAll = await fetchBingOfficialUhdWallpapers();
+    const ql = q.toLowerCase();
+    const filtered = ql
+      ? uhdAll.filter((w) => `${w.name} ${w.description || ""} ${(w.tags || []).join(" ")}`.toLowerCase().includes(ql))
+      : uhdAll;
+    return {
+      ok: true,
+      mode: "bing-official-uhd",
+      search_engine: engine,
+      page: 1,
+      last_page: 1,
+      total_online: filtered.length,
+      has_more: false,
+      items: filtered,
+      online_error: filtered.length ? "" : "暂未获取到必应官方每日 4K 壁纸，请检查网络连接",
+    };
+  }
+
+  // ==================== LIVE WALLPAPERS (14x 60fps + DOMESTIC BING LIVE GIF / PROXY WIKIMEDIA VIDEO) ====================
   if (category === "live") {
     const ql = q.toLowerCase();
     const localLive =
@@ -1414,7 +1530,11 @@ export async function searchWallpaperStore(query = "", page = 1, category = "all
     }
   }
 
-  const baseItems = pageNum === 1 && !q && category === "all" ? CURATED_WALLPAPERS : [];
+  const officialUhd =
+    pageNum === 1 && !q && (category === "all" || category === "scenery")
+      ? (await fetchBingOfficialUhdWallpapers()).slice(0, category === "scenery" ? 10 : 8)
+      : [];
+  const baseItems = pageNum === 1 && !q && category === "all" ? [...CURATED_WALLPAPERS, ...officialUhd] : officialUhd;
   return {
     ok: true,
     mode: q ? "online" : "curated+online",

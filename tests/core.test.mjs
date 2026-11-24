@@ -691,4 +691,145 @@ describe("OpenCode Studio Core Suite", () => {
       await new Promise((r) => interleavedRelay.close(r));
     }
   });
+
+  it("supports v2.2 zero-key web search parsers, built-in opencode_web MCP stdio server, WE pkg-video HTTP 206 & CEF Web shim", async () => {
+    // 1. Live Web Search RSS & DuckDuckGo HTML parsers
+    const { parseRssSearchItems, parseDuckDuckGoHtmlItems } = await import("../server/web_search.mjs");
+    const rssXml = `<?xml version="1.0" encoding="utf-8"?><rss><channel>
+      <item>
+        <title><![CDATA[Node.js 24 LTS Released]]></title>
+        <link>http://www.bing.com/news/apiclick.aspx?ref=FexRss&amp;url=https%3a%2f%2fnodejs.org%2fen%2fblog%2frelease</link>
+        <description><![CDATA[Official Node.js release notes &amp; performance highlights.]]></description>
+        <pubDate>Tue, 24 Nov 2026 10:00:00 GMT</pubDate>
+      </item>
+    </channel></rss>`;
+    const rssItems = parseRssSearchItems(rssXml, "bing_news");
+    assert.equal(rssItems.length, 1);
+    assert.equal(rssItems[0].title, "Node.js 24 LTS Released");
+    assert.equal(rssItems[0].url, "https://nodejs.org/en/blog/release");
+    assert.ok(rssItems[0].snippet.includes("Official Node.js release notes & performance"));
+
+    const ddgHtml = `
+      <div class="result">
+        <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fmodelcontextprotocol.io%2Fspecification">MCP Official Spec</a>
+        <a class="result__snippet">Model Context Protocol <b>open</b> standard.</a>
+      </div>`;
+    const ddgItems = parseDuckDuckGoHtmlItems(ddgHtml);
+    assert.equal(ddgItems.length, 1);
+    assert.equal(ddgItems[0].url, "https://modelcontextprotocol.io/specification");
+    assert.equal(ddgItems[0].snippet, "Model Context Protocol open standard.");
+
+    // 2. Built-in opencode_web MCP server mounts into Claude config when webSearchEnabled=true & answers JSON-RPC initialize + tools/list
+    const mcpOn = buildCustomPromptAndMcp(tmpWorkdir, "native", { webSearchEnabled: true });
+    assert.ok(mcpOn.mcpConfigPath, "must generate active_mcp_config.json when webSearchEnabled=true");
+    const mcpJson = JSON.parse(fs.readFileSync(mcpOn.mcpConfigPath, "utf8"));
+    assert.ok(mcpJson.mcpServers?.opencode_web, "must mount opencode_web MCP server");
+
+    const { spawn } = await import("node:child_process");
+    const mcpProc = spawn(process.execPath, [mcpJson.mcpServers.opencode_web.args[0]], {
+      env: { ...process.env, OPENCODE_DATA_DIR: tmpRoot },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const rpcLines = [];
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("MCP stdio timeout")), 5000);
+      let buf = "";
+      mcpProc.stdout.on("data", (chunk) => {
+        buf += chunk.toString("utf8");
+        let idx;
+        while ((idx = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (line) rpcLines.push(JSON.parse(line));
+          if (rpcLines.length >= 2) {
+            clearTimeout(timer);
+            resolve();
+          }
+        }
+      });
+      mcpProc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) + "\n");
+      mcpProc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }) + "\n");
+    });
+    mcpProc.kill();
+    assert.equal(rpcLines[0].result?.serverInfo?.name, "opencode_web");
+    const toolNames = (rpcLines[1].result?.tools || []).map((t) => t.name);
+    assert.deepEqual(toolNames, ["web_search", "web_read_page"]);
+
+    // 3. Curated 14 live wallpapers + favorite_wallpapers & web_search_enabled persistence
+    assert.equal(CURATED_WALLPAPERS.filter((w) => w.type === "live").length, 14);
+    assert.ok(CURATED_WALLPAPERS.some((w) => w.liveBg === "live-fireflies"));
+    assert.ok(CURATED_WALLPAPERS.some((w) => w.liveBg === "live-cybergrid"));
+
+    const favRes = await fetch(`${studioServer.url}/api/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        web_search_enabled: false,
+        favorite_wallpapers: [{ id: "fav-1", name: "测试收藏", type: "live", liveBg: "live-aurora" }],
+      }),
+    }).then((r) => r.json());
+    assert.equal(favRes.settings.web_search_enabled, false);
+    assert.equal(favRes.settings.favorite_wallpapers.length, 1);
+
+    // 4. Wallpaper Engine: PKGV single-embedded MP4 zero-copy HTTP 206 streaming + CEF Web Audio/Property shim injection
+    const weAdvDir = path.join(tmpWorkdir, "we_adv_431960");
+    const pkgVidDir = path.join(weAdvDir, "2001");
+    const webAudioDir = path.join(weAdvDir, "2002");
+    fs.mkdirSync(pkgVidDir, { recursive: true });
+    fs.mkdirSync(webAudioDir, { recursive: true });
+
+    // Build a valid PKGV archive with 1 embedded MP4 entry (ftypisom signature at offset +4, >200KB main video threshold)
+    const mp4Payload = Buffer.alloc(210_000, 0x22);
+    Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]).copy(mp4Payload, 0);
+    const verStr = Buffer.from("PKGV0002", "utf8");
+    const entryName = Buffer.from("materials/bg.mp4", "utf8");
+    const pkgHeader = Buffer.alloc(4 + verStr.length + 4 + 4 + entryName.length + 8);
+    let pos = 0;
+    pkgHeader.writeUInt32LE(verStr.length, pos); pos += 4;
+    verStr.copy(pkgHeader, pos); pos += verStr.length;
+    pkgHeader.writeUInt32LE(1, pos); pos += 4; // count = 1
+    pkgHeader.writeUInt32LE(entryName.length, pos); pos += 4;
+    entryName.copy(pkgHeader, pos); pos += entryName.length;
+    pkgHeader.writeUInt32LE(0, pos); pos += 4; // offset = 0
+    pkgHeader.writeUInt32LE(mp4Payload.length, pos); pos += 4; // length
+    fs.writeFileSync(path.join(pkgVidDir, "project.json"), JSON.stringify({ title: "Pkg Embedded 4K Video", type: "scene" }));
+    fs.writeFileSync(path.join(pkgVidDir, "scene.pkg"), Buffer.concat([pkgHeader, mp4Payload]));
+
+    // Build a Web wallpaper with user properties in project.json
+    fs.writeFileSync(
+      path.join(webAudioDir, "project.json"),
+      JSON.stringify({
+        title: "Audio Spectrum Web",
+        type: "web",
+        file: "index.html",
+        general: { properties: { speed: { value: 1.5 }, themeColor: { value: "0.2 0.6 1.0" } } },
+      }),
+    );
+    fs.writeFileSync(path.join(webAudioDir, "index.html"), "<!doctype html><html><head><title>WE</title></head><body>canvas</body></html>");
+
+    const authRes = await fetch(`${studioServer.url}/api/we/authorize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ add_dir: weAdvDir }),
+    }).then((r) => r.json());
+    assert.equal(authRes.ok, true);
+    const pkgItem = authRes.items.find((i) => i.title === "Pkg Embedded 4K Video");
+    const webItem = authRes.items.find((i) => i.title === "Audio Spectrum Web");
+    assert.ok(pkgItem && pkgItem.playable && pkgItem.play_mode === "video", "PKGV embedded MP4 should be unlocked as playable video");
+    assert.ok(webItem && webItem.playable && webItem.play_mode === "web");
+
+    // Verify HTTP 206 Byte-Range streaming from inside scene.pkg!
+    const rangeRes = await fetch(`${studioServer.url}${pkgItem.stream_url}`, {
+      headers: { Range: "bytes=4-11" },
+    });
+    assert.equal(rangeRes.status, 206);
+    const rangeBuf = Buffer.from(await rangeRes.arrayBuffer());
+    assert.equal(rangeBuf.toString("ascii"), "ftypisom");
+
+    // Verify CEF Web runtime shim injection in served HTML
+    const webHtml = await fetch(`${studioServer.url}${webItem.stream_url}`).then((r) => r.text());
+    assert.ok(webHtml.includes("wallpaperRegisterAudioListener"), "must inject WE audio spectrum shim");
+    assert.ok(webHtml.includes("applyUserProperties"), "must inject WE user properties listener hook");
+    assert.ok(webHtml.includes('"speed"'), "must pass project.json default property values");
+  });
 });

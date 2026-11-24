@@ -69,6 +69,9 @@
     _activeStaticSlot: "a",
     _bgSwapToken: 0,
     _liveRafId: null,
+    zenMode: false,
+    showAllMessages: false,
+    lastWpItems: [],
     wpCategory: "all",
     wpPage: 1,
     wpHasMore: false,
@@ -508,7 +511,50 @@
     }, 260);
   }
 
-  // ==================== SAFE GFM MARKDOWN ====================
+  // ==================== SAFE GFM MARKDOWN + ZERO-DEP SYNTAX HIGHLIGHTING ====================
+
+  const SYNTAX_TOKEN_RE =
+    /(\/\/[^\n]*|#[^\n]*|\/\*[\s\S]*?\*\/|<!--[\s\S]*?-->)|("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)|\b(async|await|break|case|catch|class|const|continue|def|default|delete|do|elif|else|enum|export|extends|false|finally|fn|for|from|func|function|if|impl|import|in|interface|let|loop|match|mod|mut|new|nil|None|null|package|pub|raise|return|select|self|static|struct|super|switch|then|this|throw|trait|true|try|type|typeof|undefined|use|var|void|where|while|with|yield|SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|LEFT|INNER|CREATE|TABLE|INDEX|AND|OR|NOT|NULL|AS|ORDER|GROUP|BY|LIMIT)\b|\b(0x[0-9a-fA-F]+|\d+(?:\.\d+)?(?:e[+-]?\d+)?)\b|\b([A-Z][A-Za-z0-9_]{1,})\b|\b([a-zA-Z_$][a-zA-Z0-9_$]*)(?=\s*\()/g;
+
+  const LANG_DOT_COLORS = {
+    js: "#f59e0b", javascript: "#f59e0b", mjs: "#f59e0b", cjs: "#f59e0b", jsx: "#f59e0b",
+    ts: "#3b82f6", typescript: "#3b82f6", tsx: "#3b82f6",
+    py: "#10b981", python: "#10b981",
+    rs: "#ea580c", rust: "#ea580c",
+    go: "#06b6d4", golang: "#06b6d4",
+    sh: "#22c55e", bash: "#22c55e", zsh: "#22c55e", powershell: "#38bdf8", ps1: "#38bdf8", cmd: "#94a3b8", bat: "#94a3b8",
+    json: "#eab308", yaml: "#ec4899", yml: "#ec4899", toml: "#ec4899",
+    html: "#f97316", css: "#8b5cf6", scss: "#ec4899", sql: "#6366f1", md: "#64748b", markdown: "#64748b",
+  };
+
+  function highlightCodeSyntax(rawCode, lang, skipHeavy = false) {
+    const cleanLang = String(lang || "text").toLowerCase();
+    if (skipHeavy || rawCode.length > 24000 || cleanLang === "text" || cleanLang === "txt" || cleanLang === "plaintext") {
+      return escHtml(rawCode);
+    }
+    let out = "";
+    let lastIdx = 0;
+    SYNTAX_TOKEN_RE.lastIndex = 0;
+    let m;
+    while ((m = SYNTAX_TOKEN_RE.exec(rawCode)) !== null) {
+      if (m.index > lastIdx) {
+        out += escHtml(rawCode.slice(lastIdx, m.index));
+      }
+      const tok = escHtml(m[0]);
+      if (m[1] !== undefined) out += `<span class="tok-com">${tok}</span>`;
+      else if (m[2] !== undefined) out += `<span class="tok-str">${tok}</span>`;
+      else if (m[3] !== undefined) out += `<span class="tok-kw">${tok}</span>`;
+      else if (m[4] !== undefined) out += `<span class="tok-num">${tok}</span>`;
+      else if (m[5] !== undefined) out += `<span class="tok-typ">${tok}</span>`;
+      else if (m[6] !== undefined) out += `<span class="tok-fn">${tok}</span>`;
+      else out += tok;
+      lastIdx = SYNTAX_TOKEN_RE.lastIndex;
+    }
+    if (lastIdx < rawCode.length) {
+      out += escHtml(rawCode.slice(lastIdx));
+    }
+    return out;
+  }
 
   function renderInlineMd(raw) {
     let s = escHtml(raw);
@@ -529,10 +575,10 @@
   const _mdCache = new Map();
   const MD_CACHE_MAX = 400;
 
-  function renderMarkdown(md) {
+  function renderMarkdown(md, isStreaming = false) {
     if (!md) return "";
     const str = String(md);
-    const cacheable = str.length <= 65536;
+    const cacheable = !isStreaming && str.length <= 65536;
     if (cacheable && _mdCache.has(str)) {
       const hit = _mdCache.get(str);
       _mdCache.delete(str);
@@ -553,12 +599,25 @@
           codeLines.push(lines[i]);
           i++;
         }
-        i++;
+        const closed = i < lines.length && /^```\s*$/.test(lines[i]);
+        if (closed) i++;
         const rawCode = codeLines.join("\n");
+        const lineCount = codeLines.length;
+        const skipSyntax = isStreaming && !closed && rawCode.length > 6000;
+        const codeHtml = highlightCodeSyntax(rawCode, lang, skipSyntax);
+        const dotColor = LANG_DOT_COLORS[lang.toLowerCase()] || "var(--brand)";
+        const collapsible = !isStreaming && lineCount > 32;
         out.push(
-          `<div class="md-code-block"><div class="md-code-head"><span>${escHtml(lang)}</span>` +
-            `<button class="md-code-copy" data-code="${encodeURIComponent(rawCode)}">复制代码</button></div>` +
-            `<pre><code>${escHtml(rawCode)}</code></pre></div>`,
+          `<div class="md-code-block${collapsible ? " is-collapsed" : ""}">` +
+            `<div class="md-code-head">` +
+              `<span class="md-code-lang"><span class="md-code-dot" style="background:${dotColor};"></span><span>${escHtml(lang)}</span><span class="md-code-lines">${lineCount} 行</span></span>` +
+              `<span class="md-code-actions"><button type="button" class="md-code-copy" data-code="${encodeURIComponent(rawCode)}">复制代码</button></span>` +
+            `</div>` +
+            `<pre><code>${codeHtml}</code></pre>` +
+            (collapsible
+              ? `<div class="md-code-expand-bar"><button type="button" class="md-code-toggle" data-lines="${lineCount}">展开全部 ${lineCount} 行代码 ▾</button></div>`
+              : "") +
+          `</div>`,
         );
         continue;
       }
@@ -1055,12 +1114,32 @@
 
   // ==================== TOOL CARDS & MESSAGE RENDERING ====================
 
+  function formatToolDisplay(name) {
+    const raw = String(name || "Tool");
+    if (raw === "web_search" || raw === "mcp__opencode_web__web_search" || raw === "WebSearch") {
+      return { label: "🌐 联网搜索", isWeb: true };
+    }
+    if (raw === "web_fetch" || raw === "mcp__opencode_web__web_read_page" || raw === "WebFetch") {
+      return { label: "🌐 网页精读", isWeb: true };
+    }
+    const mcpMatch = raw.match(/^mcp__([^_]+(?:_[^_]+)*?)__(.+)$/);
+    if (mcpMatch) {
+      return { label: `🔌 ${mcpMatch[1]}: ${mcpMatch[2]}`, isWeb: false };
+    }
+    return { label: raw, isWeb: false };
+  }
+
   function summarizeTool(name, input) {
     if (!input || typeof input !== "object") return "";
+    if (name === "web_search" || name === "mcp__opencode_web__web_search" || name === "WebSearch") {
+      return input.query || input.q || "";
+    }
+    if (name === "web_fetch" || name === "mcp__opencode_web__web_read_page" || name === "WebFetch") {
+      return input.url || "";
+    }
     if (name === "run_shell" || name === "Bash") return input.description || input.command || "";
     if (["read_file", "edit_file", "write_file", "Read", "Edit", "Write"].includes(name)) return input.file_path || input.path || "";
     if (name === "grep_search" || name === "glob_files") return `${input.pattern || ""} ${input.dir_path || ""}`.trim();
-    if (name === "web_fetch") return input.url || "";
     return JSON.stringify(input).slice(0, 90);
   }
 
@@ -1089,10 +1168,12 @@
     det.className = "tool-card" + (tool.is_error ? " is-error" : "");
     det.dataset.toolId = tool.id || "";
     const icon = status === "running" ? "◌" : status === "error" || tool.is_error ? "✕" : "✓";
+    const disp = formatToolDisplay(tool.name);
     det.innerHTML =
       `<summary><span class="tool-status ${status}">${icon}</span>` +
-      `<span class="tool-chip">${escHtml(tool.name || "Tool")}</span>` +
-      `<span class="tool-summary">${escHtml(summarizeTool(tool.name, tool.input))}</span></summary>`;
+      `<span class="tool-chip${disp.isWeb ? " is-web" : ""}">${escHtml(disp.label)}</span>` +
+      `<span class="tool-summary">${escHtml(summarizeTool(tool.name, tool.input))}</span>` +
+      `<span class="tool-chevron">▸</span></summary>`;
 
     let mounted = false;
     const mount = () => {
@@ -1260,7 +1341,9 @@
         const det = document.createElement("details");
         det.className = "thinking-card";
         det.open = false;
-        det.innerHTML = `<summary>思考过程（${String(blk.text || "").length} 字）</summary><div class="thinking-body">${escHtml(blk.text || "")}</div>`;
+        det.innerHTML =
+          `<summary><span class="thinking-chevron">▸</span><span>思考过程（${String(blk.text || "").length} 字）</span></summary>` +
+          `<div class="thinking-body">${escHtml(blk.text || "")}</div>`;
         wrap.appendChild(det);
       } else if (blk.type === "tool_use") {
         wrap.appendChild(createToolCardEl(blk, false));
@@ -1312,12 +1395,34 @@
     return wrap;
   }
 
+  const WINDOWED_MSG_THRESHOLD = 42;
+  const WINDOWED_MSG_INITIAL = 28;
+
+  function buildTimelineItemNode(item) {
+    if (item.role === "user") return createUserMsgEl(item);
+    if (item.role === "assistant") return createAssistantMsgEl(item, false);
+    if (item.role === "compact") {
+      const c = document.createElement("div");
+      c.className = "compact-divider";
+      c.id = item.id;
+      c.innerHTML =
+        `<div style="display:flex;justify-content:space-between;align-items:center;">` +
+          `<span><b>上下文压缩边界</b> · ${fmtClock(item.created_at)}</span>` +
+          `<button class="link-btn btn-sum">查看摘要</button>` +
+        `</div><div class="compact-summary hidden">${escHtml(item.content_text)}</div>`;
+      c.querySelector(".btn-sum").addEventListener("click", () => c.querySelector(".compact-summary").classList.toggle("hidden"));
+      return c;
+    }
+    return null;
+  }
+
   function renderConversation() {
     const box = $("messages-container");
     const welcomeEl = $("welcome-view");
     const tl = state.activeTimeline;
     const live = state.activeSessionId ? state.liveStream.get(state.activeSessionId) : null;
-    const hasItems = Boolean(tl?.items?.length);
+    const allItems = tl?.items || [];
+    const hasItems = allItems.length > 0;
 
     if (!hasItems && !live) {
       box.innerHTML = "";
@@ -1332,21 +1437,33 @@
     welcomeEl?.classList.add("hidden");
     $("welcome-resume-wrap")?.classList.add("hidden");
     const frag = document.createDocumentFragment();
-    for (const item of tl?.items || []) {
-      if (item.role === "user") frag.appendChild(createUserMsgEl(item));
-      else if (item.role === "assistant") frag.appendChild(createAssistantMsgEl(item, false));
-      else if (item.role === "compact") {
-        const c = document.createElement("div");
-        c.className = "compact-divider";
-        c.id = item.id;
-        c.innerHTML =
-          `<div style="display:flex;justify-content:space-between;align-items:center;">` +
-            `<span><b>上下文压缩边界</b> · ${fmtClock(item.created_at)}</span>` +
-            `<button class="link-btn btn-sum">查看摘要</button>` +
-          `</div><div class="compact-summary hidden">${escHtml(item.content_text)}</div>`;
-        c.querySelector(".btn-sum").addEventListener("click", () => c.querySelector(".compact-summary").classList.toggle("hidden"));
-        frag.appendChild(c);
-      }
+    const shouldWindow = !state.showAllMessages && allItems.length > WINDOWED_MSG_THRESHOLD;
+    const hiddenCount = shouldWindow ? allItems.length - WINDOWED_MSG_INITIAL : 0;
+    const visibleItems = shouldWindow ? allItems.slice(hiddenCount) : allItems;
+
+    if (hiddenCount > 0) {
+      const bar = document.createElement("div");
+      bar.className = "history-expand-bar";
+      bar.innerHTML =
+        `<button type="button" class="history-expand-btn" title="瞬时挂载本会话全部较早对话记录">` +
+          `<span>↑ 展开更早的 ${hiddenCount} 条对话（共 ${allItems.length} 条）</span>` +
+        `</button>`;
+      bar.querySelector("button").addEventListener("click", () => {
+        const sc = $("messages-scroll");
+        const prevHeight = sc.scrollHeight;
+        const prevTop = sc.scrollTop;
+        state.showAllMessages = true;
+        renderConversation();
+        requestAnimationFrame(() => {
+          sc.scrollTop = prevTop + (sc.scrollHeight - prevHeight);
+        });
+      });
+      frag.appendChild(bar);
+    }
+
+    for (const item of visibleItems) {
+      const node = buildTimelineItemNode(item);
+      if (node) frag.appendChild(node);
     }
 
     box.innerHTML = "";
@@ -1396,6 +1513,7 @@
             det.className = "thinking-card";
             det.open = true;
             const sum = document.createElement("summary");
+            sum.innerHTML = `<span class="thinking-chevron">▸</span><span class="thinking-lbl"></span>`;
             const body = document.createElement("div");
             body.className = "thinking-body";
             det.appendChild(sum);
@@ -1403,9 +1521,9 @@
           }
           if (det._lastText !== txt) {
             det._lastText = txt;
-            const sum = det.querySelector("summary");
+            const lbl = det.querySelector(".thinking-lbl") || det.querySelector("summary");
             const body = det.querySelector(".thinking-body");
-            if (sum) sum.textContent = `思考过程（${txt.length} 字）`;
+            if (lbl) lbl.textContent = `思考过程（${txt.length} 字）`;
             if (body) body.textContent = txt;
           }
           desired.push(det);
@@ -1451,7 +1569,7 @@
           if (div.className !== wantClass) div.className = wantClass;
           if (div._lastText !== txt) {
             div._lastText = txt;
-            div.innerHTML = renderMarkdown(txt);
+            div.innerHTML = renderMarkdown(txt, true);
           }
           desired.push(div);
         }
@@ -1525,6 +1643,7 @@
     saveDraft();
     state.activeSessionId = sid;
     state.editingMessageId = null;
+    state.showAllMessages = Boolean(opts.jumpMessageId);
     renderSessionList();
     updateRunningButtons();
     restoreDraft();
@@ -1668,20 +1787,25 @@
   function closeDrawer() {
     state.drawerOpen = false;
     closeAnimatedLayer($("right-drawer"), 260);
-    document.querySelectorAll(".seg-btn").forEach((b) => b.classList.remove("active"));
+    document.querySelectorAll(".seg-btn[data-tab]").forEach((b) => b.classList.remove("active"));
   }
 
   function syncDrawerTabs() {
     const t = state.drawerTab;
     document.querySelectorAll(".drawer-tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === t));
-    document.querySelectorAll(".seg-btn").forEach((b) => b.classList.toggle("active", state.drawerOpen && b.dataset.tab === t));
+    document.querySelectorAll(".seg-btn[data-tab]").forEach((b) => b.classList.toggle("active", state.drawerOpen && b.dataset.tab === t));
     $("drawer-panel-outline").classList.toggle("hidden", t !== "outline");
     $("drawer-panel-find").classList.toggle("hidden", t !== "find");
     $("drawer-panel-activity").classList.toggle("hidden", t !== "activity");
   }
 
   function jumpToElement(elOrId) {
-    const el = typeof elOrId === "string" ? document.getElementById(elOrId) : elOrId;
+    let el = typeof elOrId === "string" ? document.getElementById(elOrId) : elOrId;
+    if (!el && typeof elOrId === "string" && !state.showAllMessages && (state.activeTimeline?.items?.length || 0) > WINDOWED_MSG_THRESHOLD) {
+      state.showAllMessages = true;
+      renderConversation();
+      el = document.getElementById(elOrId);
+    }
     if (!el) return;
     let p = el.parentElement;
     while (p && p !== $("messages-container")) {
@@ -1773,7 +1897,12 @@
     $("thread-find-results").querySelectorAll(".find-item").forEach((el, i) => el.classList.toggle("active", i === state.findIndex));
     const m = state.findMatches[state.findIndex];
     if (m.toolId) {
-      const tEl = $("messages-container").querySelector(`[data-tool-id="${CSS.escape(m.toolId)}"]`);
+      let tEl = $("messages-container").querySelector(`[data-tool-id="${CSS.escape(m.toolId)}"]`);
+      if (!tEl && !state.showAllMessages && (state.activeTimeline?.items?.length || 0) > WINDOWED_MSG_THRESHOLD) {
+        state.showAllMessages = true;
+        renderConversation();
+        tEl = $("messages-container").querySelector(`[data-tool-id="${CSS.escape(m.toolId)}"]`);
+      }
       if (tEl) return jumpToElement(tEl);
     }
     jumpToElement(m.id);
@@ -1846,6 +1975,8 @@
       state.settings = msg.settings;
       if (keepPrompt !== undefined) state.settings.system_prompt = keepPrompt;
       applyAppearance(msg.settings.appearance);
+      syncWebSearchToggle();
+      syncFavoriteCountBadge();
       return;
     }
     if (t === "providers_updated") {
@@ -1968,11 +2099,42 @@
     }
   }
 
-  // ==================== SEND / EDIT-RESEND / UPLOAD ====================
+  // ==================== LIVE WEB SEARCH TOGGLE & SEND / EDIT-RESEND / UPLOAD ====================
+
+  function isWebSearchEnabled() {
+    return state.settings?.web_search_enabled !== false;
+  }
+
+  function syncWebSearchToggle() {
+    const btn = $("btn-toggle-websearch");
+    if (!btn) return;
+    const on = isWebSearchEnabled();
+    btn.classList.toggle("is-on", on);
+    btn.title = on
+      ? "实时联网搜索已开启（免 Key 双引擎检索最新网页与新闻 · 点击可关闭）"
+      : "实时联网搜索已关闭（点击开启，或输入 /web 关键词 单次触发）";
+  }
+
+  async function toggleWebSearch() {
+    const next = !isWebSearchEnabled();
+    state.settings.web_search_enabled = next;
+    syncWebSearchToggle();
+    toast(next ? "🌐 已开启实时联网搜索增强（支持任意模型免 Key 查最新资料）" : "已关闭实时联网搜索");
+    try {
+      const res = await apiJson("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify({ web_search_enabled: next }),
+      });
+      if (res?.settings) {
+        state.settings.web_search_enabled = res.settings.web_search_enabled;
+        syncWebSearchToggle();
+      }
+    } catch {}
+  }
 
   function sendCurrentMessage() {
     if (!state.wsConnected) return toast("正在重连后端服务…");
-    const text = $("composer-input").value.trim();
+    let text = $("composer-input").value.trim();
     const images = state.attachments.slice();
     if (!text && !images.length) return;
     if (text === "/clear") {
@@ -1980,6 +2142,21 @@
       autoResizeComposer();
       saveDraft();
       return startNewSession();
+    }
+    if (text === "/web") {
+      $("composer-input").value = "";
+      autoResizeComposer();
+      saveDraft();
+      return toggleWebSearch();
+    }
+
+    let forceWeb = false;
+    if (/^\/web\s+/i.test(text)) {
+      const query = text.replace(/^\/web\s+/i, "").trim();
+      if (query) {
+        forceWeb = true;
+        text = `请优先调用联网搜索工具检索关于「${query}」的最新权威网页信息并整理回答：${query}`;
+      }
     }
 
     const prov = getSelectedProvider();
@@ -2002,6 +2179,7 @@
       provider_id: prov?.id || "",
       model,
       thinking_level: thinking,
+      web_search: forceWeb || isWebSearchEnabled(),
     }));
   }
 
@@ -2018,6 +2196,7 @@
       provider_id: prov?.id || "",
       model,
       thinking_level: thinking,
+      web_search: isWebSearchEnabled(),
     }));
     toast("已创建新分支并重新发送");
   }
@@ -2037,6 +2216,7 @@
       provider_id: prov?.id || "",
       model,
       thinking_level: thinking,
+      web_search: isWebSearchEnabled(),
     }));
     toast("正在重新生成回复（旧版本将作为分支保留）…");
   }
@@ -2157,6 +2337,7 @@
     if (slash) {
       const q = slash[1].toLowerCase();
       const cmds = [
+        { label: "/web", desc: "使用实时联网搜索查询最新信息并回答", insert: "/web" },
         { label: "/compact", desc: "压缩当前长对话上下文", insert: "/compact" },
         { label: "/clear", desc: "开启新会话", insert: "/clear" },
         ...state.installedSkills.filter((s) => s.enabled).map((s) => ({
@@ -2583,14 +2764,17 @@
       for (const m of items) {
         const card = document.createElement("div");
         card.className = "store-card";
+        const isInstalled = state.installedMcps.some((x) => (m.id && x.source_id === m.id) || x.name === m.name);
         const isOfficial = Boolean(m.featured || (m.tags || []).includes("official"));
         const isRemote = m.command === "http" || m.command === "sse" || m.badge === "远程";
-        const badgeText = isOfficial
-          ? "官方精选"
-          : isRemote
-            ? "远程直连"
-            : m.badge || (m.tags || [])[0] || "开源";
-        const badgeCls = isOfficial ? "is-official" : isRemote ? "is-remote" : "";
+        const badgeText = isInstalled
+          ? "✓ 已安装"
+          : isOfficial
+            ? "官方精选"
+            : isRemote
+              ? "远程直连"
+              : m.badge || (m.tags || [])[0] || "开源";
+        const badgeCls = isInstalled ? "is-installed" : isOfficial ? "is-official" : isRemote ? "is-remote" : "";
         const descText =
           (m.description && m.description.trim()) ||
           `公开 MCP 扩展工具服务（${m.command === "http" || m.command === "sse" ? "远程直连" : m.command}），一键安装后即可供 Claude Code 调用。`;
@@ -2602,7 +2786,7 @@
           `<div class="store-card-desc" title="${escHtml(descText)}">${escHtml(descText)}</div>` +
           `<div class="store-card-foot">` +
             (m.repo_url ? `<a class="link-btn" href="${escHtml(m.repo_url)}" target="_blank">源码仓库 ↗</a>` : `<span></span>`) +
-            `<button class="btn-primary sm btn-install">一键安装启用</button>` +
+            `<button class="${isInstalled ? "btn-secondary" : "btn-primary"} sm btn-install">${isInstalled ? "重新配置/更新" : "一键安装启用"}</button>` +
           `</div>`;
         card.querySelector(".btn-install").addEventListener("click", async () => {
           const args = (m.args || []).map((a) => a.replace("${WORKSPACE_DIR}", state.activeCwd || state.settings.default_cwd || "."));
@@ -2677,9 +2861,10 @@
       for (const s of items) {
         const card = document.createElement("div");
         card.className = "store-card";
+        const isInstalled = state.installedSkills.some((x) => (s.slug && x.slug === s.slug) || x.name === s.name);
         const isOfficial = s.badge === "官方" || String(s.id || "").startsWith("anth-skill-") || String(s.id || "").startsWith("skill-");
-        const badgeText = isOfficial ? "官方" : s.badge || `/${(s.slug || "skill").slice(0, 12)}`;
-        const badgeCls = isOfficial ? "is-official" : "";
+        const badgeText = isInstalled ? "✓ 已安装" : isOfficial ? "官方" : s.badge || `/${(s.slug || "skill").slice(0, 12)}`;
+        const badgeCls = isInstalled ? "is-installed" : isOfficial ? "is-official" : "";
         const descText =
           (s.description && s.description.trim()) ||
           `公开 Agent 扩展技能（安装后支持 /${s.slug || "skill"} 调用），点击自动拉取 SKILL.md 并启用。`;
@@ -2691,7 +2876,7 @@
           `<div class="store-card-desc" title="${escHtml(descText)}">${escHtml(descText)}</div>` +
           `<div class="store-card-foot">` +
             (s.source_url ? `<a class="link-btn" href="${escHtml(s.source_url)}" target="_blank">开源仓库 ↗</a>` : `<span></span>`) +
-            `<button class="btn-primary sm btn-dl">下载并启用</button>` +
+            `<button class="${isInstalled ? "btn-secondary" : "btn-primary"} sm btn-dl">${isInstalled ? "更新重装" : "下载并启用"}</button>` +
           `</div>`;
         card.querySelector(".btn-dl").addEventListener("click", async () => {
           toast(`正在下载 Skill：${s.name}…`);
@@ -2704,6 +2889,186 @@
     } catch (err) {
       if (seq !== skillReqSeq) return;
       el.innerHTML = `<div class="muted-text" style="color:var(--err);">Skills 联网搜索失败：${escHtml(err.message)}</div>`;
+    }
+  }
+
+  // ==================== LAZY MEDIA OBSERVER, WALLPAPER FAVORITES, RANDOM & ZEN SHOWCASE ====================
+
+  const _wpThumbObserver = typeof IntersectionObserver === "function"
+    ? new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            const el = entry.target;
+            if (el.tagName === "VIDEO") {
+              if (entry.isIntersecting) {
+                if (el.dataset.lazySrc && !el.getAttribute("src")) {
+                  el.setAttribute("src", el.dataset.lazySrc);
+                }
+                el.play().catch(() => {});
+              } else {
+                el.pause();
+              }
+            } else if (entry.isIntersecting) {
+              const bgSrc = el.dataset.bgSrc;
+              if (bgSrc) {
+                el.style.backgroundImage = `url("${bgSrc.replace(/"/g, '\\"')}")`;
+                delete el.dataset.bgSrc;
+              }
+              el.classList.remove("is-lazy");
+              _wpThumbObserver.unobserve(el);
+            }
+          }
+        },
+        { rootMargin: "200px 0px" },
+      )
+    : null;
+
+  function observeLazyThumb(thumbEl, imgUrl, eager = false) {
+    if (!thumbEl || !imgUrl) return;
+    if (eager || !_wpThumbObserver) {
+      thumbEl.style.backgroundImage = `url("${imgUrl.replace(/"/g, '\\"')}")`;
+      return;
+    }
+    thumbEl.classList.add("is-lazy");
+    thumbEl.dataset.bgSrc = imgUrl;
+    _wpThumbObserver.observe(thumbEl);
+  }
+
+  function observeLazyVideo(vidEl, srcUrl) {
+    if (!vidEl || !srcUrl) return;
+    if (!_wpThumbObserver) {
+      vidEl.setAttribute("src", srcUrl);
+      return;
+    }
+    vidEl.dataset.lazySrc = srcUrl;
+    _wpThumbObserver.observe(vidEl);
+  }
+
+  function getFavoriteWallpapers() {
+    return Array.isArray(state.settings?.favorite_wallpapers) ? state.settings.favorite_wallpapers : [];
+  }
+
+  function getWallpaperFavKey(w) {
+    if (!w || w.type === "none") return "";
+    if (w.type === "live") return `live:${w.liveBg}`;
+    return `${w.type || w.play_mode || "image"}:${w.url || w.stream_url || w.id || ""}`;
+  }
+
+  function isWallpaperFavorited(w) {
+    const key = getWallpaperFavKey(w);
+    if (!key) return false;
+    return getFavoriteWallpapers().some((item) => getWallpaperFavKey(item) === key);
+  }
+
+  function syncFavoriteCountBadge() {
+    const cnt = getFavoriteWallpapers().length;
+    const el = $("wp-fav-count");
+    if (!el) return;
+    el.textContent = String(cnt);
+    el.classList.toggle("hidden", cnt <= 0);
+  }
+
+  function toggleFavoriteWallpaper(w, btnEl) {
+    const key = getWallpaperFavKey(w);
+    if (!key) return;
+    const list = getFavoriteWallpapers().slice();
+    const idx = list.findIndex((item) => getWallpaperFavKey(item) === key);
+    let added = false;
+    if (idx >= 0) {
+      list.splice(idx, 1);
+    } else {
+      added = true;
+      list.unshift({
+        id: w.id || key,
+        name: w.name || w.title || "收藏壁纸",
+        type: w.type || w.play_mode || "image",
+        url: w.url || w.stream_url || "",
+        thumb: w.thumb || w.preview_url || w.url || "",
+        liveBg: w.liveBg || "",
+        preview_css: w.preview_css || "",
+        resolution: w.resolution || "",
+        author: w.author || w.source_label || "",
+        license: w.license || "",
+        description: w.description || "",
+      });
+    }
+    state.settings.favorite_wallpapers = list.slice(0, 200);
+    syncFavoriteCountBadge();
+    if (btnEl) {
+      btnEl.classList.toggle("is-fav", added);
+      btnEl.textContent = added ? "♥" : "♡";
+      btnEl.title = added ? "取消收藏" : "收藏此壁纸";
+    }
+    apiJson("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify({ favorite_wallpapers: state.settings.favorite_wallpapers }),
+    }).catch(() => {});
+    toast(added ? `❤️ 已收藏壁纸：${w.name || w.title}` : "已移出我的收藏");
+    if (!added && state.wpCategory === "favorites" && !$("modal-stores")?.classList.contains("hidden")) {
+      searchWallpapers("", 1, false);
+    }
+  }
+
+  function applyWallpaperItem(w) {
+    if (!w) return;
+    const title = w.name || w.title || "精选壁纸";
+    if (w.type === "live") {
+      updateAppearance({ bgType: "live", liveBg: w.liveBg, bgUrl: "", bgName: title });
+    } else if (w.type === "video" || w.play_mode === "video") {
+      updateAppearance({ bgType: "video", bgUrl: w.url || w.stream_url || "", liveBg: "", bgName: title });
+    } else if (w.type === "web" || w.play_mode === "web") {
+      updateAppearance({ bgType: "web", bgUrl: w.url || w.stream_url || "", liveBg: "", bgMode: "hd", bgBlur: 0, bgName: title });
+    } else {
+      updateAppearance({ bgType: w.type === "gif" ? "image" : (w.type || "image"), bgUrl: w.url || w.stream_url || "", liveBg: "", bgName: title });
+    }
+    const zenTitle = $("zen-wp-title");
+    if (zenTitle) zenTitle.textContent = title;
+  }
+
+  async function applyRandomWallpaper() {
+    let pool = [
+      ...(state.lastWpItems || []).filter((w) => w && w.type !== "none"),
+      ...getFavoriteWallpapers(),
+      ...((state.weLibrary?.items || []).filter((i) => i.playable && i.stream_url)),
+    ];
+    if (!pool.length) {
+      try {
+        const res = await apiJson(`/api/stores/wallpapers?category=all&page=1&engine=${encodeURIComponent(getSearchEngineMode())}`);
+        state.lastWpItems = res.items || [];
+        pool = state.lastWpItems.filter((w) => w && w.type !== "none");
+      } catch {}
+    }
+    if (!pool.length) return toast("暂无可用壁纸池");
+    const ap = state.settings.appearance || {};
+    const curId = ap.bgType === "live" ? ap.liveBg : ap.bgUrl;
+    const candidates = pool.filter((w) => (w.liveBg || w.url || w.stream_url) !== curId);
+    const chosen = (candidates.length ? candidates : pool)[Math.floor(Math.random() * (candidates.length || pool.length))];
+    applyWallpaperItem(chosen);
+    toast(`🎲 已随机切换壁纸：${chosen.name || chosen.title || "高清壁纸"}`);
+  }
+
+  function toggleZenWallpaperMode(forceState) {
+    const next = typeof forceState === "boolean" ? forceState : !state.zenMode;
+    if (next) {
+      const ap = state.settings.appearance || {};
+      const hasBg = ap.bgType && ap.bgType !== "none" && (ap.bgUrl || ap.liveBg);
+      if (!hasBg) {
+        updateAppearance({ bgType: "live", liveBg: "live-aurora", bgUrl: "", bgName: "极光流影 · 动态 60fps" });
+        toast("已为您自动点亮「极光流影」动态壁纸并进入沉浸赏析", 2800);
+      }
+      state.zenMode = true;
+      document.body.classList.add("zen-wallpaper-mode");
+      const titleEl = $("zen-wp-title");
+      if (titleEl) {
+        const curName = state.settings.appearance?.bgName || (state.settings.appearance?.bgType === "web" ? "Web 互动壁纸（可直接移动鼠标交互）" : "沉浸壁纸赏析");
+        titleEl.textContent = curName;
+      }
+      openAnimatedLayer($("zen-exit-bar"));
+    } else {
+      if (!state.zenMode) return;
+      state.zenMode = false;
+      document.body.classList.remove("zen-wallpaper-mode");
+      closeAnimatedLayer($("zen-exit-bar"), 200);
     }
   }
 
@@ -2776,22 +3141,36 @@
       return;
     }
     const ap = state.settings.appearance || {};
-    const buildWeCard = (it) => {
+    const buildWeCard = (it, idx = 0) => {
       const isActive = Boolean(it.playable && it.stream_url && ap.bgUrl === it.stream_url);
       const card = document.createElement("div");
       card.className = "wp-card" + (isActive ? " active" : "") + (!it.playable ? " we-card-locked" : "");
-      const thumbHtml =
-        it.we_type === "video" && !it.preview_url.includes("kind=preview")
-          ? `<div class="wp-thumb"><video class="wp-thumb-vid" src="${escHtml(it.stream_url)}#t=0.5" muted playsinline preload="metadata"></video><span class="wp-live-badge">${escHtml(it.badge)}</span></div>`
-          : `<div class="wp-thumb" style="background-image:url('${escHtml(it.preview_url || it.stream_url)}')">` +
-              `<span class="wp-live-badge">${escHtml(it.badge)}</span>` +
-            `</div>`;
+      const isDirectVideoThumb = it.we_type === "video" && !it.preview_url.includes("kind=preview");
+      const favHtml = it.playable
+        ? `<button type="button" class="wp-fav-btn${isWallpaperFavorited(it) ? " is-fav" : ""}" title="${isWallpaperFavorited(it) ? "取消收藏" : "收藏此壁纸"}">${isWallpaperFavorited(it) ? "♥" : "♡"}</button>`
+        : "";
+      const thumbHtml = isDirectVideoThumb
+        ? `<div class="wp-thumb">${favHtml}<video class="wp-thumb-vid" muted loop playsinline preload="metadata"></video><span class="wp-live-badge">${escHtml(it.badge)}</span></div>`
+        : `<div class="wp-thumb">${favHtml}<span class="wp-live-badge">${escHtml(it.badge)}</span></div>`;
       card.innerHTML =
         thumbHtml +
         `<div class="wp-meta"><div class="wp-name">${escHtml(it.title)}</div>` +
         `<div class="wp-sub">${escHtml(it.source_label || "Wallpaper Engine")} · ${escHtml(it.description || "")}</div></div>`;
 
-      card.addEventListener("click", () => {
+      const thumbEl = card.querySelector(".wp-thumb");
+      if (isDirectVideoThumb) {
+        observeLazyVideo(card.querySelector("video"), `${it.stream_url}#t=0.5`);
+      } else {
+        observeLazyThumb(thumbEl, it.preview_url || it.stream_url, idx < 6);
+      }
+
+      card.querySelector(".wp-fav-btn")?.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        toggleFavoriteWallpaper(it, ev.currentTarget);
+      });
+
+      card.addEventListener("click", (ev) => {
+        if (ev.target.closest(".wp-fav-btn")) return;
         if (it.playable && it.stream_url) {
           // 100% lossless independent playback — NEVER touches Windows desktop wallpaper!
           updateAppearance({ bgType: it.play_mode, bgUrl: it.stream_url, liveBg: "", bgMode: "hd", bgBlur: 0, bgName: it.title });
@@ -2816,7 +3195,7 @@
         `当前已授权目录内暂无可直接 0 损耗独立播放的 <b>视频 (Video)</b> 或 <b>网页 (Web)</b> 壁纸。请在 Steam 小红车创意工坊左侧筛选勾选 <b>「类型：视频」</b> 或 <b>「类型：网页」</b> 订阅下载后点击「🔄 刷新」。`;
       grid.appendChild(hint);
     } else {
-      for (const it of playableItems) grid.appendChild(buildWeCard(it));
+      playableItems.forEach((it, idx) => grid.appendChild(buildWeCard(it, idx)));
     }
 
     if (lockedItems.length) {
@@ -2826,7 +3205,7 @@
         `<summary>已折叠 ${lockedItems.length} 个小红车专有 DirectX 3D (.pkg) 项目（专有格式无法脱离小红车无损独立渲染）</summary>` +
         `<div class="wp-grid" style="margin-top:8px;"></div>`;
       const subGrid = det.querySelector(".wp-grid");
-      for (const it of lockedItems) subGrid.appendChild(buildWeCard(it));
+      lockedItems.forEach((it, idx) => subGrid.appendChild(buildWeCard(it, idx + 8)));
       grid.appendChild(det);
     }
   }
@@ -2870,42 +3249,58 @@
   }
 
   let wpReqSeq = 0;
-  function buildWallpaperCard(w, grid) {
+  function buildWallpaperCard(w, grid, idx = 0) {
     const ap = state.settings.appearance || {};
     const isActive =
       (w.type === "none" && (!ap.bgType || ap.bgType === "none")) ||
       (w.type === "live" && ap.bgType === "live" && ap.liveBg === w.liveBg) ||
-      (w.url && (ap.bgUrl === w.url || ap.sourceUrl === w.url));
+      ((w.url || w.stream_url) && (ap.bgUrl === (w.url || w.stream_url) || ap.sourceUrl === w.url));
     const card = document.createElement("div");
     card.className = "wp-card" + (isActive ? " active" : "");
-    const thumbStyle = w.preview_css ? `background:${w.preview_css}` : `background-image:url('${escHtml(w.thumb || w.url)}')`;
+    const inlineCss = w.preview_css ? `background:${w.preview_css}` : "";
+    const favable = w.type !== "none";
+    const isFav = favable && isWallpaperFavorited(w);
+    const favHtml = favable
+      ? `<button type="button" class="wp-fav-btn${isFav ? " is-fav" : ""}" title="${isFav ? "取消收藏" : "收藏此壁纸"}">${isFav ? "♥" : "♡"}</button>`
+      : "";
     const badgeHtml =
       w.type === "live"
-        ? `<span class="wp-live-badge">✨ 60fps 动态</span>`
+        ? `<span class="wp-live-badge">✨ 高刷动态</span>`
         : w.type === "video"
-          ? `<span class="wp-live-badge">🎬 在线动态视频</span>`
-          : w.type === "gif"
-            ? `<span class="wp-live-badge">✨ 全网动态 GIF</span>`
-            : w.resolution
-              ? `<span class="wp-res-badge">${escHtml(w.resolution)}</span>`
-              : "";
+          ? `<span class="wp-live-badge">🎬 动态视频</span>`
+          : w.type === "web"
+            ? `<span class="wp-live-badge">✨ Web 互动</span>`
+            : w.type === "gif"
+              ? `<span class="wp-live-badge">✨ 动态 GIF</span>`
+              : w.resolution
+                ? `<span class="wp-res-badge">${escHtml(w.resolution)}</span>`
+                : "";
     const subText = w.description
       ? `${w.description}`
       : `${w.license || "Open"} · ${w.author || ""}`;
     card.innerHTML =
-      `<div class="wp-thumb" style="${thumbStyle}">${badgeHtml}</div>` +
-      `<div class="wp-meta"><div class="wp-name">${escHtml(w.name)}</div><div class="wp-sub">${escHtml(subText)}</div></div>`;
-    card.addEventListener("click", () => {
-      if (w.type === "live") {
-        updateAppearance({ bgType: "live", liveBg: w.liveBg, bgUrl: "", bgName: w.name });
-      } else if (w.type === "video") {
-        updateAppearance({ bgType: "video", bgUrl: w.url || "", liveBg: "", bgName: w.name });
+      `<div class="wp-thumb"${inlineCss ? ` style="${inlineCss}"` : ""}>${favHtml}${badgeHtml}</div>` +
+      `<div class="wp-meta"><div class="wp-name">${escHtml(w.name || w.title || "壁纸")}</div><div class="wp-sub" title="${escHtml(subText)}">${escHtml(subText)}</div></div>`;
+
+    if (!w.preview_css && (w.thumb || w.url)) {
+      observeLazyThumb(card.querySelector(".wp-thumb"), w.thumb || w.url, idx < 8);
+    }
+
+    card.querySelector(".wp-fav-btn")?.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      toggleFavoriteWallpaper(w, ev.currentTarget);
+    });
+
+    card.addEventListener("click", (ev) => {
+      if (ev.target.closest(".wp-fav-btn")) return;
+      if (w.type === "none") {
+        updateAppearance({ bgType: "none", bgUrl: "", liveBg: "", bgName: "" });
       } else {
-        updateAppearance({ bgType: w.type === "gif" ? "image" : w.type, bgUrl: w.url || "", liveBg: "", bgName: w.name });
+        applyWallpaperItem(w);
       }
       grid.querySelectorAll(".wp-card").forEach((c) => c.classList.remove("active"));
       card.classList.add("active");
-      toast(`已应用背景：${w.name}`);
+      toast(`已应用背景：${w.name || w.title}`);
     });
     return card;
   }
@@ -2916,10 +3311,34 @@
     const metaEl = $("wp-search-meta");
     const moreBtn = $("btn-wp-load-more");
     const cat = state.wpCategory || "all";
+    syncFavoriteCountBadge();
+
+    if (cat === "favorites" && !q) {
+      state.wpPage = 1;
+      state.wpHasMore = false;
+      moreBtn?.classList.add("hidden");
+      const favs = getFavoriteWallpapers();
+      grid.innerHTML = "";
+      if (!favs.length) {
+        grid.innerHTML = `<div class="muted-text" style="grid-column:1/-1;white-space:normal;">尚未收藏任何壁纸。悬停任意壁纸卡片左上角点击「♡」即可加入我的收藏（离线快速切换）！</div>`;
+        if (metaEl) metaEl.textContent = "0 张收藏";
+      } else {
+        favs.forEach((w, idx) => grid.appendChild(buildWallpaperCard(w, grid, idx)));
+        if (metaEl) metaEl.textContent = `已收藏 ${favs.length} 张壁纸`;
+      }
+      return;
+    }
 
     if (!append) {
       state.wpPage = 1;
-      grid.innerHTML = `<div class="muted-text">${q ? `正在实时联网搜索「${escHtml(q)}」${cat === "live" ? "动态壁纸与在线循环视频" : "海量 4K 壁纸"}…` : cat === "live" ? "正在加载 12 套 60fps 动态壁纸与在线开源动态视频…" : "正在加载精选与热门 4K 壁纸…"}</div>`;
+      const loadingHint = q
+        ? `正在实时联网搜索「${escHtml(q)}」${cat === "live" ? "动态壁纸与循环视频" : "海量 4K 壁纸"}…`
+        : cat === "bing_uhd"
+          ? "正在拉取微软必应官方每日 4K UHD (3840×2160) 原版壁纸…"
+          : cat === "live"
+            ? "正在加载 14 款高刷动态壁纸与在线开源循环视频…"
+            : "正在加载精选与微软必应 4K UHD 壁纸…";
+      grid.innerHTML = `<div class="muted-text">${loadingHint}</div>`;
       if (metaEl) metaEl.textContent = "检索中…";
       moreBtn?.classList.add("hidden");
     } else if (moreBtn) {
@@ -2936,12 +3355,13 @@
       if (!append) grid.innerHTML = "";
 
       const items = data.items || [];
+      state.lastWpItems = append ? [...(state.lastWpItems || []), ...items] : items;
       if (!items.length && !append) {
         grid.innerHTML = `<div class="muted-text">未搜索到匹配壁纸${data.online_error ? `（${escHtml(data.online_error)}）` : "，试试「星空」「极光」「海洋」「樱花」「赛博」或英文关键词"}。</div>`;
       } else {
-        for (const w of items) {
-          grid.appendChild(buildWallpaperCard(w, grid));
-        }
+        items.forEach((w, idx) => {
+          grid.appendChild(buildWallpaperCard(w, grid, append ? idx + 12 : idx));
+        });
       }
 
       state.wpPage = data.page || page;
@@ -2952,8 +3372,10 @@
         moreBtn.classList.toggle("hidden", !state.wpHasMore);
       }
       if (metaEl) {
-        if (cat === "live") {
-          metaEl.textContent = `当前已加载 ${grid.children.length} 个动态壁纸（60fps + 在线视频）${data.online_error ? ` · ${data.online_error}` : ""}`;
+        if (cat === "bing_uhd") {
+          metaEl.textContent = `必应官方每日 4K UHD 原图 · 共 ${grid.children.length} 张`;
+        } else if (cat === "live") {
+          metaEl.textContent = `当前已加载 ${grid.children.length} 个动态壁纸（14款内置 + 在线视频）${data.online_error ? ` · ${data.online_error}` : ""}`;
         } else if (data.total_online > 0) {
           metaEl.textContent = `在线共 ${Number(data.total_online).toLocaleString()} 张 4K 壁纸（第 ${state.wpPage}/${data.last_page || 1} 页）`;
         } else if (data.online_error) {
@@ -3470,6 +3892,9 @@
     $("btn-open-providers").addEventListener("click", () => openProvidersModal());
     $("btn-open-stores").addEventListener("click", () => openStoresModal("mcp"));
     $("btn-export-md")?.addEventListener("click", exportCurrentSessionMarkdown);
+    $("btn-zen-wallpaper")?.addEventListener("click", () => toggleZenWallpaperMode());
+    $("btn-zen-exit")?.addEventListener("click", () => toggleZenWallpaperMode(false));
+    $("btn-zen-random")?.addEventListener("click", () => applyRandomWallpaper());
     $("btn-quick-bg").addEventListener("click", () => openStoresModal("wallpapers"));
     $("btn-open-memory").addEventListener("click", openMemoryModal);
     $("btn-open-settings").addEventListener("click", openSettingsModal);
@@ -3519,6 +3944,7 @@
         }).catch(() => {});
       }
     });
+    $("btn-toggle-websearch")?.addEventListener("click", toggleWebSearch);
     $("btn-quick-compact").addEventListener("click", () => {
       if (!state.activeSessionId) return toast("当前为空白新会话");
       $("composer-input").value = "/compact";
@@ -3575,10 +4001,22 @@
       if (state.activeSessionId && state.wsConnected) state.ws.send(JSON.stringify({ type: "stop_turn", session_id: state.activeSessionId }));
     });
 
-    // Code copy delegation
+    // Code copy & collapsible long code blocks delegation
     $("messages-container").addEventListener("click", (ev) => {
       const btn = ev.target.closest(".md-code-copy");
-      if (btn) copyText(decodeURIComponent(btn.dataset.code || ""), "已复制代码");
+      if (btn) {
+        copyText(decodeURIComponent(btn.dataset.code || ""), "已复制代码");
+        return;
+      }
+      const toggleBtn = ev.target.closest(".md-code-toggle");
+      if (toggleBtn) {
+        const block = toggleBtn.closest(".md-code-block");
+        if (block) {
+          const collapsed = block.classList.toggle("is-collapsed");
+          const n = toggleBtn.dataset.lines || "";
+          toggleBtn.textContent = collapsed ? `展开全部 ${n} 行代码 ▾` : "收起代码 ▴";
+        }
+      }
     });
 
     // Scroll bottom (rAF throttled for 60fps over 4K wallpapers)
@@ -3594,7 +4032,7 @@
     $("btn-scroll-bottom").addEventListener("click", () => scrollToBottom(true));
 
     // Drawer
-    document.querySelectorAll(".seg-btn").forEach((b) =>
+    document.querySelectorAll(".seg-btn[data-tab]").forEach((b) =>
       b.addEventListener("click", () => (state.drawerOpen && state.drawerTab === b.dataset.tab ? closeDrawer() : openDrawer(b.dataset.tab))),
     );
     document.querySelectorAll(".drawer-tab").forEach((b) =>
@@ -3936,6 +4374,7 @@
     $("btn-search-wp").addEventListener("click", () => {
       searchWallpapers($("wp-search-input").value.trim(), 1, false);
     });
+    $("btn-random-wp")?.addEventListener("click", () => applyRandomWallpaper());
     $("wp-search-input").addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
         searchWallpapers($("wp-search-input").value.trim(), 1, false);
@@ -4109,13 +4548,25 @@
       } else if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.key.toLowerCase() === "o") {
         ev.preventDefault();
         startNewSession();
+      } else if (ev.altKey && !ev.ctrlKey && !ev.metaKey && ev.key.toLowerCase() === "w") {
+        ev.preventDefault();
+        toggleZenWallpaperMode();
       } else if (ev.key === "Escape") {
+        if (state.zenMode) {
+          toggleZenWallpaperMode(false);
+          return;
+        }
         closeModal("lightbox");
         closeAllGlassDropdowns();
         closeAutocomplete();
         document.querySelectorAll(".modal-backdrop:not(.hidden)").forEach((bd) => {
           if (bd.id !== "modal-confirm") closeModal(bd);
         });
+      }
+    });
+    window.addEventListener("message", (ev) => {
+      if (ev.origin === location.origin && ev.data?.type === "ocs_zen_exit") {
+        toggleZenWallpaperMode(false);
       }
     });
   }
@@ -4146,6 +4597,8 @@
     $("cwd-pill-text").textContent = state.activeCwd || "选择目录";
 
     applyAppearance(state.settings.appearance || {});
+    syncWebSearchToggle();
+    syncFavoriteCountBadge();
     renderComposerSelectors();
     renderClaudeStatusViews();
     syncWelcomeResumePill();

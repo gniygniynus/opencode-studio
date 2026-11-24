@@ -100,6 +100,7 @@ export class SessionOrchestrator {
     providerId = "",
     model = "",
     thinkingLevel = "auto",
+    webSearchEnabled = null,
   }) {
     const cleanText = String(text || "").trim();
     if (!cleanText && (!images || !images.length)) {
@@ -173,6 +174,7 @@ export class SessionOrchestrator {
       providerId: providerId || meta.provider_id,
       model: model || meta.model,
       thinkingLevel: thinkingLevel || meta.thinking_level || "auto",
+      webSearchEnabled,
       forceNoCliResume: false,
       prefetchedTimeline: nextTimeline,
     });
@@ -191,6 +193,7 @@ export class SessionOrchestrator {
     providerId = "",
     model = "",
     thinkingLevel = "",
+    webSearchEnabled = null,
   }) {
     const cleanText = String(newText || "").trim();
     if (!cleanText) return { ok: false, error: "编辑后的内容不能为空" };
@@ -240,6 +243,7 @@ export class SessionOrchestrator {
       providerId: providerId || meta.provider_id,
       model: model || meta.model,
       thinkingLevel: thinkingLevel || meta.thinking_level || "auto",
+      webSearchEnabled,
       forceNoCliResume: true,
     });
 
@@ -255,6 +259,7 @@ export class SessionOrchestrator {
     providerId = "",
     model = "",
     thinkingLevel = "",
+    webSearchEnabled = null,
   }) {
     const meta = getSessionMeta(sessionId);
     if (!meta) return { ok: false, error: "会话不存在" };
@@ -286,6 +291,7 @@ export class SessionOrchestrator {
       providerId: providerId || meta.provider_id,
       model: model || meta.model,
       thinkingLevel: thinkingLevel || meta.thinking_level || "auto",
+      webSearchEnabled,
       forceNoCliResume: true,
       truncateAfterUserId: parentUserId,
     });
@@ -366,6 +372,7 @@ export class SessionOrchestrator {
     providerId,
     model,
     thinkingLevel,
+    webSearchEnabled = null,
     forceNoCliResume,
     truncateAfterUserId = null,
     prefetchedTimeline = null,
@@ -480,6 +487,7 @@ export class SessionOrchestrator {
             provider,
             model: effectiveModel,
             thinkingLevel,
+            webSearchEnabled,
             cwd: meta.cwd,
             historyItems,
             resumeCliSid: canResume ? meta.claude_cli_sid : "",
@@ -498,6 +506,7 @@ export class SessionOrchestrator {
             provider,
             model: effectiveModel,
             thinkingLevel,
+            webSearchEnabled,
             cwd: meta.cwd,
             historyItems,
             mcpManager: this.mcpManager,

@@ -357,6 +357,8 @@ function seedInitialData(db) {
     ensureKv("permission_mode", "auto"); // auto | confirm_dangerous
     ensureKv("claude_isolation", "isolated"); // isolated (零冲突独立目录) | shared (共享系统 ~/.claude)
     ensureKv("update_channel", "stable"); // stable | latest
+    ensureKv("web_search_enabled", true); // 对话框实时联网搜索开关
+    ensureKv("favorite_wallpapers", []); // 收藏的壁纸列表
     ensureKv("appearance", DEFAULT_APPEARANCE);
     ensureKv("search_engine", DEFAULT_SEARCH_ENGINE);
     ensureKv("wallpaper_engine", DEFAULT_WALLPAPER_ENGINE);
@@ -437,6 +439,8 @@ export function getAllSettings() {
     permission_mode: getSetting("permission_mode", "auto"),
     claude_isolation: getSetting("claude_isolation", "isolated"),
     update_channel: getSetting("update_channel", "stable"),
+    web_search_enabled: getSetting("web_search_enabled", true) !== false,
+    favorite_wallpapers: Array.isArray(getSetting("favorite_wallpapers", [])) ? getSetting("favorite_wallpapers", []) : [],
     appearance: { ...DEFAULT_APPEARANCE, ...(getSetting("appearance", DEFAULT_APPEARANCE) || {}) },
     search_engine: { ...DEFAULT_SEARCH_ENGINE, ...(getSetting("search_engine", DEFAULT_SEARCH_ENGINE) || {}) },
     wallpaper_engine: { ...DEFAULT_WALLPAPER_ENGINE, ...(getSetting("wallpaper_engine", DEFAULT_WALLPAPER_ENGINE) || {}) },

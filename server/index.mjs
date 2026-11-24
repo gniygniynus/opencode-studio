@@ -82,6 +82,7 @@ import {
   searchWallpaperStore,
 } from "./stores.mjs";
 import { checkForUpdates, getAppVersion } from "./updater.mjs";
+import { searchWebLive } from "./web_search.mjs";
 import {
   detectSteamWallpaperEngineDirs,
   getAuthorizedWallpaperItem,
@@ -878,7 +879,19 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         const prevIsolation = getAllSettings().claude_isolation;
         const isolationChanged =
           body.claude_isolation !== undefined && body.claude_isolation !== prevIsolation;
-        for (const key of ["system_prompt", "prompt_mode", "permission_mode", "claude_isolation", "update_channel", "appearance", "search_engine", "wallpaper_engine", "default_cwd"]) {
+        for (const key of [
+          "system_prompt",
+          "prompt_mode",
+          "permission_mode",
+          "claude_isolation",
+          "update_channel",
+          "web_search_enabled",
+          "favorite_wallpapers",
+          "appearance",
+          "search_engine",
+          "wallpaper_engine",
+          "default_cwd",
+        ]) {
           if (body[key] !== undefined) setSetting(key, body[key]);
         }
         const next = getAllSettings();
@@ -1056,6 +1069,14 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         deleteMemory(id);
         broadcast({ type: "memories_updated" });
         return sendJson(res, 200, { ok: true });
+      }
+
+      // ==================== DUAL-ENGINE LIVE WEB SEARCH ====================
+      if (method === "GET" && pathname === "/api/web-search") {
+        const q = urlObj.searchParams.get("q") || "";
+        const eng = urlObj.searchParams.get("engine") || "";
+        const limit = Number(urlObj.searchParams.get("limit") || 8);
+        return sendJson(res, 200, await searchWebLive(q, { maxResults: limit, mode: eng }));
       }
 
       // ==================== ONLINE OPEN-SOURCE STORES (DUAL-ENGINE CN DIRECT / PROXY GLOBAL) ====================
@@ -1572,6 +1593,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           providerId: msg.provider_id || "",
           model: msg.model || "",
           thinkingLevel: msg.thinking_level || "auto",
+          webSearchEnabled: msg.web_search !== undefined ? Boolean(msg.web_search) : null,
         });
       } else if (msg.type === "edit_resend") {
         await orchestrator.editAndResend({
@@ -1582,6 +1604,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           providerId: msg.provider_id || "",
           model: msg.model || "",
           thinkingLevel: msg.thinking_level || "",
+          webSearchEnabled: msg.web_search !== undefined ? Boolean(msg.web_search) : null,
         });
       } else if (msg.type === "regenerate_reply") {
         await orchestrator.regenerateReply({
@@ -1590,6 +1613,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           providerId: msg.provider_id || "",
           model: msg.model || "",
           thinkingLevel: msg.thinking_level || "",
+          webSearchEnabled: msg.web_search !== undefined ? Boolean(msg.web_search) : null,
         });
       } else if (msg.type === "stop_turn") {
         orchestrator.stopTurn(msg.session_id);

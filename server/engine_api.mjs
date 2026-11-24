@@ -17,14 +17,21 @@ import { BUILTIN_TOOLS, executeBuiltinTool } from "./tools.mjs";
 
 const MAX_TOOL_STEPS = 25;
 
-export function buildTransparentSystemPrompt(cwd) {
+export function buildTransparentSystemPrompt(cwd, { webSearchEnabled = null } = {}) {
   const settings = getAllSettings();
   const basePrompt = String(settings.system_prompt || "").trim();
+  const useWebSearch = webSearchEnabled !== null ? Boolean(webSearchEnabled) : settings.web_search_enabled !== false;
   const parts = [basePrompt];
 
   parts.push(
     `\n[运行环境]\n- 操作系统: ${process.platform} (${process.arch})\n- 当前工作目录: ${cwd}\n- 提示: 操作文件与命令默认相对于当前工作目录。`,
   );
+
+  if (useWebSearch) {
+    parts.push(
+      `\n[实时全网搜索已启用]\n可随时调用 \`web_search\` 检索最新互联网资讯与权威文档，并用 \`web_fetch\` 精读指定网页，回答时请附上参考来源链接。`,
+    );
+  }
 
   // Inject unified live memories (full core rules + full MEMORY.md indexes + pinned web memories, never 220-char truncated)
   const unifiedMem = buildUnifiedMemoryContext({ cwd, rtMode: "native", includeToolHint: true });
@@ -451,6 +458,7 @@ export async function runOpenCodeApiTurn({
   provider,
   model,
   thinkingLevel,
+  webSearchEnabled = null,
   cwd,
   historyItems,
   mcpManager,
@@ -459,8 +467,10 @@ export async function runOpenCodeApiTurn({
   confirmDangerous,
 }) {
   const cap = detectModelCapabilities(model, provider.kind, null, provider.model_overrides?.[model]);
-  const systemPrompt = buildTransparentSystemPrompt(cwd);
-  const allTools = [...BUILTIN_TOOLS, ...(mcpManager ? mcpManager.getToolDefinitions() : [])];
+  const useWebSearch = webSearchEnabled !== null ? Boolean(webSearchEnabled) : getAllSettings().web_search_enabled !== false;
+  const systemPrompt = buildTransparentSystemPrompt(cwd, { webSearchEnabled: useWebSearch });
+  const builtinSubset = useWebSearch ? BUILTIN_TOOLS : BUILTIN_TOOLS.filter((t) => t.name !== "web_search");
+  const allTools = [...builtinSubset, ...(mcpManager ? mcpManager.getToolDefinitions() : [])];
 
   appendTurnLog(
     sessionId,

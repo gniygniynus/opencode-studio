@@ -12,7 +12,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { getAllSettings, listMemories, saveMemory } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
-import { killProcessTree, proxyFetch } from "./runtime_utils.mjs";
+import { killProcessTree } from "./runtime_utils.mjs";
+import { fetchWebPageClean, formatSearchResultsForLlm, searchWebLive } from "./web_search.mjs";
 
 const IGNORE_DIRS = new Set([
   ".git",
@@ -122,6 +123,18 @@ export const BUILTIN_TOOLS = [
         file_ext: { type: "string", description: "可选文件后缀过滤，如 .js 或 .py" },
       },
       required: ["pattern"],
+    },
+  },
+  {
+    name: "web_search",
+    description: "实时联网搜索全网网页、技术文档与最新动态（免 API Key，自动支持国内直连与全球搜索）。",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "搜索关键词" },
+        max_results: { type: "number", description: "返回结果数量，默认 8" },
+      },
+      required: ["query"],
     },
   },
   {
@@ -424,32 +437,23 @@ export async function executeBuiltinTool(name, input, ctx) {
       };
     }
 
+    if (name === "web_search") {
+      const res = await searchWebLive(String(input?.query || ""), {
+        maxResults: Number(input?.max_results) || 8,
+      });
+      return {
+        ok: res.ok || Boolean(res.results?.length),
+        output: formatSearchResultsForLlm(res),
+      };
+    }
+
     if (name === "web_fetch") {
-      const url = String(input?.url || "").trim();
-      if (!/^https?:\/\//i.test(url)) return { ok: false, output: "仅支持 http:// 或 https:// 链接" };
-      const proxyUrl = getAllSettings().search_engine?.proxy_url || "";
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 15000);
-      try {
-        const res = await proxyFetch(url, {
-          headers: { "User-Agent": "OpenCodeStudio/2.1 (+https://github.com/gniygniynus/opencode-studio)" },
-          signal: controller.signal,
-          proxyUrl,
-        });
-        const body = await res.text();
-        const plain = body
-          .replace(/<script[\s\S]*?<\/script>/gi, " ")
-          .replace(/<style[\s\S]*?<\/style>/gi, " ")
-          .replace(/<[^>]+>/g, " ")
-          .replace(/\s+/g, " ")
-          .trim();
-        return {
-          ok: res.ok,
-          output: `HTTP ${res.status} (${url})\n` + plain.slice(0, 16000),
-        };
-      } finally {
-        clearTimeout(timer);
-      }
+      const page = await fetchWebPageClean(String(input?.url || ""), { maxChars: 18000 });
+      if (!page.ok) return { ok: false, output: `抓取失败 (${input?.url || ""}): ${page.error}` };
+      return {
+        ok: true,
+        output: `URL: ${page.url}\nTitle: ${page.title || "-"}\n\n${page.content}`,
+      };
     }
 
     if (name === "memory_search") {

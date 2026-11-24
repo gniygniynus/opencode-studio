@@ -169,6 +169,13 @@
             </svg>
           </button>
 
+          <button id="btn-zen-wallpaper" class="icon-btn" title="沉浸赏析壁纸与互动模式 (Alt+W)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"></path>
+              <circle cx="12" cy="12" r="3"></circle>
+            </svg>
+          </button>
+
           <button id="btn-quick-bg" class="icon-btn" title="外观与开源背景壁纸商店">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
               <circle cx="12" cy="12" r="5"></circle>
@@ -202,19 +209,19 @@
               <div class="welcome-grid">
                 <div class="welcome-card glass-card" id="wc-providers">
                   <div class="wc-title">1. 原生登录 & 内置 API 管理</div>
-                  <div class="wc-body">完整 Claude 官方 Auth 登录，或任意 Anthropic / OpenAI API 驱动原生 Claude Code，随时更新与自动识别思考等级。</div>
+                  <div class="wc-body">完整 Claude 官方 Auth 登录，或任意 Anthropic / OpenAI API 驱动原生 Claude Code，一键测速与自动识别思考等级。</div>
                 </div>
                 <div class="welcome-card glass-card" id="wc-stores">
-                  <div class="wc-title">2. 开源 MCP & Skills 商店</div>
-                  <div class="wc-body">精选开源工具与技能 + 实时联网搜索，一键下载安装并直接挂载给原生 Claude Code。</div>
+                  <div class="wc-title">2. 零配置联网搜索 & MCP / Skills</div>
+                  <div class="wc-body">内置免 Key 双引擎实时联网搜索与网页精读，聚合官方 MCP Registry 与 GitHub 开源技能一键挂载。</div>
                 </div>
                 <div class="welcome-card glass-card" id="wc-wallpaper">
-                  <div class="wc-title">3. 高清 / 隐性 / 动态壁纸商店</div>
-                  <div class="wc-body">支持高清原版与隐性护眼双模式、海量 4K 壁纸实时联网搜索、60fps 动态壁纸与本地视频上传。</div>
+                  <div class="wc-title">3. 必应每日 4K / 动态 / 小红车壁纸</div>
+                  <div class="wc-body">内置微软必应 4K UHD、14 款高刷动态壁纸、Wallpaper Engine 视频与 Web 音频互动壁纸、沉浸赏析模式。</div>
                 </div>
                 <div class="welcome-card glass-card" id="wc-settings">
-                  <div class="wc-title">4. 自定义提示词 & 稳定/最新版切换</div>
-                  <div class="wc-body">完全掌控系统提示词与遥测关闭，一键安装或切换 Claude Code 稳定版 (stable) / 最新版 (latest)。</div>
+                  <div class="wc-title">4. 自定义提示词 & 双通道升级</div>
+                  <div class="wc-body">完全掌控系统提示词、SQLite FTS5 秒级全文索引维护，一键切换 Claude Code 稳定版 / 最新版。</div>
                 </div>
               </div>
             </div>
@@ -268,6 +275,10 @@
                   </div>
 
                   <span id="model-cap-badge" class="cap-badge hidden" title="当前模型上下文窗口与用量"></span>
+                  <button id="btn-toggle-websearch" type="button" class="chip-btn web-toggle is-on" title="实时联网搜索增强：开启后模型可免 Key 检索最新网页与新闻（也可用 /web 关键词）">
+                    <span class="web-dot"></span>
+                    <span>联网</span>
+                  </button>
                   <button id="btn-quick-compact" class="chip-btn" title="手动压缩当前长会话上下文">/compact</button>
                 </div>
 
@@ -516,11 +527,14 @@
           <div class="store-search-bar">
             <input id="wp-search-input" class="text-input" placeholder="输入即全网实时搜索海量 4K 静态壁纸或动态壁纸（免代理支持任意中文：星空、动漫、樱花、赛博、海洋、风景）…" />
             <button id="btn-search-wp" class="btn-primary">全网搜索</button>
+            <button id="btn-random-wp" class="btn-secondary" title="从当前展示池中随机抽取一张高清或动态壁纸立即换上">🎲 随机换一张</button>
           </div>
 
           <div class="wp-cat-bar">
             <button class="chip-btn wp-cat active" data-cat="all">全部精选+热门</button>
-            <button class="chip-btn wp-cat" data-cat="live">✨ 动态壁纸 (60fps + 全网动图/视频)</button>
+            <button class="chip-btn wp-cat" data-cat="bing_uhd">🌅 必应每日 4K</button>
+            <button class="chip-btn wp-cat" data-cat="live">✨ 动态壁纸 (14款高刷 + 视频)</button>
+            <button class="chip-btn wp-cat" data-cat="favorites">❤️ 我的收藏 <span id="wp-fav-count" class="wp-fav-count hidden">0</span></button>
             <button class="chip-btn wp-cat" data-cat="scenery">自然风景</button>
             <button class="chip-btn wp-cat" data-cat="anime">动漫二次元</button>
             <button class="chip-btn wp-cat" data-q="星空">星空宇宙</button>
@@ -833,6 +847,12 @@
         </div>
       </div>
     </div>
+  </div>
+
+  <div id="zen-exit-bar" class="zen-exit-bar hidden">
+    <span id="zen-wp-title" class="zen-wp-title">沉浸壁纸赏析</span>
+    <button id="btn-zen-random" type="button" class="zen-pill-btn" title="随机切换下一张壁纸">🎲 换一张</button>
+    <button id="btn-zen-exit" type="button" class="zen-pill-btn primary" title="恢复工作台界面 (Esc / Alt+W)">退出赏析 (Esc)</button>
   </div>
 
   <div id="lightbox" class="lightbox hidden"><img id="lightbox-img" alt="预览" /></div>

@@ -190,17 +190,18 @@ function parseJpegDimensions(buf) {
 
 /**
  * Inspect Wallpaper Engine `scene.pkg` (PKGVxxxx) header-only to distinguish:
+ *  - Embedded native `.mp4` / `.webm` video scenes (direct video entry inside PKGV or single `.tex` wrapping ISO MP4/WebM):
+ *      Streams at exact byte offsets via HTTP 206 Byte-Range with 0 disk extraction & 0 quality loss!
  *  - Complete single-image high-res photo/artwork scenes (e.g. 6000x4000 11MB JPEG or 3840x2160 4K JPEG/PNG):
  *      Contains EXACTLY 1 main visual `.tex` (excluding masks/particles) wrapping a complete native JPEG/PNG.
- *      Safe to stream bit-for-bit at exact byte offsets with 0 quality loss & 0 missing foreground layers!
- *  - Multi-layer DirectX 3D scenes (2+ separate foreground/background `.tex` layers like WLOP Dome / Moonlight):
+ *  - Multi-layer DirectX 3D scenes (2+ separate foreground/background `.tex` layers):
  *      Returns null so we NEVER serve an incomplete single background strip as fake 4K!
  */
 export function inspectCompleteSingleImageInPkg(pkgPath) {
   let fd;
   try {
     const st = fs.statSync(pkgPath);
-    if (!st.isFile() || st.size < 64 || st.size > 1024 * 1024 * 1024) return null;
+    if (!st.isFile() || st.size < 64 || st.size > 2 * 1024 * 1024 * 1024) return null;
     fd = fs.openSync(pkgPath, "r");
 
     const headBuf = Buffer.alloc(Math.min(st.size, 256 * 1024));
@@ -219,6 +220,7 @@ export function inspectCompleteSingleImageInPkg(pkgPath) {
     if (count <= 0 || count > 20000) return null;
 
     const mainTex = [];
+    const directVideos = [];
     for (let i = 0; i < count; i++) {
       if (off + 12 > headBuf.length) break;
       const nLen = headBuf.readInt32LE(off);
@@ -226,11 +228,13 @@ export function inspectCompleteSingleImageInPkg(pkgPath) {
       if (nLen <= 0 || nLen > 512 || off + nLen + 8 > headBuf.length) break;
       const name = headBuf.subarray(off, off + nLen).toString("utf8");
       off += nLen;
-      const fOff = headBuf.readInt32LE(off);
+      const fOff = headBuf.readUInt32LE(off);
       off += 4;
-      const fLen = headBuf.readInt32LE(off);
+      const fLen = headBuf.readUInt32LE(off);
       off += 4;
-      if (
+      if (/\.(mp4|webm)$/i.test(name) && fLen > 200_000) {
+        directVideos.push({ name, fOff, fLen, ext: path.extname(name).toLowerCase() });
+      } else if (
         /\.tex$/i.test(name) &&
         fLen > 200_000 &&
         !/(^|\/)(masks?|particles?|effects?|bokeh|glow|dust|snow|rain|spark)/i.test(name)
@@ -239,6 +243,22 @@ export function inspectCompleteSingleImageInPkg(pkgPath) {
       }
     }
     const dataBase = off;
+
+    // Case A: Direct .mp4 / .webm bundled inside scene.pkg
+    if (directVideos.length === 1 && mainTex.length === 0) {
+      const v = directVideos[0];
+      if (dataBase + v.fOff + v.fLen <= st.size) {
+        return {
+          media_kind: "video",
+          mime: v.ext === ".webm" ? "video/webm" : "video/mp4",
+          start: dataBase + v.fOff,
+          length: v.fLen,
+          width: 0,
+          height: 0,
+          size_mb: Math.round((v.fLen / (1024 * 1024)) * 10) / 10,
+        };
+      }
+    }
 
     // Strictly require EXACTLY 1 main visual texture so multi-layer 3D scenes are NEVER broken!
     if (mainTex.length !== 1) return null;
@@ -251,6 +271,40 @@ export function inspectCompleteSingleImageInPkg(pkgPath) {
     const got = fs.readSync(fd, probe, 0, probe.length, absStart);
     const sub = probe.subarray(0, got);
 
+    // Case B: Embedded native MP4 (`ftyp` ISO BMFF header) or WebM (`1A 45 DF A3` EBML header) inside .tex
+    const ftypIdx = sub.indexOf(Buffer.from("ftyp", "ascii"));
+    if (ftypIdx >= 4 && ftypIdx <= 4096) {
+      const boxStart = ftypIdx - 4;
+      const boxSize = sub.readUInt32BE(boxStart);
+      if (boxSize >= 16 && boxSize <= 128) {
+        const length = entry.fLen - boxStart;
+        return {
+          media_kind: "video",
+          mime: "video/mp4",
+          start: absStart + boxStart,
+          length,
+          width: 0,
+          height: 0,
+          size_mb: Math.round((length / (1024 * 1024)) * 10) / 10,
+        };
+      }
+    }
+
+    const webmIdx = sub.indexOf(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+    if (webmIdx >= 0 && webmIdx <= 4096) {
+      const length = entry.fLen - webmIdx;
+      return {
+        media_kind: "video",
+        mime: "video/webm",
+        start: absStart + webmIdx,
+        length,
+        width: 0,
+        height: 0,
+        size_mb: Math.round((length / (1024 * 1024)) * 10) / 10,
+      };
+    }
+
+    // Case C: Embedded lossless high-res PNG / JPEG
     const pngIdx = sub.indexOf(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
     if (pngIdx >= 0 && pngIdx + 24 <= sub.length) {
       const width = sub.readUInt32BE(pngIdx + 16);
@@ -258,6 +312,7 @@ export function inspectCompleteSingleImageInPkg(pkgPath) {
       if (width < 800 || height < 600) return null;
       const length = entry.fLen - pngIdx;
       return {
+        media_kind: "image",
         mime: "image/png",
         start: absStart + pngIdx,
         length,
@@ -281,6 +336,7 @@ export function inspectCompleteSingleImageInPkg(pkgPath) {
         length = length - tailLen + eoi + 2;
       }
       return {
+        media_kind: "image",
         mime: "image/jpeg",
         start: absStart + jpgIdx,
         length,
@@ -384,8 +440,32 @@ function scanWallpaperProjectFolder(dirPath, rootLabel) {
     const pkgPath = path.join(dirPath, "scene.pkg");
     const sceneTarget = fs.existsSync(pkgPath) ? pkgPath : fs.existsSync(filePath) ? filePath : "";
     if (!sceneTarget) return null;
-    const singleImg = fs.existsSync(pkgPath) ? inspectCompleteSingleImageInPkg(pkgPath) : null;
-    if (singleImg) {
+    const singleMedia = fs.existsSync(pkgPath) ? inspectCompleteSingleImageInPkg(pkgPath) : null;
+    if (singleMedia && singleMedia.media_kind === "video") {
+      return {
+        id,
+        title,
+        we_type: "video",
+        play_mode: "video",
+        playable: true,
+        lossless_in_browser: true,
+        dir_path: dirPath,
+        file_path: pkgPath,
+        pkg_path: pkgPath,
+        pkg_image_slice: singleMedia,
+        preview_path: hasPreview ? previewPath : "",
+        size_bytes: singleMedia.length,
+        size_mb: singleMedia.size_mb,
+        ext: singleMedia.mime === "video/webm" ? ".webm" : ".mp4",
+        tags,
+        source_label: rootLabel,
+        stream_url: `/api/we/media?id=${id}&kind=pkg_video`,
+        preview_url: hasPreview ? `/api/we/media?id=${id}&kind=preview` : `/api/we/media?id=${id}&kind=pkg_video`,
+        badge: `🎬 包内原版视频 · ${singleMedia.size_mb} MB`,
+        description: `从 scene.pkg 零拷贝直出原版动态视频（0 解压落盘 0 损耗，不影响桌面壁纸）`,
+      };
+    }
+    if (singleMedia) {
       return {
         id,
         title,
@@ -396,16 +476,16 @@ function scanWallpaperProjectFolder(dirPath, rootLabel) {
         dir_path: dirPath,
         file_path: pkgPath,
         pkg_path: pkgPath,
-        pkg_image_slice: singleImg,
+        pkg_image_slice: singleMedia,
         preview_path: hasPreview ? previewPath : "",
-        size_bytes: singleImg.length,
-        size_mb: singleImg.size_mb,
-        ext: singleImg.mime === "image/png" ? ".png" : ".jpg",
+        size_bytes: singleMedia.length,
+        size_mb: singleMedia.size_mb,
+        ext: singleMedia.mime === "image/png" ? ".png" : ".jpg",
         tags,
         source_label: rootLabel,
         stream_url: `/api/we/media?id=${id}&kind=pkg_image`,
         preview_url: hasPreview ? `/api/we/media?id=${id}&kind=preview` : `/api/we/media?id=${id}&kind=pkg_image`,
-        badge: `🖼️ 原版无损 · ${singleImg.width}×${singleImg.height} · ${singleImg.size_mb} MB`,
+        badge: `🖼️ 原版无损 · ${singleMedia.width}×${singleMedia.height} · ${singleMedia.size_mb} MB`,
         description: `从单图 scene.pkg 零拷贝直读完整原片（0 压缩 0 缺图，不影响桌面壁纸）`,
       };
     }
@@ -547,19 +627,39 @@ export function streamAuthorizedMedia(req, res, item, kind = "file", authorizedD
     return res.end(JSON.stringify({ error: "壁纸项不存在或未授权" }));
   }
 
-  // Zero-copy exact byte-range read of a complete single-image JPEG/PNG inside scene.pkg!
-  if (kind === "pkg_image" && item.pkg_path && item.pkg_image_slice) {
+  // Zero-copy exact byte-range read of a complete single-image JPEG/PNG or embedded MP4/WebM inside scene.pkg!
+  if ((kind === "pkg_image" || kind === "pkg_video") && item.pkg_path && item.pkg_image_slice) {
     if (!isPathInsideAuthorizedDirs(item.pkg_path, authorizedDirs) || !fs.existsSync(item.pkg_path)) {
       res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
       return res.end(JSON.stringify({ error: "未授权访问路径" }));
     }
-    const { start, length, mime } = item.pkg_image_slice;
+    const { start: sliceStart, length: sliceTotal, mime } = item.pkg_image_slice;
+    const range = req.headers.range;
+    if (range) {
+      const m = range.match(/bytes=(\d*)-(\d*)/);
+      const rStart = m && m[1] ? Number(m[1]) : 0;
+      const requestedEnd = m && m[2] ? Number(m[2]) : Math.min(rStart + 4 * 1024 * 1024 - 1, sliceTotal - 1);
+      const rEnd = Math.min(requestedEnd, sliceTotal - 1);
+      if (rStart >= sliceTotal || rStart > rEnd) {
+        res.writeHead(416, { "Content-Range": `bytes */${sliceTotal}` });
+        return res.end();
+      }
+      res.writeHead(206, {
+        "Content-Type": mime,
+        "Content-Range": `bytes ${rStart}-${rEnd}/${sliceTotal}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": rEnd - rStart + 1,
+        "Cache-Control": "public, max-age=86400",
+      });
+      return fs.createReadStream(item.pkg_path, { start: sliceStart + rStart, end: sliceStart + rEnd }).pipe(res);
+    }
     res.writeHead(200, {
       "Content-Type": mime,
-      "Content-Length": length,
+      "Content-Length": sliceTotal,
+      "Accept-Ranges": "bytes",
       "Cache-Control": "public, max-age=86400",
     });
-    return fs.createReadStream(item.pkg_path, { start, end: start + length - 1 }).pipe(res);
+    return fs.createReadStream(item.pkg_path, { start: sliceStart, end: sliceStart + sliceTotal - 1 }).pipe(res);
   }
 
   const targetPath = kind === "preview" && item.preview_path ? item.preview_path : item.file_path;
@@ -602,6 +702,66 @@ export function streamAuthorizedMedia(req, res, item, kind = "file", authorizedD
   return fs.createReadStream(targetPath).pipe(res);
 }
 
+function buildWeWebRuntimeShimScript(dirPath) {
+  let userProps = {};
+  try {
+    const pjPath = path.join(dirPath, "project.json");
+    if (fs.existsSync(pjPath)) {
+      const pj = JSON.parse(fs.readFileSync(pjPath, "utf8").replace(/^\uFEFF/, ""));
+      const rawProps = pj?.general?.properties || {};
+      for (const [k, v] of Object.entries(rawProps)) {
+        if (v && typeof v === "object" && v.value !== undefined) {
+          userProps[k] = { value: v.value };
+        }
+      }
+    }
+  } catch {}
+
+  const safeJson = JSON.stringify(userProps).replace(/<\//g, "<\\/");
+  return `<script>
+/* OpenCode Studio — Wallpaper Engine CEF Web Runtime Compatibility Bridge */
+(function(){
+  var _audioCbs = [];
+  var _defaults = ${safeJson};
+  window.wallpaperRequestRandomFileForProperty = function(prop, cb){ if (typeof cb === "function") cb(prop, ""); };
+  window.wallpaperRegisterAudioListener = function(cb){
+    if (typeof cb === "function" && _audioCbs.indexOf(cb) < 0) _audioCbs.push(cb);
+  };
+  function _fireProps(){
+    var l = window.wallpaperPropertyListener;
+    if (!l) return;
+    try { if (typeof l.applyGeneralProperties === "function") l.applyGeneralProperties({ fps: 60 }); } catch(e){}
+    try { if (typeof l.applyUserProperties === "function") l.applyUserProperties(_defaults); } catch(e){}
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", _fireProps);
+  } else {
+    setTimeout(_fireProps, 0);
+  }
+  window.addEventListener("load", _fireProps);
+  var _phase = 0;
+  var _buf = new Array(128);
+  setInterval(function(){
+    if (!_audioCbs.length || document.hidden) return;
+    _phase += 0.09;
+    for (var i = 0; i < 64; i++) {
+      var v = Math.max(0.01, (Math.sin(_phase * 1.3 + i * 0.18) * 0.5 + 0.5) * Math.exp(-i * 0.032) * 0.42);
+      _buf[i] = v;
+      _buf[i + 64] = v * 0.96;
+    }
+    for (var j = 0; j < _audioCbs.length; j++) {
+      try { _audioCbs[j](_buf); } catch(e){}
+    }
+  }, 33);
+  window.addEventListener("keydown", function(ev){
+    if (ev.key === "Escape" || (ev.altKey && (ev.key === "w" || ev.key === "W"))) {
+      try { window.parent.postMessage({ type: "ocs_zen_exit" }, window.location.origin); } catch(e){}
+    }
+  });
+})();
+</script>`;
+}
+
 export function serveAuthorizedWebAsset(req, res, item, relSubpath, authorizedDirs = []) {
   if (!item || item.we_type !== "web") {
     res.writeHead(404);
@@ -618,6 +778,22 @@ export function serveAuthorizedWebAsset(req, res, item, relSubpath, authorizedDi
     return res.end("Not Found");
   }
   const ext = path.extname(fullPath).toLowerCase();
+  if (ext === ".html" || ext === ".htm") {
+    try {
+      const rawHtml = fs.readFileSync(fullPath, "utf8");
+      const shim = buildWeWebRuntimeShimScript(item.dir_path);
+      const injected = /<head[^>]*>/i.test(rawHtml)
+        ? rawHtml.replace(/<head[^>]*>/i, (m) => `${m}\n${shim}`)
+        : `${shim}\n${rawHtml}`;
+      const buf = Buffer.from(injected, "utf8");
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Length": buf.length,
+        "Cache-Control": "no-cache",
+      });
+      return res.end(buf);
+    } catch {}
+  }
   res.writeHead(200, {
     "Content-Type": STREAM_MIME[ext] || "application/octet-stream",
     "Cache-Control": "no-cache",

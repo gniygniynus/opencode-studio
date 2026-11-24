@@ -1272,12 +1272,18 @@ export async function installOrSwitchClaudeVersion({ channel = "stable", forceNa
   };
 }
 
-export function buildCustomPromptAndMcp(cwd, rtMode) {
+export function buildCustomPromptAndMcp(cwd, rtMode, { webSearchEnabled = null } = {}) {
   const settings = getAllSettings();
   const basePrompt = String(settings.system_prompt || "").trim();
   const mode = settings.prompt_mode || "replace"; // replace | append | native
+  const useWebSearch = webSearchEnabled !== null ? Boolean(webSearchEnabled) : settings.web_search_enabled !== false;
 
   const extraSections = [];
+  if (useWebSearch) {
+    extraSections.push(
+      "[实时全网搜索已启用]\n当前会话已挂载内置免配置联网工具 `mcp__opencode_web__web_search` 与 `mcp__opencode_web__web_read_page`。遇到时效性资讯、最新技术文档、外部网址或不确定事实时，请主动调用联网搜索并在回答末尾附上参考来源链接。",
+    );
+  }
   const memoryBlock = buildUnifiedMemoryContext({ cwd, rtMode });
   if (memoryBlock) {
     extraSections.push(memoryBlock);
@@ -1316,11 +1322,27 @@ export function buildCustomPromptAndMcp(cwd, rtMode) {
     } catch {}
   }
 
-  // Materialize enabled installed MCPs (both local stdio AND remote http/sse!) into active_mcp_config.json
+  // Materialize enabled installed MCPs + built-in live web search MCP into active_mcp_config.json
   const mcps = listInstalledMcps().filter((m) => m.enabled);
   let mcpConfigPath = null;
-  if (mcps.length) {
+  if (mcps.length || useWebSearch) {
     const mcpObj = { mcpServers: {} };
+    if (useWebSearch) {
+      let webMcpScript = path.join(PROJECT_ROOT, "server", "websearch_mcp_stdio.mjs");
+      if (webMcpScript.includes("app.asar") && !webMcpScript.includes("app.asar.unpacked") && fs.existsSync(webMcpScript.replace("app.asar", "app.asar.unpacked"))) {
+        webMcpScript = webMcpScript.replace("app.asar", "app.asar.unpacked");
+      }
+      const nodeCmd = rtMode === "wsl" ? winPathToWsl(process.execPath) : process.execPath;
+      mcpObj.mcpServers.opencode_web = {
+        command: nodeCmd,
+        args: [webMcpScript],
+        env: {
+          ELECTRON_RUN_AS_NODE: "1",
+          OPENCODE_DATA_DIR: getPaths().dataRoot,
+          NO_PROXY: "127.0.0.1,localhost,::1",
+        },
+      };
+    }
     for (const m of mcps) {
       if ((m.command === "http" || m.command === "sse" || m.command === "streamable-http") && m.args?.[0]) {
         mcpObj.mcpServers[m.name] = {
@@ -1373,6 +1395,7 @@ export async function runNativeClaudeCodeTurn({
   provider,
   model,
   thinkingLevel,
+  webSearchEnabled = null,
   cwd,
   historyItems,
   resumeCliSid,
@@ -1406,7 +1429,9 @@ export async function runNativeClaudeCodeTurn({
   );
   const effectiveThinking =
     thinkingLevel && thinkingLevel !== "auto" ? thinkingLevel : (cap.thinking_supported ? cap.default_thinking : "off");
-  const { memoryBlock, promptFlag, promptText, mcpConfigPath } = buildCustomPromptAndMcp(cwd, rt.mode);
+  const { memoryBlock, promptFlag, promptText, mcpConfigPath } = buildCustomPromptAndMcp(cwd, rt.mode, {
+    webSearchEnabled,
+  });
 
   // Build strictly isolated environment so native auth & API providers NEVER collide
   const env = {
