@@ -62,6 +62,16 @@ jobs:
       - run: ${{ matrix.cmd }}
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - name: Verify unpacked native Claude Code inside packaged output
+        shell: bash
+        run: |
+          FOUND=$(find dist -path "*app.asar.unpacked*claude*" -type f -size +10M | head -n1)
+          if [ -z "$FOUND" ]; then
+            echo "ERROR: Packaged app.asar.unpacked is missing native Claude Code binary!"
+            find dist -maxdepth 6
+            exit 1
+          fi
+          ls -lh "$FOUND"
       - uses: actions/upload-artifact@v4
         with:
           name: opencode-studio-${{ matrix.label }}
@@ -105,8 +115,19 @@ jobs:
           generate_release_notes: true
           body: |
             ## OpenCode Studio ${{ steps.meta.outputs.tag }}
-            - 发布通道：**${{ steps.meta.outputs.channel }}**
-            - **100% 纯净内置官方原生 Claude Code**：安装包已直接随包内置对应平台的官方原生 Claude Code 二进制，下载安装即可开箱即用，无需预先安装 CLI 或折腾代理！
-            - 支持平台：Windows x64 (`Setup.exe` / 便携版)、macOS Apple Silicon `arm64` (`.dmg` / `.zip`)、Linux x64 (`.AppImage` / `.deb`)
-            - macOS 首次打开未签名开源应用提示解决：在终端执行 `xattr -cr "/Applications/OpenCode Studio.app"` 后打开即可。
+            - **100% 开箱即用内置官方原生 Claude Code**：安装包已随包内置经过完整兼容验证的对应平台官方原生 Claude Code 内核，学生下载安装后直接可用，**无需单独安装 Claude Code 或 Node.js**！
+            - **安装向导版 vs 免安装便携版说明（Windows）**：
+              - `Setup.exe`（安装向导版，推荐主力使用）：支持自定义安装目录、自动创建桌面与开始菜单快捷方式、支持控制面板一键卸载。
+              - 不带 `Setup` 的 `.exe`（免安装便携版）：单文件绿色版，无需管理员安装权限，双击直接运行（适合机房电脑或随身 U 盘）。
+            - **macOS 首次打开提示解决**：在终端执行 `xattr -cr "/Applications/OpenCode Studio.app"` 后打开即可。
           files: release-artifacts/*
+      - name: Keep only the latest GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT_TAG="${{ steps.meta.outputs.tag }}"
+          OLD_TAGS=$(gh release list --repo "${{ github.repository }}" --limit 50 --json tagName --jq '.[].tagName' | grep -vxF "$CURRENT_TAG" || true)
+          for t in $OLD_TAGS; do
+            echo "Removing superseded release & tag: $t"
+            gh release delete "$t" --repo "${{ github.repository }}" --cleanup-tag --yes || true
+          done

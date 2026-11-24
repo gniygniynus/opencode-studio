@@ -1,11 +1,12 @@
 /**
- * Dual-channel GitHub Releases Updater (stable vs latest) for OpenCode Studio.
- * Queries https://api.github.com/repos/gniygniynus/opencode-studio/releases.
+ * GitHub Releases Updater for OpenCode Studio.
+ * Queries https://api.github.com/repos/gniygniynus/opencode-studio/releases
+ * and focuses cleanly on the latest official release.
  */
 
 import fs from "node:fs";
 import path from "node:path";
-import { getAllSettings, getSetting, setSetting } from "./db.mjs";
+import { getAllSettings, setSetting } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
 import { PROJECT_ROOT } from "./paths.mjs";
 import { proxyFetch } from "./runtime_utils.mjs";
@@ -61,11 +62,8 @@ function pickPlatformAsset(assets = []) {
 }
 
 export async function checkForUpdates(channelOverride = null) {
-  const channel = channelOverride === "latest" || channelOverride === "stable"
-    ? channelOverride
-    : getSetting("update_channel", "stable");
-
-  if (channelOverride) {
+  const channel = channelOverride === "latest" ? "latest" : "stable";
+  if (channelOverride === "latest" || channelOverride === "stable") {
     setSetting("update_channel", channel);
   }
 
@@ -95,10 +93,14 @@ export async function checkForUpdates(channelOverride = null) {
       };
     }
 
-    const releases = (await res.json()).filter((r) => !r.draft);
-    const stableRel = releases.find((r) => !r.prerelease) || null;
+    const rawReleases = await res.json();
+    const releases = (Array.isArray(rawReleases) ? rawReleases : []).filter((r) => !r.draft);
+    const stableRel = releases.find((r) => !r.draft && !r.prerelease) || null;
     const latestRel = releases[0] || null;
-    const target = channel === "latest" ? latestRel : stableRel;
+    const target =
+      channelOverride === "latest"
+        ? latestRel || stableRel
+        : releases.find((r) => !r.draft && !r.prerelease) || releases[0] || null;
 
     if (!target) {
       return {
@@ -107,7 +109,7 @@ export async function checkForUpdates(channelOverride = null) {
         current_version: currentVersion,
         repo_url: `https://github.com/${REPO_SLUG}/releases`,
         has_update: false,
-        message: channel === "stable" ? "当前尚无正式稳定版 Release（可切换「最新版」通道查看测试版）。" : "尚无可用版本。",
+        message: "当前尚无已发布的 Release 版本。",
       };
     }
 

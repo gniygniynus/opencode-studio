@@ -19,6 +19,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import { getAllSettings, listInstalledMcps, listInstalledSkills } from "./db.mjs";
 import { appendTurnLog, classifyError, logEvent } from "./logger.mjs";
 import { buildUnifiedMemoryContext, syncDiskMemoriesToDb } from "./memory_sync.mjs";
@@ -117,35 +118,148 @@ export function getClaudeIsolationConfig() {
   };
 }
 
-function getManagedClaudeCandidates() {
-  const binName = process.platform === "win32" ? "claude.exe" : "claude";
-  const platPkg = `@anthropic-ai/claude-code-${process.platform}-${process.arch}`;
-  const r = getPaths().claudeRuntimeDir;
-  const out = [path.join(r, "node_modules", platPkg, binName)];
-  if (process.platform === "linux") {
-    out.push(path.join(r, "node_modules", `${platPkg}-musl`, binName));
+function isLinuxMusl() {
+  if (process.platform !== "linux") return false;
+  try {
+    if (fs.existsSync("/etc/alpine-release")) return true;
+    const rep = typeof process.report?.getReport === "function" ? process.report.getReport() : null;
+    if (rep && rep.header && !rep.header.glibcVersionRuntime) return true;
+  } catch {}
+  return false;
+}
+
+function getPlatformSubPkgNames() {
+  const plat = process.platform;
+  const arch = process.arch;
+  const base = `claude-code-${plat}-${arch}`;
+  if (plat === "linux") {
+    return isLinuxMusl() ? [`${base}-musl`, base] : [base, `${base}-musl`];
   }
-  out.push(path.join(r, "node_modules", "@anthropic-ai", "claude-code", "bin", binName));
+  if (plat === "darwin" && arch === "arm64") {
+    return [base, "claude-code-darwin-x64"];
+  }
+  return [base];
+}
+
+function getBundledRoots() {
+  const raw = [
+    process.resourcesPath ? path.join(process.resourcesPath, "app.asar.unpacked") : null,
+    PROJECT_ROOT.includes("app.asar") && !PROJECT_ROOT.includes("app.asar.unpacked")
+      ? PROJECT_ROOT.replace("app.asar", "app.asar.unpacked")
+      : null,
+    PROJECT_ROOT,
+  ];
+  const seen = new Set();
+  const out = [];
+  for (const r of raw) {
+    if (!r) continue;
+    const abs = path.resolve(r);
+    if (!seen.has(abs)) {
+      seen.add(abs);
+      out.push(r);
+    }
+  }
   return out;
 }
 
-function getBundledClaudeCandidates() {
-  const binName = process.platform === "win32" ? "claude.exe" : "claude";
-  const platPkg = `@anthropic-ai/claude-code-${process.platform}-${process.arch}`;
-  const roots = [PROJECT_ROOT];
-  // When packaged inside Electron app.asar, native binaries live in app.asar.unpacked!
-  if (PROJECT_ROOT.includes("app.asar") && !PROJECT_ROOT.includes("app.asar.unpacked")) {
-    roots.unshift(PROJECT_ROOT.replace("app.asar", "app.asar.unpacked"));
-  }
-  const out = [];
-  for (const r of roots) {
-    out.push(path.join(r, "node_modules", platPkg, binName));
-    if (process.platform === "linux") {
-      out.push(path.join(r, "node_modules", `${platPkg}-musl`, binName));
+function ensureExecutableIfNeeded(binPath) {
+  if (process.platform === "win32") return;
+  try {
+    const st = fs.statSync(binPath);
+    if (st.isFile() && (st.mode & 0o111) === 0) {
+      fs.chmodSync(binPath, 0o755);
     }
-    out.push(path.join(r, "node_modules", "@anthropic-ai", "claude-code", "bin", binName));
+  } catch {}
+}
+
+function scanAnthropicNativeBinaries(scopeDir, binName, maxDepth = 4) {
+  const found = [];
+  if (!scopeDir || !fs.existsSync(scopeDir)) return found;
+  const isWin = process.platform === "win32";
+  const targetLower = binName.toLowerCase();
+  const MIN_NATIVE_BYTES = 5 * 1024 * 1024;
+  let budget = 250;
+
+  const walk = (dir, depth) => {
+    if (depth > maxDepth || budget <= 0) return;
+    budget--;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (budget <= 0) return;
+      const full = path.join(dir, e.name);
+      if (e.isFile()) {
+        const matched = isWin ? e.name.toLowerCase() === targetLower : e.name === binName;
+        if (matched) {
+          try {
+            const st = fs.statSync(full);
+            if (st.size > MIN_NATIVE_BYTES) {
+              ensureExecutableIfNeeded(full);
+              found.push(full);
+            }
+          } catch {}
+        }
+      } else if (e.isDirectory() && depth < maxDepth && !e.name.startsWith(".")) {
+        walk(full, depth + 1);
+      }
+    }
+  };
+
+  walk(scopeDir, 0);
+  return found;
+}
+
+function collectClaudeCandidatesFromRoots(roots) {
+  const binName = process.platform === "win32" ? "claude.exe" : "claude";
+  const subPkgs = getPlatformSubPkgNames();
+  const fixed = [];
+  for (const r of roots) {
+    if (!r) continue;
+    // a) Nested path produced by electron-builder / npm tree:
+    //    node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-${plat}-${arch}/${binName}
+    for (const sub of subPkgs) {
+      fixed.push(path.join(r, "node_modules", "@anthropic-ai", "claude-code", "node_modules", "@anthropic-ai", sub, binName));
+    }
+    // b) Hoisted flat path: node_modules/@anthropic-ai/claude-code-${plat}-${arch}/${binName}
+    for (const sub of subPkgs) {
+      fixed.push(path.join(r, "node_modules", "@anthropic-ai", sub, binName));
+    }
+    // c) Wrapper/bin fallback: node_modules/@anthropic-ai/claude-code/bin/${binName}
+    fixed.push(path.join(r, "node_modules", "@anthropic-ai", "claude-code", "bin", binName));
   }
-  return out;
+
+  let anyExists = false;
+  for (const p of fixed) {
+    if (fs.existsSync(p)) {
+      anyExists = true;
+      ensureExecutableIfNeeded(p);
+    }
+  }
+
+  if (!anyExists) {
+    const discovered = [];
+    for (const r of roots) {
+      if (!r) continue;
+      discovered.push(...scanAnthropicNativeBinaries(path.join(r, "node_modules", "@anthropic-ai"), binName, 4));
+    }
+    if (discovered.length) {
+      return [...new Set([...discovered, ...fixed])];
+    }
+  }
+
+  return [...new Set(fixed)];
+}
+
+function getManagedClaudeCandidates() {
+  return collectClaudeCandidatesFromRoots([getPaths().claudeRuntimeDir]);
+}
+
+function getBundledClaudeCandidates() {
+  return collectClaudeCandidatesFromRoots(getBundledRoots());
 }
 
 /**
@@ -291,14 +405,44 @@ function runClaudeSync(rt, args, timeoutMs = 8000) {
   return spawnSync(rt.binary, args, { encoding: "utf8", env: cleanEnv, timeout: timeoutMs, windowsHide: true });
 }
 
-function readInstalledPkgVersionFast(rootDir) {
-  try {
-    const pkgPath = path.join(rootDir, "node_modules", "@anthropic-ai", "claude-code", "package.json");
-    if (fs.existsSync(pkgPath)) {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
-      if (pkg?.version) return `${pkg.version} (Claude Code)`;
+function readInstalledPkgVersionFast(rootDir, hitBinPath = "") {
+  const pkgCandidates = [];
+  if (hitBinPath) {
+    const binDir = path.dirname(hitBinPath);
+    pkgCandidates.push(path.join(binDir, "package.json"));
+    pkgCandidates.push(path.join(binDir, "..", "package.json"));
+  }
+  const searchRoots = [];
+  if (rootDir) {
+    if (path.resolve(rootDir) === path.resolve(PROJECT_ROOT)) {
+      searchRoots.push(...getBundledRoots());
+    } else {
+      if (process.resourcesPath && rootDir.includes("app.asar")) {
+        searchRoots.push(path.join(process.resourcesPath, "app.asar.unpacked"));
+      }
+      if (rootDir.includes("app.asar") && !rootDir.includes("app.asar.unpacked")) {
+        searchRoots.push(rootDir.replace("app.asar", "app.asar.unpacked"));
+      }
+      searchRoots.push(rootDir);
     }
-  } catch {}
+  }
+  const subPkgs = getPlatformSubPkgNames();
+  for (const r of searchRoots) {
+    if (!r) continue;
+    pkgCandidates.push(path.join(r, "node_modules", "@anthropic-ai", "claude-code", "package.json"));
+    for (const sub of subPkgs) {
+      pkgCandidates.push(path.join(r, "node_modules", "@anthropic-ai", "claude-code", "node_modules", "@anthropic-ai", sub, "package.json"));
+      pkgCandidates.push(path.join(r, "node_modules", "@anthropic-ai", sub, "package.json"));
+    }
+  }
+  for (const pkgPath of [...new Set(pkgCandidates)]) {
+    try {
+      if (fs.existsSync(pkgPath)) {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+        if (pkg?.version) return `${pkg.version} (Claude Code)`;
+      }
+    } catch {}
+  }
   return "installed";
 }
 
@@ -536,7 +680,7 @@ export function getClaudeRuntimeAndAuth(force = false) {
         mode: "native",
         binary: managedHit,
         isCmd: /\.(cmd|bat)$/i.test(managedHit),
-        version: readInstalledPkgVersionFast(iso.runtimeDir),
+        version: readInstalledPkgVersionFast(iso.runtimeDir, managedHit),
         managed: true,
         bundled: false,
       };
@@ -549,7 +693,7 @@ export function getClaudeRuntimeAndAuth(force = false) {
         mode: "native",
         binary: bundledHit,
         isCmd: /\.(cmd|bat)$/i.test(bundledHit),
-        version: readInstalledPkgVersionFast(PROJECT_ROOT),
+        version: readInstalledPkgVersionFast(PROJECT_ROOT, bundledHit),
         managed: false,
         bundled: true,
       };
@@ -970,15 +1114,23 @@ export async function checkClaudeVersions() {
     latestVer = parseSemverString(l);
     source = "official-gcs";
   } catch (e1) {
-    // Fallback to npm registry (works cleanly even on restricted networks)
+    // Fallback to npm registry / npmmirror (works cleanly even on restricted campus networks)
     try {
-      const raw = await fetchText("https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags", 7000);
+      const raw = await fetchText("https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags", 6000);
       const tags = JSON.parse(raw);
       stableVer = parseSemverString(tags.stable || tags.latest);
       latestVer = parseSemverString(tags.latest || tags.next);
       source = "npm-registry";
     } catch (e2) {
-      error = `无法联网查询官方版本通道: ${e2.message || e1.message}`;
+      try {
+        const rawCn = await fetchText("https://registry.npmmirror.com/-/package/@anthropic-ai/claude-code/dist-tags", 6000);
+        const tagsCn = JSON.parse(rawCn);
+        stableVer = parseSemverString(tagsCn.stable || tagsCn.latest);
+        latestVer = parseSemverString(tagsCn.latest || tagsCn.next);
+        source = "npmmirror";
+      } catch (e3) {
+        error = `无法联网查询官方版本通道: ${e3.message || e2.message || e1.message}`;
+      }
     }
   }
 
@@ -1147,129 +1299,495 @@ PY`;
   return removed;
 }
 
-/**
- * Install or switch Claude Code between `stable` and `latest` channels,
- * preserve config/auth migration, and automatically clean up unused old versions!
- */
-export async function installOrSwitchClaudeVersion({ channel = "stable", forceNativeWin = false, onProgress } = {}) {
-  const target = channel === "latest" ? "latest" : "stable";
-  const iso = getClaudeIsolationConfig();
-  const rt = detectClaudeRuntime(true);
-
-  logEvent("INFO", "claude_install", "start", `安装/切换原生 Claude Code -> ${target} (current=${rt.mode}, isolation=${iso.mode})`);
-  onProgress?.(
-    iso.mode === "isolated"
-      ? `正在 OpenCode Studio 私有隔离目录 (${iso.runtimeDir}) 中安装/切换原生 Claude Code (${target})，绝不影响系统原有 Claude Code…\n`
-      : `正在安装/切换原生 Claude Code (${target})，将保留您的账号与配置…\n`,
-  );
-
-  const runCmd = (spawnFn) =>
-    new Promise((resolve) => {
-      let output = "";
-      const proc = spawnFn();
-      const push = (chunk) => {
-        const s = chunk.toString("utf8");
-        output += s;
-        onProgress?.(s);
-      };
-      proc.stdout?.on("data", push);
-      proc.stderr?.on("data", push);
-      proc.on("error", (err) => resolve({ code: 1, output: output + `\n${err.message}` }));
-      proc.on("close", (code) => resolve({ code: code ?? 1, output }));
-    });
-
-  let runRes;
-  if (iso.mode === "isolated") {
-    // Strictly install/upgrade inside OpenCode Studio's private runtime folder — NEVER touches user's ~/.local/bin/claude or global npm!
-    fs.mkdirSync(iso.runtimeDir, { recursive: true });
-    const pkgJsonPath = path.join(iso.runtimeDir, "package.json");
-    if (!fs.existsSync(pkgJsonPath)) {
-      fs.writeFileSync(pkgJsonPath, JSON.stringify({ name: "opencode-studio-claude-runtime", private: true }, null, 2), "utf8");
+function parseTarSize(buf) {
+  if (!buf || buf.length === 0) return 0;
+  // GNU base-256 extension (high bit set on first byte)
+  if ((buf[0] & 0x80) !== 0) {
+    let val = 0;
+    for (let i = 1; i < buf.length; i++) {
+      val = val * 256 + buf[i];
     }
-    const se = getAllSettings().search_engine || {};
-    const npmArgs = ["install", "--prefix", iso.runtimeDir, "--no-audit", "--no-fund", `@anthropic-ai/claude-code@${target}`];
-    if (se.mode === "cn") {
-      npmArgs.push("--registry=https://registry.npmmirror.com");
-    }
-    onProgress?.(`执行私有隔离安装：npm ${npmArgs.join(" ")}\n`);
-    runRes = await runCmd(() =>
-      process.platform === "win32"
-        ? spawn("cmd.exe", ["/c", "npm", ...npmArgs], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
-        : spawn("npm", npmArgs, { stdio: ["ignore", "pipe", "pipe"] }),
-    );
-    // Remove duplicate bin/claude.exe hardlink inside private dir to keep footprint minimal
-    try {
-      const dupBin = path.join(iso.runtimeDir, "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe");
-      if (fs.existsSync(dupBin)) fs.unlinkSync(dupBin);
-    } catch {}
-  } else if (rt.mode !== "missing" && !(forceNativeWin && rt.mode === "wsl")) {
-    runRes = await runCmd(() =>
-      spawnClaudeProcess(rt, ["install", target, "--force"], {
-        cwd: os.homedir(),
-        env: {},
-        stdio: ["ignore", "pipe", "pipe"],
-      }),
-    );
-  } else if (process.platform === "win32") {
-    onProgress?.("正在调用官方 Windows 安装脚本（若无代理受限将自动回退 npm 安装）…\n");
-    runRes = await runCmd(() =>
-      spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", `irm https://claude.ai/install.ps1 | iex`], {
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      }),
-    );
-    if (runRes.code !== 0) {
-      onProgress?.(`\n官方直连安装未成功，正在自动回退 npm 安装 @anthropic-ai/claude-code@${target}…\n`);
-      runRes = await runCmd(() =>
-        spawn("cmd.exe", ["/c", "npm", "install", "-g", `@anthropic-ai/claude-code@${target}`], {
-          windowsHide: true,
-          stdio: ["ignore", "pipe", "pipe"],
-        }),
-      );
-    }
-  } else {
-    onProgress?.("正在调用官方安装脚本（若无代理受限将自动回退 npm 安装）…\n");
-    runRes = await runCmd(() =>
-      spawn("bash", ["-lc", `curl -fsSL https://claude.ai/install.sh | bash -s ${target}`], {
-        stdio: ["ignore", "pipe", "pipe"],
-      }),
-    );
-    if (runRes.code !== 0) {
-      onProgress?.(`\n官方直连安装未成功，正在自动回退 npm 安装 @anthropic-ai/claude-code@${target}…\n`);
-      runRes = await runCmd(() =>
-        spawn("npm", ["install", "-g", `@anthropic-ai/claude-code@${target}`], {
-          stdio: ["ignore", "pipe", "pipe"],
-        }),
-      );
+    return val;
+  }
+  // Standard POSIX ustar octal string: header.subarray(124, 136)
+  let end = buf.length;
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] === 0) {
+      end = i;
+      break;
     }
   }
+  const str = buf.subarray(0, end).toString("ascii").trim();
+  if (!str) return 0;
+  const parsed = parseInt(str, 8);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
 
-  clearRuntimeCache();
-  const nextRt = getClaudeRuntimeAndAuth(true);
-  let cleanup = { removed: 0, freed_mb: 0 };
-  if (runRes.code === 0 && nextRt.installed) {
-    ensureClaudeDirectReady(nextRt);
-    if (iso.mode === "isolated") {
-      onProgress?.("\n[隔离切换完成] 已在工作台私有目录完成版本更新，您的系统原有 Claude Code 与配置完全未受影响。\n");
-    } else {
-      cleanup = cleanupOldClaudeVersions(nextRt);
-      if (cleanup.removed > 0) {
-        onProgress?.(`\n[自动清理] 已保留现有配置完成迁移，并清理 ${cleanup.removed} 个旧版本二进制，释放约 ${cleanup.freed_mb} MB 空间。\n`);
-      } else {
-        onProgress?.("\n[迁移完成] 已保留原有账号与配置，无冗余旧版本残留。\n");
+function readTarString(buf) {
+  let end = buf.length;
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] === 0) {
+      end = i;
+      break;
+    }
+  }
+  return buf.subarray(0, end).toString("utf8").trim();
+}
+
+/**
+ * Pure Node.js gunzip + standard POSIX ustar (512-byte header blocks) extractor.
+ * Zero external tar/npm/powershell/curl dependencies!
+ */
+function extractClaudeBinaryFromTgz(tgzBuffer, binName) {
+  const tarBuf = zlib.gunzipSync(tgzBuffer);
+  const isWin = process.platform === "win32";
+  const targetLower = binName.toLowerCase();
+
+  let offset = 0;
+  let paxPath = "";
+  let paxSize = null;
+  let gnuLongPath = "";
+  let bestSlice = null;
+
+  while (offset + 512 <= tarBuf.length) {
+    const header = tarBuf.subarray(offset, offset + 512);
+    let allZero = true;
+    for (let i = 0; i < 512; i++) {
+      if (header[i] !== 0) {
+        allZero = false;
+        break;
       }
     }
+    if (allZero) {
+      offset += 512;
+      continue;
+    }
+
+    const rawName = readTarString(header.subarray(0, 100));
+    const magic = header.subarray(257, 262).toString("ascii");
+    const prefix = magic === "ustar" ? readTarString(header.subarray(345, 500)) : "";
+    const fileSize = paxSize !== null ? paxSize : parseTarSize(header.subarray(124, 136));
+    const typeFlagByte = header[156];
+    const typeFlag = typeFlagByte === 0 ? "0" : String.fromCharCode(typeFlagByte);
+
+    const dataStart = offset + 512;
+    const dataEnd = Math.min(tarBuf.length, dataStart + fileSize);
+    const paddedLen = Math.ceil(fileSize / 512) * 512;
+
+    if (typeFlag === "x" || typeFlag === "g") {
+      const paxText = tarBuf.subarray(dataStart, dataEnd).toString("utf8");
+      for (const line of paxText.split("\n")) {
+        const sp = line.indexOf(" ");
+        if (sp <= 0) continue;
+        const kv = line.slice(sp + 1);
+        const eq = kv.indexOf("=");
+        if (eq <= 0) continue;
+        const k = kv.slice(0, eq);
+        const v = kv.slice(eq + 1);
+        if (typeFlag === "x") {
+          if (k === "path") paxPath = v;
+          else if (k === "size") {
+            const n = Number(v);
+            if (Number.isFinite(n) && n >= 0) paxSize = n;
+          }
+        }
+      }
+      offset += 512 + paddedLen;
+      continue;
+    }
+
+    if (typeFlag === "L") {
+      gnuLongPath = readTarString(tarBuf.subarray(dataStart, dataEnd));
+      offset += 512 + paddedLen;
+      continue;
+    }
+
+    const fullPath = (paxPath || gnuLongPath || (prefix ? `${prefix}/${rawName}` : rawName)).replace(/\\/g, "/");
+    paxPath = "";
+    paxSize = null;
+    gnuLongPath = "";
+
+    if ((typeFlag === "0" || typeFlag === "") && fileSize > 0) {
+      const base = path.posix.basename(fullPath);
+      const matched = isWin ? base.toLowerCase() === targetLower : base === binName;
+      if (matched) {
+        const slice = tarBuf.subarray(dataStart, dataEnd);
+        if (!bestSlice || slice.length > bestSlice.length) {
+          bestSlice = slice;
+        }
+      }
+    }
+
+    offset += 512 + paddedLen;
   }
 
-  logEvent("INFO", "claude_install", "done", `Claude Code (${target}) 切换结束 rc=${runRes.code}, version=${nextRt.version}, cleaned=${cleanup.removed}`);
-  return {
-    ok: runRes.code === 0 && nextRt.installed,
-    code: runRes.code,
-    channel: target,
-    cleanup,
-    output: runRes.output.slice(-4000),
-    runtime: nextRt,
+  return bestSlice;
+}
+
+/**
+ * Reset managed private upgrade runtime and seamlessly fall back to the installer's bundled Claude Code binary!
+ */
+export async function resetToBundledClaudeRuntime() {
+  const runtimeDir = getPaths().claudeRuntimeDir;
+  try {
+    fs.mkdirSync(runtimeDir, { recursive: true });
+    for (const entry of ["node_modules", "package.json", "package-lock.json"]) {
+      const fp = path.join(runtimeDir, entry);
+      if (fs.existsSync(fp)) {
+        fs.rmSync(fp, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+      }
+    }
+  } catch (err) {
+    logEvent("WARN", "claude_install", "reset_bundled_cleanup_warn", `清理私有升级目录警告: ${err.message}`);
+  }
+  clearRuntimeCache();
+  const rt = await refreshClaudeRuntimeAndAuthAsync(true);
+  logEvent("INFO", "claude_install", "reset_bundled", `已恢复安装包内置原生 Claude Code (${rt.version || "none"})`);
+  return rt;
+}
+
+/**
+ * Pure Node.js streaming installer/switcher for native Claude Code (`stable` / `latest`).
+ * Zero external `npm`, `powershell irm`, or `curl` dependencies — works 100% out-of-the-box on fresh student PCs!
+ * Downloads safely into `getPaths().claudeRuntimeDir` regardless of `isolated` or `shared` config mode.
+ */
+export async function installOrSwitchClaudeVersion({ channel = "stable", onProgress, onPercent } = {}) {
+  const target = channel === "latest" ? "latest" : "stable";
+  const runtimeDir = getPaths().claudeRuntimeDir;
+  const binName = process.platform === "win32" ? "claude.exe" : "claude";
+  let logBuf = "";
+  let tmpBinPath = "";
+
+  const pushLog = (txt) => {
+    logBuf += txt;
+    onProgress?.(txt);
   };
+
+  logEvent("INFO", "claude_install", "start", `纯内置流式安装/切换原生 Claude Code -> ${target}`);
+
+  try {
+    onPercent?.({ stage: "resolving", percent: 4, message: "正在解析官方版本元数据…" });
+    pushLog(`正在解析原生 Claude Code (${target}) 官方版本元数据…\n`);
+
+    const se = getAllSettings().search_engine || {};
+    const proxyUrl = String(se.proxy_url || "").trim();
+    const preferGlobal = Boolean(proxyUrl) || se.mode === "proxy" || se.mode === "global";
+    const registries = preferGlobal
+      ? ["https://registry.npmjs.org", "https://registry.npmmirror.com"]
+      : ["https://registry.npmmirror.com", "https://registry.npmjs.org"];
+
+    const subPkgCandidates = getPlatformSubPkgNames();
+
+    const smartFetch = async (url, { timeoutMs = 12000, isCnMirror = false } = {}) => {
+      const attempt = async (effectiveProxy) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const res = await proxyFetch(url, {
+            headers: {
+              "User-Agent": "OpenCodeStudio/2.1",
+              Accept: "application/json, application/octet-stream, */*",
+            },
+            signal: controller.signal,
+            proxyUrl: effectiveProxy,
+          });
+          return res;
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+
+      if (isCnMirror) {
+        try {
+          return await attempt("");
+        } catch (e) {
+          if (proxyUrl) return await attempt(proxyUrl);
+          throw e;
+        }
+      }
+      try {
+        return await attempt(proxyUrl);
+      } catch (e) {
+        if (proxyUrl) return await attempt("");
+        throw e;
+      }
+    };
+
+    const fetchJson = async (url, isCnMirror) => {
+      const res = await smartFetch(url, { timeoutMs: 12000, isCnMirror });
+      if (!res.ok) {
+        const err = new Error(`HTTP ${res.status} (${url})`);
+        err.status = res.status;
+        throw err;
+      }
+      return await res.json();
+    };
+
+    const downloadTarballWithProgress = async (tarballUrl, ver, isCnMirror) => {
+      const tryStream = async (effectiveProxy) => {
+        const controller = new AbortController();
+        let idleTimer = setTimeout(() => controller.abort(), 30000);
+        const resetIdle = () => {
+          clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => controller.abort(), 30000);
+        };
+        try {
+          const res = await proxyFetch(tarballUrl, {
+            headers: { "User-Agent": "OpenCodeStudio/2.1" },
+            signal: controller.signal,
+            proxyUrl: effectiveProxy,
+          });
+          if (!res.ok) throw new Error(`下载返回 HTTP ${res.status}`);
+          if (!res.body) throw new Error("响应体为空");
+
+          const totalBytes = Number(res.headers.get("content-length") || 0);
+          const totalMb = totalBytes > 0 ? Number((totalBytes / (1024 * 1024)).toFixed(1)) : null;
+          const chunks = [];
+          let downloadedBytes = 0;
+          const startedAt = Date.now();
+          let lastEmitAt = 0;
+
+          const reader = res.body.getReader();
+          while (true) {
+            resetIdle();
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value && value.byteLength > 0) {
+              const buf = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+              chunks.push(buf);
+              downloadedBytes += buf.length;
+
+              const now = Date.now();
+              if (now - lastEmitAt >= 150 || (totalBytes > 0 && downloadedBytes >= totalBytes)) {
+                lastEmitAt = now;
+                const elapsedSec = Math.max(0.05, (now - startedAt) / 1000);
+                const downloadedMb = Number((downloadedBytes / (1024 * 1024)).toFixed(1));
+                const speedMbps = Number((downloadedBytes / (1024 * 1024) / elapsedSec).toFixed(2));
+                const percent =
+                  totalBytes > 0
+                    ? Math.min(88, Math.max(8, Math.round(8 + (downloadedBytes / totalBytes) * 80)))
+                    : Math.min(86, Math.max(8, Math.round(8 + (1 - Math.exp(-downloadedBytes / (55 * 1024 * 1024))) * 78)));
+                const msg = totalMb
+                  ? `正在下载 Claude Code v${ver} (${downloadedMb} / ${totalMb} MB · ${speedMbps} MB/s)…`
+                  : `正在下载 Claude Code v${ver} (已下载 ${downloadedMb} MB · ${speedMbps} MB/s)…`;
+                onPercent?.({
+                  stage: "downloading",
+                  percent,
+                  downloaded_mb: downloadedMb,
+                  total_mb: totalMb,
+                  speed_mbps: speedMbps,
+                  version: ver,
+                  message: msg,
+                });
+              }
+            }
+          }
+          if (downloadedBytes < 1024 * 1024) {
+            throw new Error(`下载的数据包体积异常 (${downloadedBytes} bytes)`);
+          }
+          return Buffer.concat(chunks, downloadedBytes);
+        } finally {
+          clearTimeout(idleTimer);
+        }
+      };
+
+      if (isCnMirror) {
+        try {
+          return await tryStream("");
+        } catch (e) {
+          if (proxyUrl) return await tryStream(proxyUrl);
+          throw e;
+        }
+      }
+      try {
+        return await tryStream(proxyUrl);
+      } catch (e) {
+        if (proxyUrl) return await tryStream("");
+        throw e;
+      }
+    };
+
+    let ver = "";
+    let platPkgName = "";
+    let tgzBuf = null;
+    let lastMirrorErr = null;
+
+    for (const reg of registries) {
+      const isCnMirror = reg.includes("npmmirror.com");
+      try {
+        pushLog(`正在从镜像源 ${reg} 查询 @anthropic-ai/claude-code@${target}…\n`);
+        let pkgMeta;
+        try {
+          pkgMeta = await fetchJson(`${reg}/@anthropic-ai/claude-code/${target}`, isCnMirror);
+        } catch (tagErr) {
+          if (target === "stable" && tagErr.status === 404) {
+            pkgMeta = await fetchJson(`${reg}/@anthropic-ai/claude-code/latest`, isCnMirror);
+          } else {
+            throw tagErr;
+          }
+        }
+        ver = parseSemverString(pkgMeta?.version);
+        if (!ver) throw new Error("未解析到有效版本号");
+
+        let tarballUrl = "";
+        let resolvedSubPkg = "";
+        for (const cand of subPkgCandidates) {
+          try {
+            const platMeta = await fetchJson(`${reg}/@anthropic-ai/${cand}/${ver}`, isCnMirror);
+            if (platMeta?.dist?.tarball) {
+              tarballUrl = platMeta.dist.tarball;
+              resolvedSubPkg = cand;
+              break;
+            }
+          } catch (subErr) {
+            if (subErr.status === 404) continue;
+            throw subErr;
+          }
+        }
+        if (!tarballUrl || !resolvedSubPkg) {
+          throw new Error(`当前平台 (${process.platform}-${process.arch}) 暂无匹配的官方原生包 (v${ver})`);
+        }
+
+        platPkgName = resolvedSubPkg;
+        pushLog(`已锁定版本 v${ver} (@anthropic-ai/${platPkgName})，开始流式下载安装包…\n`);
+        onPercent?.({
+          stage: "downloading",
+          percent: 8,
+          downloaded_mb: 0,
+          total_mb: null,
+          speed_mbps: 0,
+          version: ver,
+          message: `正在连接镜像源下载 Claude Code v${ver}…`,
+        });
+
+        tgzBuf = await downloadTarballWithProgress(tarballUrl, ver, isCnMirror);
+        break;
+      } catch (err) {
+        lastMirrorErr = err;
+        pushLog(`镜像源 ${reg} 未能完成下载 (${err.message})，尝试切换备用镜像源…\n`);
+      }
+    }
+
+    if (!tgzBuf || !ver || !platPkgName) {
+      throw lastMirrorErr || new Error("所有可用镜像源均连接失败，请检查网络连接");
+    }
+
+    onPercent?.({
+      stage: "extracting",
+      percent: 92,
+      version: ver,
+      message: `正在解压 Claude Code v${ver} 原生内核…`,
+    });
+    pushLog(`下载完成 (${(tgzBuf.length / (1024 * 1024)).toFixed(1)} MB)，正在纯内置解压原生二进制…\n`);
+
+    const binarySlice = extractClaudeBinaryFromTgz(tgzBuf, binName);
+    if (!binarySlice || binarySlice.length < 5 * 1024 * 1024) {
+      throw new Error(`安装包内未找到有效的 ${binName} 原生可执行文件`);
+    }
+
+    const destDir = path.join(runtimeDir, "node_modules", "@anthropic-ai", platPkgName);
+    fs.mkdirSync(destDir, { recursive: true });
+    tmpBinPath = path.join(destDir, ".claude.tmp");
+    fs.writeFileSync(tmpBinPath, binarySlice);
+    tgzBuf = null; // allow GC immediately
+
+    if (process.platform !== "win32") {
+      fs.chmodSync(tmpBinPath, 0o755);
+    }
+
+    onPercent?.({
+      stage: "verifying",
+      percent: 97,
+      version: ver,
+      message: `正在验证 Claude Code v${ver} 可执行性…`,
+    });
+    pushLog(`正在校验原生二进制可执行性 (--version)…\n`);
+
+    const verifyRes = await spawnAsyncText(tmpBinPath, ["--version"], { timeoutMs: 8000 });
+    if (verifyRes.status !== 0 || !/claude|\d+\.\d+/i.test(verifyRes.stdout || "")) {
+      throw new Error(`原生二进制启动校验失败 (exit=${verifyRes.status}): ${(verifyRes.stderr || verifyRes.stdout || "").trim()}`);
+    }
+
+    const finalBinPath = path.join(destDir, binName);
+    try {
+      if (process.platform !== "win32" && fs.existsSync(finalBinPath)) {
+        fs.chmodSync(finalBinPath, 0o755);
+      }
+    } catch {}
+    fs.renameSync(tmpBinPath, finalBinPath);
+    tmpBinPath = "";
+    if (process.platform !== "win32") {
+      try {
+        fs.chmodSync(finalBinPath, 0o755);
+      } catch {}
+    }
+
+    // Write package metadata for instant cold-boot version inspection
+    fs.writeFileSync(
+      path.join(destDir, "package.json"),
+      JSON.stringify({ name: `@anthropic-ai/${platPkgName}`, version: ver }, null, 2),
+      "utf8",
+    );
+    const metaPkgDir = path.join(runtimeDir, "node_modules", "@anthropic-ai", "claude-code");
+    fs.mkdirSync(metaPkgDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(metaPkgDir, "package.json"),
+      JSON.stringify({ name: "@anthropic-ai/claude-code", version: ver }, null, 2),
+      "utf8",
+    );
+    // Remove any legacy npm-installed wrapper inside private runtime dir so our verified binary always wins
+    try {
+      const legacyBinDir = path.join(metaPkgDir, "bin");
+      if (fs.existsSync(legacyBinDir)) {
+        fs.rmSync(legacyBinDir, { recursive: true, force: true });
+      }
+    } catch {}
+
+    clearRuntimeCache();
+    const nextRt = await refreshClaudeRuntimeAndAuthAsync(true);
+    ensureClaudeDirectReady(nextRt);
+
+    const doneMsg = `Claude Code v${ver} (${target}) 安装就绪！已安全部署于工作台私有目录，不影响系统环境。`;
+    pushLog(`\n[安装完成] ${doneMsg}\n`);
+    onPercent?.({
+      stage: "done",
+      percent: 100,
+      version: ver,
+      message: doneMsg,
+    });
+
+    logEvent("INFO", "claude_install", "done", `Claude Code (${target}) 安装成功 version=${nextRt.version}`);
+    return {
+      ok: true,
+      code: 0,
+      channel: target,
+      version: ver,
+      percent: 100,
+      stage: "done",
+      output: logBuf.slice(-4000),
+      runtime: nextRt,
+    };
+  } catch (err) {
+    if (tmpBinPath) {
+      try {
+        if (fs.existsSync(tmpBinPath)) fs.unlinkSync(tmpBinPath);
+      } catch {}
+    }
+    pushLog(`\n[安装失败] ${err.message}\n`);
+    onPercent?.({
+      stage: "error",
+      percent: 0,
+      error: err.message,
+      message: `安装失败：${err.message}`,
+    });
+    logEvent("WARN", "claude_install", "failed", `Claude Code (${target}) 安装失败: ${err.message}`);
+    return {
+      ok: false,
+      error: err.message,
+      output: logBuf.slice(-4000),
+      runtime: await refreshClaudeRuntimeAndAuthAsync(true),
+    };
+  }
 }
 
 export function buildCustomPromptAndMcp(cwd, rtMode, { webSearchEnabled = null } = {}) {

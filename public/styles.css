@@ -2868,6 +2868,102 @@ body.zen-wallpaper-mode .wallpaper-web {
   background: #ffffff;
 }
 
+/* Copyable Proxy Hints, Protected Bundled Kernel Drawer & Live Download Progress Bar */
+.info-box,
+.modal-sub,
+.updater-result,
+.proxy-hint-bar {
+  user-select: text;
+  -webkit-user-select: text;
+}
+.proxy-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.proxy-input-row .text-input {
+  flex: 1;
+}
+.proxy-hint-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.copyable-proxy {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  color: var(--brand);
+  cursor: pointer;
+  user-select: text;
+  -webkit-user-select: text;
+  transition: background var(--dur-fast), border-color var(--dur-fast), transform var(--dur-fast) var(--ease-spring);
+}
+.copyable-proxy:hover {
+  background: var(--brand-soft);
+  border-color: var(--brand);
+}
+.copyable-proxy:active {
+  transform: scale(0.96);
+}
+
+.kernel-adv-details {
+  margin-top: 10px;
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+.kernel-adv-details > summary {
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.kernel-adv-details > summary:hover {
+  color: var(--text-primary);
+}
+.kernel-adv-body {
+  margin-top: 10px;
+}
+
+.install-progress-wrap {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: rgb(var(--surface-rgb));
+}
+.install-progress-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 560;
+  color: var(--text-primary);
+  margin-bottom: 7px;
+}
+.install-progress-track {
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.install-progress-bar {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--brand) 0%, #38bdf8 100%);
+  transition: width 0.2s ease;
+}
+
 /* Accessibility: respect OS Reduced Motion preference */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

@@ -22,6 +22,7 @@ import {
   getClaudeRuntimeAndAuth,
   installOrSwitchClaudeVersion,
   refreshClaudeRuntimeAndAuthAsync,
+  resetToBundledClaudeRuntime,
   runClaudeAuthLogin,
   runClaudeAuthLogout,
   submitClaudeAuthCode,
@@ -862,9 +863,16 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           channel: body.channel === "latest" ? "latest" : "stable",
           forceNativeWin: Boolean(body.force_native_win),
           onProgress: (chunk) => broadcast({ type: "claude_install_log", text: chunk }),
+          onPercent: (prog) => broadcast({ type: "claude_install_progress", ...prog }),
         });
         broadcast({ type: "claude_status_updated", claude_native: result.runtime || getClaudeRuntimeAndAuth(true) });
         return sendJson(res, 200, result);
+      }
+      if (method === "POST" && pathname === "/api/claude/reset-bundled") {
+        await readJsonBody(req).catch(() => ({}));
+        const rt = await resetToBundledClaudeRuntime();
+        broadcast({ type: "claude_status_updated", claude_native: rt });
+        return sendJson(res, 200, { ok: true, runtime: rt });
       }
 
       // ==================== SETTINGS ====================

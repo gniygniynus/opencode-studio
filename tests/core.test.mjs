@@ -832,4 +832,51 @@ describe("OpenCode Studio Core Suite", () => {
     assert.ok(webHtml.includes("applyUserProperties"), "must inject WE user properties listener hook");
     assert.ok(webHtml.includes('"speed"'), "must pass project.json default property values");
   });
+
+  it("detects nested electron-builder app.asar.unpacked Claude Code binary and supports one-click reset to bundled", async () => {
+    const { clearRuntimeCache, getClaudeRuntimeAndAuth } = await import("../server/claude_runtime.mjs");
+    const mockResDir = path.join(tmpWorkdir, "mock_electron_resources");
+    const binName = process.platform === "win32" ? "claude.exe" : "claude";
+    const subPkg = `claude-code-${process.platform}-${process.arch}`;
+    const nestedPkgDir = path.join(
+      mockResDir,
+      "app.asar.unpacked",
+      "node_modules",
+      "@anthropic-ai",
+      "claude-code",
+      "node_modules",
+      "@anthropic-ai",
+      subPkg,
+    );
+    const parentPkgDir = path.join(mockResDir, "app.asar.unpacked", "node_modules", "@anthropic-ai", "claude-code");
+    fs.mkdirSync(nestedPkgDir, { recursive: true });
+    fs.writeFileSync(path.join(parentPkgDir, "package.json"), JSON.stringify({ name: "@anthropic-ai/claude-code", version: "2.1.323" }));
+    fs.writeFileSync(path.join(nestedPkgDir, "package.json"), JSON.stringify({ name: `@anthropic-ai/${subPkg}`, version: "2.1.323" }));
+    const nestedBinPath = path.join(nestedPkgDir, binName);
+    fs.writeFileSync(nestedBinPath, Buffer.alloc(64, 0x7f));
+
+    const origResourcesPath = process.resourcesPath;
+    process.resourcesPath = mockResDir;
+    try {
+      clearRuntimeCache();
+      const fastSnap = getClaudeRuntimeAndAuth(false);
+      assert.equal(fastSnap.installed, true, "must detect nested electron-builder unpacked binary on cold boot");
+      assert.equal(fastSnap.bundled, true);
+      assert.equal(path.resolve(fastSnap.binary), path.resolve(nestedBinPath));
+      assert.ok(String(fastSnap.version || "").includes("2.1.323"));
+    } finally {
+      if (origResourcesPath === undefined) delete process.resourcesPath;
+      else process.resourcesPath = origResourcesPath;
+      clearRuntimeCache();
+    }
+
+    // Verify POST /api/claude/reset-bundled cleans up private runtime overrides safely
+    const resetRes = await fetch(`${studioServer.url}/api/claude/reset-bundled`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }).then((r) => r.json());
+    assert.equal(resetRes.ok, true);
+    assert.ok(resetRes.runtime);
+  });
 });

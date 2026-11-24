@@ -861,14 +861,13 @@
     const info = getSelectedModelInfo();
     const tSel = $("thinking-select");
     const gdThink = $("gd-thinking");
-    const capBadge = $("model-cap-badge");
 
     if (prov && $("model-select").value) {
       const mLabel = info?.display_name || $("model-select").value;
       const ccTag = state.claudeNative?.installed
         ? `${state.claudeNative.bundled ? "内置原生" : "原生"} Claude Code ${state.claudeNative.version}`
-        : "原生 Claude Code（未检测到）";
-      $("sidebar-prov-model").textContent = `${mLabel} · ${fmtTokens(info?.context_window || 128000)} 上下文`;
+        : "内置开放 API 引擎";
+      $("sidebar-prov-model").textContent = mLabel;
       $("composer-engine-note").textContent =
         prov.kind === "claude_native"
           ? `${ccTag} · 官方 Auth (${mLabel})`
@@ -878,12 +877,6 @@
       if (ml) ml.textContent = mLabel;
     }
 
-    if (info) {
-      capBadge.textContent = `${fmtTokens(info.context_window)} 上下文${info.vision ? " · 识图" : ""}`;
-      capBadge.classList.remove("hidden");
-    } else {
-      capBadge.classList.add("hidden");
-    }
     updateContextDisplay();
 
     if (!info || !info.thinking_supported || !info.thinking_levels?.length) {
@@ -2011,6 +2004,24 @@
       }
       return;
     }
+    if (t === "claude_install_progress") {
+      const wrap = $("claude-install-progress-wrap");
+      const lbl = $("claude-progress-label");
+      const meta = $("claude-progress-meta");
+      const bar = $("claude-progress-bar");
+      if (wrap) wrap.classList.remove("hidden");
+      const pct = Math.max(0, Math.min(100, Math.round(Number(msg.percent) || 0)));
+      if (bar) bar.style.width = `${pct}%`;
+      if (lbl) lbl.textContent = msg.message || "正在下载并校验内核…";
+      if (meta) {
+        const sizePart =
+          msg.downloaded_mb !== undefined && msg.total_mb
+            ? `${msg.downloaded_mb} / ${msg.total_mb} MB` + (msg.speed_mbps ? ` · ${msg.speed_mbps} MB/s` : "") + ` (${pct}%)`
+            : `${pct}%`;
+        meta.textContent = sizePart;
+      }
+      return;
+    }
     if (t === "claude_install_log") {
       const pre = $("claude-install-log");
       if (pre && msg.text) {
@@ -2106,13 +2117,8 @@
   }
 
   function syncWebSearchToggle() {
-    const btn = $("btn-toggle-websearch");
-    if (!btn) return;
-    const on = isWebSearchEnabled();
-    btn.classList.toggle("is-on", on);
-    btn.title = on
-      ? "实时联网搜索已开启（免 Key 双引擎检索最新网页与新闻 · 点击可关闭）"
-      : "实时联网搜索已关闭（点击开启，或输入 /web 关键词 单次触发）";
+    const sel = $("set-web-search");
+    if (sel) sel.value = isWebSearchEnabled() ? "on" : "off";
   }
 
   async function toggleWebSearch() {
@@ -2378,19 +2384,27 @@
 
   function renderClaudeStatusViews() {
     const cn = state.claudeNative;
-    const modeLabel = cn?.mode === "wsl" ? "WSL2 原生内核" : cn?.mode === "native" ? "本机原生内核" : "未安装";
+    const modeLabel = cn?.bundled
+      ? "随包内置适配内核"
+      : cn?.managed
+        ? "私有隔离升级内核"
+        : cn?.mode === "wsl"
+          ? "WSL2 原生内核"
+          : cn?.mode === "native"
+            ? "本机原生内核"
+            : "未安装";
     const loggedIn = Boolean(cn?.auth?.loggedIn);
     const authDetailText = !cn || !cn.installed
-      ? "未检测到原生 Claude Code（可前往「设置」一键安装稳定版或最新版）"
+      ? "正在检测内置原生 Claude Code 内核（若处于源码模式未装依赖，可在设置高级维护中一键下载）"
       : loggedIn
         ? `已登录（${cn.auth.authMethod || "OAuth"}${cn.auth.email ? ` · ${cn.auth.email}` : ""}${cn.auth.subscriptionType ? ` · ${cn.auth.subscriptionType}` : ""}）· 内核 ${cn.version} (${modeLabel})`
-        : `未登录官方账号 · 内核 ${cn.version} (${modeLabel})，点击下方按钮执行官方 OAuth 登录`;
+        : `未登录官方账号 · 内核 ${cn.version} (${modeLabel})，点击下方按钮执行官方 OAuth 登录（使用第三方 API 则无需登录此处）`;
 
     const statusBox = $("claude-native-status-box");
     if (statusBox) {
       statusBox.innerHTML = cn
-        ? `<b>原生 Claude Code 内核：</b>${cn.installed ? `${escHtml(cn.version)} (${modeLabel})` : "未安装"}<br />` +
-          `<b>官方 Auth：</b>${loggedIn ? `<span style="color:var(--ok);">● 已登录</span>` : `<span style="color:var(--muted);">○ 未登录</span>`}<br />` +
+        ? `<b>原生 Claude Code 内核：</b>${cn.installed ? `<span style="color:var(--ok);">● 已就绪</span> ${escHtml(cn.version)} (${modeLabel})` : "未就绪"}<br />` +
+          `<b>官方 Auth：</b>${loggedIn ? `<span style="color:var(--ok);">● 已登录</span>` : `<span style="color:var(--muted);">○ 未登录（用内置 API 无需登录）</span>`}<br />` +
           `${escHtml(cn.note || "")}`
         : "";
     }
@@ -2399,17 +2413,43 @@
     const logoutBtn = $("btn-claude-auth-logout");
     if (logoutBtn) logoutBtn.disabled = !cn?.installed || !loggedIn;
 
+    const pill = $("claude-bundled-pill");
+    if (pill) {
+      if (cn?.installed && cn?.bundled) {
+        pill.textContent = "● 内置适配版已就绪";
+        pill.className = "store-badge is-installed";
+      } else if (cn?.installed) {
+        pill.textContent = cn.managed ? "● 已切换自定义版本" : "● 本机内核已就绪";
+        pill.className = "store-badge is-official";
+      } else {
+        pill.textContent = cn?.probing ? "检测中…" : "需初始化";
+        pill.className = "store-badge";
+      }
+    }
+
+    const resetBtn = $("btn-claude-reset-bundled");
+    if (resetBtn) {
+      resetBtn.disabled = Boolean(cn?.bundled);
+    }
+
+    const advDetails = $("claude-kernel-adv");
+    if (advDetails && cn && !cn.installed && !cn.probing) {
+      advDetails.open = true;
+    }
+
     const verLine = $("claude-core-ver-line");
     if (verLine) {
       verLine.textContent = cn?.installed
-        ? `当前已接入原生 Claude Code ${cn.version}（${modeLabel} · ${cn.binary || ""}）`
-        : "未检测到本机原生 Claude Code，点击右侧按钮自动安装稳定版或最新版";
+        ? cn.bundled
+          ? `已自动启用随本软件内置并完整适配的原生 Claude Code ${cn.version}（无需学生额外安装内核）`
+          : `当前已接入原生 Claude Code ${cn.version}（${modeLabel}）`
+        : "未检测到内置二进制（源码运行模式），可在下方高级维护中一键下载";
     }
     const engineNote = $("composer-engine-note");
     if (engineNote) {
       engineNote.textContent = cn?.installed
-        ? `驱动内核：原生 Claude Code ${cn.version}`
-        : "驱动内核：内置开放 API 引擎（可在设置中安装原生 Claude Code）";
+        ? `驱动内核：${modeLabel} ${cn.version}`
+        : "驱动内核：内置开放 API 引擎";
     }
   }
 
@@ -3494,17 +3534,17 @@
       const savedPrompt = s.system_prompt !== undefined && s.system_prompt !== null ? String(s.system_prompt) : "";
       if (!state._promptDirty) $("set-system-prompt").value = savedPrompt;
       if ($("set-prompt-mode")) $("set-prompt-mode").value = s.prompt_mode || "replace";
+      if ($("set-web-search")) $("set-web-search").value = s.web_search_enabled === false ? "off" : "on";
       if ($("set-search-mode")) $("set-search-mode").value = s.search_engine?.mode || "auto";
       if ($("set-search-proxy")) $("set-search-proxy").value = s.search_engine?.proxy_url || "";
       if ($("set-claude-isolation")) $("set-claude-isolation").value = s.claude_isolation || "isolated";
       $("set-permission-mode").value = s.permission_mode || "auto";
       $("set-default-cwd").value = s.default_cwd || "";
-      $("set-update-channel").value = s.update_channel || "stable";
     };
     state._promptDirty = false;
     syncFieldsFromSettings(state.settings || {});
     setPromptSaveBadge("ok", "● 已保存");
-    $("updater-current-line").textContent = `当前外壳版本：v${state.version} · 仓库：github.com/gniygniynus/opencode-studio`;
+    $("updater-current-line").textContent = `当前版本：v${state.version} · 官方仓库：github.com/gniygniynus/opencode-studio`;
     renderClaudeStatusViews();
     renderDbStats();
     // Fetch fresh persisted settings & live DB stats in parallel
@@ -3557,6 +3597,24 @@
     }
   }
 
+  async function resetToBundledClaudeCore() {
+    const btn = $("btn-claude-reset-bundled");
+    if (btn) btn.disabled = true;
+    try {
+      const res = await apiJson("/api/claude/reset-bundled", { method: "POST", body: JSON.stringify({}) });
+      if (res.runtime) {
+        state.claudeNative = res.runtime;
+        renderClaudeStatusViews();
+      }
+      $("claude-install-progress-wrap")?.classList.add("hidden");
+      toast(`已恢复随软件内置的完整适配版内核 (${res.runtime?.version || "已就绪"})`, 3800);
+    } catch (err) {
+      toast("恢复内置内核失败: " + err.message, 4000);
+    } finally {
+      renderClaudeStatusViews();
+    }
+  }
+
   async function installOrSwitchClaudeCore(channel) {
     const label = channel === "latest" ? "最新版 (latest)" : "稳定版 (stable)";
     const vInfo = state.lastClaudeVersions;
@@ -3564,29 +3622,38 @@
       channel === "latest"
         ? (vInfo?.latest_version ? ` (v${vInfo.latest_version})` : "")
         : (vInfo?.stable_version ? ` (v${vInfo.stable_version})` : "");
-    const curHint = state.claudeNative?.version ? `当前版本：${state.claudeNative.version}` : "当前本机尚未安装原生 Claude Code";
+    const curHint = state.claudeNative?.version ? `当前内核：${state.claudeNative.version}` : "当前尚未检测到内核";
 
     if (
       !window.confirm(
-        `确认安装/切换原生 Claude Code 到「${label}${targetVerHint}」？\n\n` +
+        `确认在线下载原生 Claude Code「${label}${targetVerHint}」？\n\n` +
           `${curHint}\n` +
-          `• 切换过程会自动保留您的账号登录状态与原有配置\n` +
-          `• 迁移成功后会自动清理旧版本残留二进制文件，释放磁盘空间`,
+          `• 提示：本软件安装包已自带经过完整适配验证的内核，日常无需升级\n` +
+          `• 下载的新内核仅存放在工作台私有目录，随时可点击「恢复软件内置适配版内核」一键回退`,
       )
     ) {
       return;
     }
 
     const pre = $("claude-install-log");
+    const progWrap = $("claude-install-progress-wrap");
+    const progBar = $("claude-progress-bar");
+    const progLbl = $("claude-progress-label");
+    const progMeta = $("claude-progress-meta");
     const btnS = $("btn-claude-install-stable");
     const btnL = $("btn-claude-install-latest");
     if (btnS) btnS.disabled = true;
     if (btnL) btnL.disabled = true;
+    if (progWrap) {
+      progWrap.classList.remove("hidden");
+      if (progBar) progBar.style.width = "2%";
+      if (progLbl) progLbl.textContent = `正在连接镜像源获取 ${label}…`;
+      if (progMeta) progMeta.textContent = "2%";
+    }
     if (pre) {
       pre.classList.remove("hidden");
-      pre.textContent = `>>> 正在安装 / 切换原生 Claude Code ${label}，请稍候…\n`;
+      pre.textContent = `>>> 开始在线下载原生 Claude Code ${label}（内置流式下载，无需本机安装 Node/npm）…\n`;
     }
-    toast(`正在安装/切换原生 Claude Code ${label}…`, 3500);
     try {
       const res = await apiJson("/api/claude/install", {
         method: "POST",
@@ -3603,47 +3670,52 @@
         pre.scrollTop = pre.scrollHeight;
       }
       if (res.ok) {
-        const cleanNote = res.cleanup?.removed ? `，已清理 ${res.cleanup.removed} 个旧版本 (${res.cleanup.freed_mb}MB)` : "";
-        toast(`原生 Claude Code ${label} 已就绪 (${state.claudeNative?.version || ""})${cleanNote}`, 5000);
+        if (progBar) progBar.style.width = "100%";
+        if (progLbl) progLbl.textContent = `下载并校验完成 (${state.claudeNative?.version || ""})`;
+        if (progMeta) progMeta.textContent = "100%";
+        toast(`原生 Claude Code ${label} 已就绪 (${state.claudeNative?.version || ""})`, 4500);
         checkClaudeCoreVersions();
       } else {
-        toast(`切换失败：${res.error || "请查看下方日志"}`, 5000);
+        toast(`下载切换未成功：${res.error || "已自动保留软件内置内核可用"}`, 5000);
       }
     } catch (err) {
       if (pre) pre.textContent += `\n[ERROR] ${err.message}`;
-      toast("安装/切换失败: " + err.message, 4500);
+      toast("在线下载失败（软件内置内核不受影响）: " + err.message, 4500);
     } finally {
       if (btnS) btnS.disabled = false;
       if (btnL) btnL.disabled = false;
+      renderClaudeStatusViews();
     }
   }
 
   async function runUpdateCheck() {
-    const ch = $("set-update-channel").value;
-    $("updater-result").textContent = `正在联网检测当前外壳与 GitHub 稳定版 / 最新版…`;
-    const res = await apiJson(`/api/updater/check?channel=${encodeURIComponent(ch)}`);
-    if (!res.ok) {
-      $("updater-result").innerHTML = `${escHtml(res.message || "检测失败")} <a class="link-btn" href="${escHtml(res.repo_url)}" target="_blank">打开 GitHub Releases ↗</a>`;
-      return;
+    const btn = $("btn-check-update");
+    if (btn) btn.disabled = true;
+    $("updater-result").textContent = "正在联网检测 GitHub 上的项目最新版本…";
+    try {
+      const res = await apiJson("/api/updater/check?channel=latest");
+      if (!res.ok) {
+        $("updater-result").innerHTML = `${escHtml(res.message || "检测失败")} <a class="link-btn" href="${escHtml(res.repo_url)}" target="_blank">打开 GitHub Releases ↗</a>`;
+        return;
+      }
+      if (!res.target_version) {
+        $("updater-result").innerHTML = `${escHtml(res.message)} <a class="link-btn" href="${escHtml(res.repo_url)}" target="_blank">查看 Releases ↗</a>`;
+        return;
+      }
+      const statusLine = res.has_update
+        ? `<b style="color:var(--brand);">发现新版本 ${escHtml(res.tag_name)}</b>（本机当前 v${escHtml(res.current_version)}）`
+        : `<b style="color:var(--ok);">● 当前 v${escHtml(res.current_version)} 已是项目最新版本 (${escHtml(res.tag_name)})</b>`;
+      const dlBtn = res.recommended_asset
+        ? `<a class="btn-primary sm" style="text-decoration:none;margin-right:8px;" href="${escHtml(res.recommended_asset.download_url)}" target="_blank">下载最新版安装包 (${escHtml(res.recommended_asset.name)})</a>`
+        : "";
+      $("updater-result").innerHTML =
+        `<div style="margin-bottom:8px;">${statusLine}</div>` +
+        `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">${dlBtn}<a class="link-btn" href="${escHtml(res.release_url)}" target="_blank">打开发布页 (${escHtml(res.tag_name)}) ↗</a></div>`;
+    } catch (err) {
+      $("updater-result").textContent = "检查更新失败: " + err.message;
+    } finally {
+      if (btn) btn.disabled = false;
     }
-    if (!res.target_version) {
-      $("updater-result").innerHTML = `${escHtml(res.message)} <a class="link-btn" href="${escHtml(res.repo_url)}" target="_blank">查看 Releases ↗</a>`;
-      return;
-    }
-    const statusLine = res.has_update
-      ? `<b style="color:var(--brand);">可升级至 ${escHtml(res.tag_name)}</b>（当前 v${escHtml(res.current_version)}）`
-      : `<b style="color:var(--ok);">当前 v${escHtml(res.current_version)} 已是该通道最新版本 (${escHtml(res.tag_name)})</b>`;
-    const dlBtn = res.recommended_asset
-      ? `<a class="btn-primary sm" style="text-decoration:none;margin-right:8px;" href="${escHtml(res.recommended_asset.download_url)}" target="_blank">下载本平台安装包 (${escHtml(res.recommended_asset.name)})</a>`
-      : "";
-    $("updater-result").innerHTML =
-      `<div>${statusLine}</div>` +
-      `<div class="ver-compare-grid">` +
-        `<div class="ver-pill-card"><span class="v-lbl">本机当前外壳</span><span class="v-val">v${escHtml(res.current_version)}</span></div>` +
-        `<div class="ver-pill-card"><span class="v-lbl">GitHub 稳定版</span><span class="v-val">${escHtml(res.available_channels?.stable || "-")}</span></div>` +
-        `<div class="ver-pill-card"><span class="v-lbl">GitHub 最新版</span><span class="v-val">${escHtml(res.available_channels?.latest || "-")}</span></div>` +
-      `</div>` +
-      `<div style="margin:10px 0 4px;">${dlBtn}<a class="link-btn" href="${escHtml(res.release_url)}" target="_blank">查看完整发布说明 ↗</a></div>`;
   }
 
   // ==================== MODAL: CWD (NATIVE PICKER + CUSTOM BY DRIVE) / MEMORY / LOGS ====================
@@ -3944,7 +4016,6 @@
         }).catch(() => {});
       }
     });
-    $("btn-toggle-websearch")?.addEventListener("click", toggleWebSearch);
     $("btn-quick-compact").addEventListener("click", () => {
       if (!state.activeSessionId) return toast("当前为空白新会话");
       $("composer-input").value = "/compact";
@@ -4415,6 +4486,26 @@
         flushPromptAutoSave(false);
       }),
     );
+    // Copyable proxy presets & quick copy/clear buttons
+    document.querySelectorAll(".copyable-proxy").forEach((el) => {
+      el.addEventListener("click", () => {
+        const val = el.dataset.proxy || el.textContent.trim();
+        if (!val) return;
+        const inp = $("set-search-proxy");
+        if (inp) inp.value = val;
+        copyText(val, `已复制并填入代理地址：${val}（记得点下方保存设置）`);
+      });
+    });
+    $("btn-copy-proxy")?.addEventListener("click", () => {
+      const val = ($("set-search-proxy")?.value || "").trim() || "http://127.0.0.1:7897";
+      copyText(val, `已复制代理地址：${val}`);
+    });
+    $("btn-clear-proxy")?.addEventListener("click", () => {
+      const inp = $("set-search-proxy");
+      if (inp) inp.value = "";
+      toast("已清空代理地址（点击保存设置生效）");
+    });
+
     $("btn-save-settings").addEventListener("click", async () => {
       const btn = $("btn-save-settings");
       clearTimeout(promptSaveTimer);
@@ -4427,16 +4518,18 @@
         const searchMode = $("set-search-mode")?.value || state.settings.search_engine?.mode || "auto";
         const searchProxy = ($("set-search-proxy")?.value || "").trim();
         const claudeIsolation = $("set-claude-isolation")?.value || state.settings.claude_isolation || "isolated";
+        const webSearchEnabled = ($("set-web-search")?.value || "on") !== "off";
         const res = await apiJson("/api/settings", {
           method: "PUT",
           body: JSON.stringify({
             system_prompt: $("set-system-prompt").value,
             prompt_mode: $("set-prompt-mode")?.value || "replace",
             permission_mode: $("set-permission-mode").value,
+            web_search_enabled: webSearchEnabled,
             claude_isolation: claudeIsolation,
             search_engine: { ...(state.settings.search_engine || {}), mode: searchMode, proxy_url: searchProxy },
             default_cwd: $("set-default-cwd").value.trim(),
-            update_channel: $("set-update-channel").value,
+            update_channel: "latest",
           }),
         });
         state.settings = res.settings;
@@ -4459,6 +4552,7 @@
     });
     $("btn-db-optimize")?.addEventListener("click", () => runDatabaseMaintenance(false));
     $("btn-db-purge-archived")?.addEventListener("click", () => runDatabaseMaintenance(true));
+    $("btn-claude-reset-bundled")?.addEventListener("click", resetToBundledClaudeCore);
     $("btn-claude-check-ver")?.addEventListener("click", checkClaudeCoreVersions);
     $("btn-claude-install-stable")?.addEventListener("click", () => installOrSwitchClaudeCore("stable"));
     $("btn-claude-install-latest")?.addEventListener("click", () => installOrSwitchClaudeCore("latest"));

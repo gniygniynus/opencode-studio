@@ -274,11 +274,6 @@
                     <div class="gd-menu hidden" id="gd-thinking-menu"></div>
                   </div>
 
-                  <span id="model-cap-badge" class="cap-badge hidden" title="当前模型上下文窗口与用量"></span>
-                  <button id="btn-toggle-websearch" type="button" class="chip-btn web-toggle is-on" title="实时联网搜索增强：开启后模型可免 Key 检索最新网页与新闻（也可用 /web 关键词）">
-                    <span class="web-dot"></span>
-                    <span>联网</span>
-                  </button>
                   <button id="btn-quick-compact" class="chip-btn" title="手动压缩当前长会话上下文">/compact</button>
                 </div>
 
@@ -580,13 +575,13 @@
     </div>
   </div>
 
-  <!-- ==================== MODAL: SETTINGS (PROMPT / SAFETY / DUAL-CHANNEL UPDATER) ==================== -->
+  <!-- ==================== MODAL: SETTINGS (PROMPT / SAFETY / LATEST UPDATER) ==================== -->
   <div id="modal-settings" class="modal-backdrop hidden">
     <div class="modal-card lg">
       <div class="modal-header">
         <div>
-          <h3>工作台设置 · 自定义提示词 · 双通道更新</h3>
-          <p class="modal-sub">所有发给模型的指令完全透明可控，支持稳定版 / 最新版更新检查</p>
+          <h3>工作台设置 · 自定义提示词 · 版本维护</h3>
+          <p class="modal-sub">所有发给模型的指令完全透明可控，安装包已内置适配好的原生 Claude Code 内核</p>
         </div>
         <button class="icon-btn xs modal-close" data-close="modal-settings">×</button>
       </div>
@@ -620,6 +615,13 @@
             </select>
           </label>
           <label class="field">
+            <span>对话实时联网搜索增强</span>
+            <select id="set-web-search" class="text-input">
+              <option value="on">开启免 Key 实时联网搜索（推荐 · 支持 /web 关键词）</option>
+              <option value="off">关闭对话联网搜索</option>
+            </select>
+          </label>
+          <label class="field">
             <span>联网商店搜索引擎模式</span>
             <select id="set-search-mode" class="text-input">
               <option value="auto">自动探测（无代理自动走国内直连，有代理走全网引擎）</option>
@@ -634,14 +636,24 @@
               <option value="shared">共享系统 ~/.claude 模式（复用本机原有官方登录态）</option>
             </select>
           </label>
-          <label class="field">
+          <label class="field full">
             <span>默认新建会话工作目录</span>
             <input id="set-default-cwd" class="text-input mono" />
           </label>
-          <label class="field full">
+          <div class="field full">
             <span>可选联网代理地址（供全网商店 / 壁纸下载 / 版本检查按需使用，留空则不走自定义代理，绝不影响本地直连 API）</span>
-            <input id="set-search-proxy" class="text-input mono" placeholder="如 http://127.0.0.1:7897（留空表示不启用）" />
-          </label>
+            <div class="proxy-input-row">
+              <input id="set-search-proxy" class="text-input mono" placeholder="留空表示不启用自定义代理" />
+              <button type="button" id="btn-copy-proxy" class="btn-secondary sm" title="复制输入框中的代理地址">复制地址</button>
+              <button type="button" id="btn-clear-proxy" class="btn-secondary sm" title="清空代理地址">清空</button>
+            </div>
+            <div class="proxy-hint-bar">
+              <span>常用本地代理示例（支持鼠标框选复制，或点击一键复制并填入）：</span>
+              <code class="copyable-proxy" data-proxy="http://127.0.0.1:7897" title="点击复制并填入 Clash Verge 默认端口">http://127.0.0.1:7897</code>
+              <code class="copyable-proxy" data-proxy="http://127.0.0.1:7890" title="点击复制并填入 Clash 默认端口">http://127.0.0.1:7890</code>
+              <code class="copyable-proxy" data-proxy="http://127.0.0.1:10809" title="点击复制并填入 v2rayN 默认 HTTP 端口">http://127.0.0.1:10809</code>
+            </div>
+          </div>
         </div>
 
         <div class="action-row" style="margin-bottom:18px;">
@@ -662,39 +674,51 @@
           </div>
         </div>
 
-        <!-- Native Claude Code Core Channel Detector & Safe Switcher -->
+        <!-- Bundled Native Claude Code Core Status & Protected Optional Maintenance -->
         <div class="settings-section updater-box" style="margin-bottom:14px;">
           <div class="section-header-row">
             <div>
-              <div class="section-label" style="margin:0;">原生 Claude Code 内核版本检测与切换</div>
-              <p class="modal-sub" id="claude-core-ver-line">检测本机 Claude Code 中…</p>
+              <div class="section-label" style="margin:0;">内置原生 Claude Code 内核状态（开箱即用 · 免额外安装）</div>
+              <p class="modal-sub" id="claude-core-ver-line">正在校验随安装包内置的原生 Claude Code 内核…</p>
             </div>
-            <div class="updater-controls">
-              <button id="btn-claude-check-ver" class="btn-primary sm">检测版本</button>
-              <button id="btn-claude-install-stable" class="btn-secondary sm">切换稳定版 (stable)</button>
-              <button id="btn-claude-install-latest" class="btn-secondary sm">切换最新版 (latest)</button>
-            </div>
+            <span id="claude-bundled-pill" class="store-badge is-installed">● 内置适配版已就绪</span>
           </div>
-          <div id="claude-ver-compare" class="updater-result">点击「检测版本」查看当前本机版本与官方稳定版 / 最新版对比；切换前会二次确认，迁移完成后自动清理旧版残留文件。</div>
-          <pre id="claude-install-log" class="tool-pre hidden" style="margin-top:8px;max-height:150px;"></pre>
+          <details id="claude-kernel-adv" class="kernel-adv-details">
+            <summary>高级维护（日常无需操作 · 已随软件内置完整适配版内核，避免盲目升级产生兼容风险）</summary>
+            <div class="kernel-adv-body">
+              <div class="updater-controls" style="flex-wrap:wrap;">
+                <button id="btn-claude-reset-bundled" type="button" class="btn-primary sm" title="清除外部覆盖版本，立即切回随本软件打包并经过完整适配测试的内置内核">🛡️ 恢复软件内置适配版内核</button>
+                <button id="btn-claude-check-ver" type="button" class="btn-secondary sm">检测上游内核版本</button>
+                <button id="btn-claude-install-stable" type="button" class="btn-secondary sm">在线下载稳定版</button>
+                <button id="btn-claude-install-latest" type="button" class="btn-secondary sm">在线下载最新版</button>
+              </div>
+              <div id="claude-install-progress-wrap" class="install-progress-wrap hidden">
+                <div class="install-progress-head">
+                  <span id="claude-progress-label">准备下载…</span>
+                  <span id="claude-progress-meta" class="mono">0%</span>
+                </div>
+                <div class="install-progress-track">
+                  <div id="claude-progress-bar" class="install-progress-bar" style="width:0%;"></div>
+                </div>
+              </div>
+              <div id="claude-ver-compare" class="updater-result">本软件安装包已自带经过严格兼容验证的官方原生 Claude Code 内核，学生安装软件后直接可用，无需再下载内核。</div>
+              <pre id="claude-install-log" class="tool-pre hidden" style="margin-top:8px;max-height:140px;"></pre>
+            </div>
+          </details>
         </div>
 
-        <!-- OpenCode Studio Shell Updater -->
+        <!-- OpenCode Studio Latest Release Checker (Single Clean Latest Channel) -->
         <div class="settings-section updater-box">
           <div class="section-header-row">
             <div>
-              <div class="section-label" style="margin:0;">工作台外壳版本检测（GitHub Releases）</div>
-              <p class="modal-sub" id="updater-current-line">当前版本：v1.1.0</p>
+              <div class="section-label" style="margin:0;">OpenCode Studio 项目最新版本</div>
+              <p class="modal-sub" id="updater-current-line">当前版本：v2.2.1</p>
             </div>
             <div class="updater-controls">
-              <select id="set-update-channel" class="compact-select">
-                <option value="stable">工作台稳定版 (stable)</option>
-                <option value="latest">工作台最新版 (latest)</option>
-              </select>
-              <button id="btn-check-update" class="btn-primary sm">检测版本</button>
+              <button id="btn-check-update" class="btn-primary sm">检测最新版本</button>
             </div>
           </div>
-          <div id="updater-result" class="updater-result">点击「检测版本」对比当前外壳与 GitHub 稳定版 / 最新版，不会自动覆盖或误触安装。</div>
+          <div id="updater-result" class="updater-result">点击「检测最新版本」查看 GitHub 最新正式版发布说明与一键安装包下载链接。</div>
         </div>
       </div>
     </div>
