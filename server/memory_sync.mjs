@@ -12,7 +12,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { getAllSettings, listMemories, saveMemory } from "./db.mjs";
+import { getAllSettings, getSetting, listMemories, saveMemory, setSetting } from "./db.mjs";
 import { getPaths } from "./paths.mjs";
 
 const ROOT_RULE_FILES = [
@@ -28,9 +28,20 @@ const MAX_TOTAL_MEMORY_CHARS = 22000;
 
 // In-memory bidirectional mapping between SQLite memory IDs and disk .md files
 const diskPathByMemId = new Map();
+const relPathByMemId = new Map();
 const memIdByDiskPath = new Map();
 let lastSyncAt = 0;
 let lastSyncRoot = "";
+let lastDiscovered = null;
+
+function getIgnoredDiskMemoryMap() {
+  const raw = getSetting("ignored_disk_memories", {});
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? { ...raw } : {};
+}
+
+function setIgnoredDiskMemoryMap(mapObj) {
+  setSetting("ignored_disk_memories", mapObj || {});
+}
 
 function winPathToWsl(p) {
   if (!p) return "";
@@ -105,7 +116,9 @@ export function getActiveClaudeMemoryRoot() {
 export function resetMemorySyncCache() {
   lastSyncAt = 0;
   lastSyncRoot = "";
+  lastDiscovered = null;
   diskPathByMemId.clear();
+  relPathByMemId.clear();
   memIdByDiskPath.clear();
 }
 
@@ -242,18 +255,23 @@ export function discoverClaudeDiskMemories(rootDir = getActiveClaudeMemoryRoot()
 export function syncDiskMemoriesToDb({ force = false } = {}) {
   const rootDir = getActiveClaudeMemoryRoot();
   const now = Date.now();
-  if (!force && lastSyncRoot === rootDir && now - lastSyncAt < 2000) {
-    return { synced: 0, rootDir, skipped: true };
+  if (!force && lastSyncRoot === rootDir && lastDiscovered && now - lastSyncAt < 2000) {
+    return { synced: 0, rootDir, discovered: lastDiscovered, skipped: true };
   }
   if (lastSyncRoot !== rootDir) {
     diskPathByMemId.clear();
+    relPathByMemId.clear();
     memIdByDiskPath.clear();
   }
   lastSyncRoot = rootDir;
   lastSyncAt = now;
 
   const discovered = discoverClaudeDiskMemories(rootDir);
-  if (!discovered.allFiles.length) return { synced: 0, rootDir, skipped: false };
+  lastDiscovered = discovered;
+  if (!discovered.allFiles.length) return { synced: 0, rootDir, discovered, skipped: false };
+
+  const ignoredMap = getIgnoredDiskMemoryMap();
+  let ignoredChanged = false;
 
   const existingAll = listMemories();
   const byId = new Map(existingAll.map((m) => [m.id, m]));
@@ -265,6 +283,16 @@ export function syncDiskMemoriesToDb({ force = false } = {}) {
 
   let synced = 0;
   for (const item of discovered.allFiles) {
+    // Respect explicit Web UI deletions unless the disk file was freshly modified afterwards
+    const deletedAtMs = Number(ignoredMap[item.relPath] || 0);
+    if (deletedAtMs > 0) {
+      if (item.mtimeMs <= deletedAtMs + 1000) {
+        continue;
+      }
+      delete ignoredMap[item.relPath];
+      ignoredChanged = true;
+    }
+
     const stableId = `mem_disk_${crypto.createHash("sha1").update(item.relPath).digest("hex").slice(0, 16)}`;
 
     // Match existing row without creating duplicates
@@ -284,6 +312,7 @@ export function syncDiskMemoriesToDb({ force = false } = {}) {
 
     if (existing) {
       diskPathByMemId.set(existing.id, item.fullPath);
+      relPathByMemId.set(existing.id, item.relPath);
       memIdByDiskPath.set(item.fullPath, existing.id);
 
       const dbUpdatedMs = Date.parse(existing.updated_at || "") || 0;
@@ -316,6 +345,7 @@ export function syncDiskMemoriesToDb({ force = false } = {}) {
           pinned: item.pinned,
         });
         diskPathByMemId.set(saved.id, item.fullPath);
+        relPathByMemId.set(saved.id, item.relPath);
         memIdByDiskPath.set(item.fullPath, saved.id);
         byId.set(saved.id, saved);
         byNormTitle.set(normalizeKey(saved.title), saved);
@@ -324,7 +354,40 @@ export function syncDiskMemoriesToDb({ force = false } = {}) {
     }
   }
 
-  return { synced, rootDir, totalDiskFiles: discovered.allFiles.length, skipped: false };
+  if (ignoredChanged) {
+    setIgnoredDiskMemoryMap(ignoredMap);
+  }
+
+  return { synced, rootDir, totalDiskFiles: discovered.allFiles.length, discovered, skipped: false };
+}
+
+/**
+ * Prevent deleted disk-backed memories from resurrecting on the next `GET /api/memories` sync!
+ * Never deletes user's shared `~/.claude` files; in isolated mode removes non-core project `.md` safely.
+ */
+export function recordDeletedDiskMemory(memId) {
+  if (!memId) return;
+  const relPath = relPathByMemId.get(memId);
+  const fullPath = diskPathByMemId.get(memId);
+  if (relPath) {
+    const ignoredMap = getIgnoredDiskMemoryMap();
+    ignoredMap[relPath] = Date.now();
+    setIgnoredDiskMemoryMap(ignoredMap);
+  }
+  if (fullPath) {
+    const isIsolated = getAllSettings().claude_isolation !== "shared";
+    const base = path.basename(fullPath).toUpperCase();
+    const isProtected = base === "CLAUDE.MD" || base === "GLOBAL_AGENT_RULES.MD" || base === "WORK_PRINCIPLES.MD" || base === "MEMORY.MD";
+    if (isIsolated && !isProtected && fullPath.startsWith(getPaths().claudeConfigDir)) {
+      try {
+        if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+      } catch {}
+    }
+    memIdByDiskPath.delete(fullPath);
+  }
+  diskPathByMemId.delete(memId);
+  relPathByMemId.delete(memId);
+  lastDiscovered = null;
 }
 
 /**
@@ -343,7 +406,16 @@ export function syncMemoryToDisk(savedMemory) {
   try {
     fs.mkdirSync(path.dirname(fp), { recursive: true });
     fs.writeFileSync(fp, String(savedMemory.content || ""), "utf8");
+    const rel = relPathByMemId.get(savedMemory.id);
+    if (rel) {
+      const ignoredMap = getIgnoredDiskMemoryMap();
+      if (ignoredMap[rel]) {
+        delete ignoredMap[rel];
+        setIgnoredDiskMemoryMap(ignoredMap);
+      }
+    }
     lastSyncAt = Date.now();
+    lastDiscovered = null;
     return { written: true, path: fp };
   } catch {
     return { written: false };
@@ -361,10 +433,9 @@ function truncateClean(text, maxChars) {
  * (works identically across native / append / replace prompt modes and any working directory).
  */
 export function buildUnifiedMemoryContext({ cwd = "", rtMode = "native", includeToolHint = false } = {}) {
-  syncDiskMemoriesToDb({ force: true });
-
-  const rootDir = getActiveClaudeMemoryRoot();
-  const discovered = discoverClaudeDiskMemories(rootDir);
+  const syncRes = syncDiskMemoriesToDb({ force: false });
+  const rootDir = syncRes.rootDir;
+  const discovered = syncRes.discovered || discoverClaudeDiskMemories(rootDir);
   const allDbMemories = listMemories({ cwd });
 
   const sections = [];

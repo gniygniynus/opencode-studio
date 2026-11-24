@@ -11,6 +11,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import { WebSocketServer } from "ws";
 
 import { handleProviderProxyRequest } from "./api_proxy.mjs";
@@ -20,6 +21,7 @@ import {
   clearRuntimeCache,
   getClaudeRuntimeAndAuth,
   installOrSwitchClaudeVersion,
+  refreshClaudeRuntimeAndAuthAsync,
   runClaudeAuthLogin,
   runClaudeAuthLogout,
   submitClaudeAuthCode,
@@ -27,6 +29,7 @@ import {
 import {
   activateProvider,
   addCustomBackground,
+  closeDb,
   createSession,
   deleteCustomBackground,
   deleteInstalledMcp,
@@ -36,6 +39,7 @@ import {
   deleteSession,
   getActiveProvider,
   getAllSettings,
+  getDatabaseStats,
   getDb,
   getProvider,
   getSessionMeta,
@@ -46,6 +50,7 @@ import {
   listMemories,
   listProviders,
   listSessions,
+  optimizeDatabase,
   saveInstalledMcp,
   saveInstalledSkill,
   saveMemory,
@@ -63,10 +68,11 @@ import {
   tailLogs,
 } from "./logger.mjs";
 import { McpManager } from "./mcp_client.mjs";
-import { resetMemorySyncCache, syncDiskMemoriesToDb, syncMemoryToDisk } from "./memory_sync.mjs";
-import { enrichProviderForClient, fetchProviderModels } from "./model_registry.mjs";
+import { recordDeletedDiskMemory, resetMemorySyncCache, syncDiskMemoriesToDb, syncMemoryToDisk } from "./memory_sync.mjs";
+import { enrichProviderForClient, fetchProviderModels, testProviderConnection } from "./model_registry.mjs";
 import { SessionOrchestrator } from "./orchestrator.mjs";
 import { getPaths, PUBLIC_DIR } from "./paths.mjs";
+import { proxyFetch } from "./runtime_utils.mjs";
 import {
   downloadRemoteSkillContent,
   importPublicSkillFromUrl,
@@ -155,6 +161,13 @@ function enforceUploadsBudget(dir, maxBytes = 200 * 1024 * 1024) {
   } catch {}
 }
 
+let _wpStorageCache = { at: 0, dir: "", data: null };
+
+function invalidateWallpaperStorageCache() {
+  _wpStorageCache.at = 0;
+  _wpStorageCache.data = null;
+}
+
 function cleanupOldActiveWallpapers(dir, keepName = "") {
   let removed = 0;
   try {
@@ -167,10 +180,14 @@ function cleanupOldActiveWallpapers(dir, keepName = "") {
       }
     }
   } catch {}
+  if (removed > 0) invalidateWallpaperStorageCache();
   return removed;
 }
 
-function getWallpaperStorageStats(dir) {
+function getWallpaperStorageStats(dir, force = false) {
+  if (!force && _wpStorageCache.data && _wpStorageCache.dir === dir && Date.now() - _wpStorageCache.at < 30_000) {
+    return _wpStorageCache.data;
+  }
   let activeBytes = 0;
   let uploadBytes = 0;
   let cacheBytes = 0;
@@ -194,7 +211,7 @@ function getWallpaperStorageStats(dir) {
     }
   } catch {}
   const toMb = (b) => Math.round((b / (1024 * 1024)) * 100) / 100;
-  return {
+  const stats = {
     active_mb: toMb(activeBytes),
     uploads_mb: toMb(uploadBytes),
     cache_mb: toMb(cacheBytes),
@@ -203,6 +220,8 @@ function getWallpaperStorageStats(dir) {
     upload_count: uploadCount,
     cache_limit_mb: 35,
   };
+  _wpStorageCache = { at: Date.now(), dir, data: stats };
+  return stats;
 }
 
 function clearWallpaperPreviewCache(dir) {
@@ -219,6 +238,7 @@ function clearWallpaperPreviewCache(dir) {
       } catch {}
     }
   } catch {}
+  invalidateWallpaperStorageCache();
   return { removed, freed_mb: Math.round((freedBytes / (1024 * 1024)) * 100) / 100 };
 }
 
@@ -240,18 +260,20 @@ function extFromMediaMime(mime, urlHint = "") {
 }
 
 async function fetchPublicMediaBuffer(rawUrl, fbUrl = "") {
+  const proxyUrl = getAllSettings().search_engine?.proxy_url || "";
   const tryFetch = async (targetUrl) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 14000);
     try {
       const originRef = new URL(targetUrl).origin + "/";
-      const upstream = await fetch(targetUrl, {
+      const upstream = await proxyFetch(targetUrl, {
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
           Referer: originRef,
           Accept: "image/avif,image/webp,image/apng,image/gif,image/*,video/webm,video/mp4,*/*;q=0.8",
         },
         signal: controller.signal,
+        proxyUrl,
       });
       if (!upstream.ok) throw new Error(`HTTP ${upstream.status}`);
       const mime = (upstream.headers.get("content-type") || "image/jpeg").split(";")[0];
@@ -567,13 +589,67 @@ function listAvailableDrives() {
   return { platform: process.platform, home, drives: [home, "/"] };
 }
 
+const _staticAssetCache = new Map();
+
+function acceptsGzip(req) {
+  const enc = String(req?.headers?.["accept-encoding"] || "");
+  return /\bgzip\b/i.test(enc);
+}
+
+function serveStaticFile(req, res, fp) {
+  const st = fs.statSync(fp);
+  const ext = path.extname(fp).toLowerCase();
+  const contentType = MIME[ext] || "application/octet-stream";
+  const compressible = /\.(html|css|js|mjs|json|svg)$/i.test(ext);
+
+  if (st.size <= 2 * 1024 * 1024) {
+    let cached = _staticAssetCache.get(fp);
+    if (!cached || cached.mtimeMs !== st.mtimeMs || cached.size !== st.size) {
+      const raw = fs.readFileSync(fp);
+      const gzip = compressible && raw.length >= 512 ? zlib.gzipSync(raw, { level: zlib.constants.Z_BEST_SPEED }) : null;
+      const etag = `W/"${st.size.toString(16)}-${Math.trunc(st.mtimeMs).toString(16)}"`;
+      cached = { mtimeMs: st.mtimeMs, size: st.size, etag, raw, gzip };
+      _staticAssetCache.set(fp, cached);
+    }
+
+    if (req.headers["if-none-match"] === cached.etag) {
+      res.writeHead(304, { ETag: cached.etag, "Cache-Control": "no-cache" });
+      return res.end();
+    }
+
+    const useGzip = Boolean(cached.gzip && acceptsGzip(req));
+    const outBuf = useGzip ? cached.gzip : cached.raw;
+    const headers = {
+      "Content-Type": contentType,
+      "Content-Length": outBuf.length,
+      ETag: cached.etag,
+      "Cache-Control": "no-cache",
+      Vary: "Accept-Encoding",
+    };
+    if (useGzip) headers["Content-Encoding"] = "gzip";
+    res.writeHead(200, headers);
+    return res.end(outBuf);
+  }
+
+  res.writeHead(200, { "Content-Type": contentType, "Content-Length": st.size, "Cache-Control": "no-cache" });
+  return fs.createReadStream(fp).pipe(res);
+}
+
 function sendJson(res, status, data) {
-  const body = JSON.stringify(data);
-  res.writeHead(status, {
+  const rawBuf = Buffer.from(JSON.stringify(data), "utf8");
+  const useGzip = rawBuf.length >= 2048 && acceptsGzip(res._req);
+  const outBuf = useGzip ? zlib.gzipSync(rawBuf, { level: zlib.constants.Z_BEST_SPEED }) : rawBuf;
+  const headers = {
     "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": outBuf.length,
     "Cache-Control": "no-store",
-  });
-  res.end(body);
+  };
+  if (useGzip) {
+    headers["Content-Encoding"] = "gzip";
+    headers.Vary = "Accept-Encoding";
+  }
+  res.writeHead(status, headers);
+  res.end(outBuf);
 }
 
 async function readJsonBody(req, maxBytes = 25 * 1024 * 1024) {
@@ -686,7 +762,13 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
   const orchestrator = new SessionOrchestrator({ broadcast, mcpManager, getPort: () => boundPort });
   const appVersion = getAppVersion();
 
+  // Warm up Claude runtime & auth status asynchronously in background so first `/api/bootstrap` never blocks!
+  refreshClaudeRuntimeAndAuthAsync(false)
+    .then((status) => broadcast({ type: "claude_status_updated", claude_native: status }))
+    .catch(() => {});
+
   const server = http.createServer(async (req, res) => {
+    res._req = req;
     const reqId = newReqId();
     try {
       const urlObj = new URL(req.url || "/", `http://${host}:${boundPort || port}`);
@@ -729,14 +811,25 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           installed_skills: listInstalledSkills(),
           custom_backgrounds: listCustomBackgrounds(),
           wallpaper_storage: getWallpaperStorageStats(paths.backgroundsDir),
+          db_stats: getDatabaseStats(),
           running_sessions: orchestrator.runningSessionIds(),
         });
+      }
+
+      // ==================== DATABASE STATS & ONE-CLICK MAINTENANCE ====================
+      if (method === "GET" && pathname === "/api/db/stats") {
+        return sendJson(res, 200, { ok: true, stats: getDatabaseStats() });
+      }
+      if (method === "POST" && pathname === "/api/db/optimize") {
+        const body = await readJsonBody(req).catch(() => ({}));
+        const result = optimizeDatabase({ purgeArchived: Boolean(body.purge_archived) });
+        return sendJson(res, 200, result);
       }
 
       // ==================== NATIVE CLAUDE CODE AUTH & VERSION MANAGEMENT ====================
       if (method === "GET" && pathname === "/api/claude/status") {
         const force = urlObj.searchParams.get("refresh") === "1";
-        return sendJson(res, 200, getClaudeRuntimeAndAuth(force));
+        return sendJson(res, 200, await refreshClaudeRuntimeAndAuthAsync(force));
       }
       if (method === "GET" && pathname === "/api/claude/versions") {
         return sendJson(res, 200, await checkClaudeVersions());
@@ -794,11 +887,12 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           clearRuntimeCache();
           resetMemorySyncCache();
           // Refresh Claude runtime & sync active Claude directory memories asynchronously
-          setImmediate(() => {
+          setImmediate(async () => {
             try {
               syncDiskMemoriesToDb({ force: true });
               broadcast({ type: "memories_updated" });
-              broadcast({ type: "claude_status_updated", claude_native: getClaudeRuntimeAndAuth(true) });
+              const refreshed = await refreshClaudeRuntimeAndAuthAsync(true);
+              broadcast({ type: "claude_status_updated", claude_native: refreshed });
             } catch {}
           });
         }
@@ -816,6 +910,35 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           providers: listProviders(false).map(enrichProviderForClient),
           claude_native: getClaudeRuntimeAndAuth(false),
         });
+      }
+      if (method === "POST" && pathname === "/api/providers/test") {
+        const body = await readJsonBody(req);
+        const existing = body.id ? getProvider(body.id, true) : null;
+        const kind = body.kind || existing?.kind || "openai";
+        if (kind === "claude_native") {
+          const rt = await refreshClaudeRuntimeAndAuthAsync(true);
+          return sendJson(res, 200, {
+            ok: Boolean(rt.installed && rt.auth?.loggedIn),
+            latency_ms: 0,
+            model: body.default_model || existing?.default_model || "sonnet",
+            message: rt.installed
+              ? rt.auth?.loggedIn
+                ? `原生 Claude Code (${rt.version}) 已登录就绪`
+                : `原生 Claude Code (${rt.version}) 已安装，但尚未登录官方账号`
+              : "未检测到本机原生 Claude Code，请先在设置中安装",
+            error: !rt.installed ? "未安装原生 Claude Code" : !rt.auth?.loggedIn ? "尚未完成官方 OAuth 登录" : "",
+          });
+        }
+        const merged = {
+          id: body.id || existing?.id || "temp",
+          name: body.name || existing?.name || "测试供应商",
+          kind,
+          base_url: body.base_url !== undefined ? String(body.base_url).trim() : existing?.base_url || "",
+          api_key: body.api_key ? String(body.api_key).trim() : existing?.api_key || "",
+          default_model: body.default_model || existing?.default_model || "",
+          models: Array.isArray(body.models) && body.models.length ? body.models : existing?.models || [],
+        };
+        return sendJson(res, 200, await testProviderConnection(merged));
       }
       if (method === "POST" && pathname === "/api/providers") {
         const body = await readJsonBody(req);
@@ -929,6 +1052,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       }
       if (method === "DELETE" && pathname.match(/^\/api\/memories\/([^/]+)$/)) {
         const id = pathname.split("/")[3];
+        recordDeletedDiskMemory(id);
         deleteMemory(id);
         broadcast({ type: "memories_updated" });
         return sendJson(res, 200, { ok: true });
@@ -1199,12 +1323,13 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           url: `/api/bg-files/${fileName}`,
           source: isVideo ? "video" : "upload",
         });
+        invalidateWallpaperStorageCache();
         return sendJson(res, 200, {
           ok: true,
           is_video: isVideo,
           background: bg,
           backgrounds: listCustomBackgrounds(),
-          storage: getWallpaperStorageStats(paths.backgroundsDir),
+          storage: getWallpaperStorageStats(paths.backgroundsDir, true),
         });
       }
       if (method === "DELETE" && pathname.match(/^\/api\/backgrounds\/([^/]+)$/)) {
@@ -1218,10 +1343,11 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
             try { fs.unlinkSync(fp); } catch {}
           }
         }
+        invalidateWallpaperStorageCache();
         return sendJson(res, 200, {
           ok: true,
           backgrounds: listCustomBackgrounds(),
-          storage: getWallpaperStorageStats(paths.backgroundsDir),
+          storage: getWallpaperStorageStats(paths.backgroundsDir, true),
         });
       }
       if (method === "GET" && pathname.startsWith("/api/bg-files/")) {
@@ -1393,14 +1519,12 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         );
       }
 
-      // ==================== STATIC FRONTEND ====================
+      // ==================== STATIC FRONTEND (MEMORY-CACHED + ETAG 304 + GZIP) ====================
       if (method === "GET") {
         const rel = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
         const fp = path.join(PUBLIC_DIR, rel);
         if (fp.startsWith(PUBLIC_DIR) && fs.existsSync(fp) && fs.statSync(fp).isFile()) {
-          const ext = path.extname(fp).toLowerCase();
-          res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream", "Cache-Control": "no-cache" });
-          return fs.createReadStream(fp).pipe(res);
+          return serveStaticFile(req, res, fp);
         }
       }
 
@@ -1513,12 +1637,22 @@ const isDirectRun =
   process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
 
 if (isDirectRun) {
+  process.on("exit", () => closeDb());
   startServer()
-    .then(({ url }) => {
-      console.log(`[OpenCode Studio] Listening on ${url}`);
+    .then((handle) => {
+      console.log(`[OpenCode Studio] Listening on ${handle.url}`);
+      const shutdown = () => {
+        handle.stop().finally(() => {
+          closeDb();
+          process.exit(0);
+        });
+      };
+      process.once("SIGINT", shutdown);
+      process.once("SIGTERM", shutdown);
     })
     .catch((err) => {
       console.error("[OpenCode Studio] Failed to start:", err);
+      closeDb();
       process.exit(1);
     });
 }

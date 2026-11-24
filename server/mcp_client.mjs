@@ -6,6 +6,7 @@
 import { spawn } from "node:child_process";
 import { listInstalledMcps } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
+import { killProcessTree } from "./runtime_utils.mjs";
 
 class StdioMcpConnection {
   constructor(config) {
@@ -154,9 +155,7 @@ class StdioMcpConnection {
   stop(keepError = false) {
     if (!keepError) this.status = "stopped";
     if (this.proc) {
-      try {
-        this.proc.kill();
-      } catch {}
+      killProcessTree(this.proc);
       this.proc = null;
     }
   }

@@ -4,6 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>OpenCode Studio</title>
+  <script>
+    try {
+      const snap = JSON.parse(localStorage.getItem("ocs_ap_snap") || "null");
+      if (snap && snap.theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
+      if (snap && snap.fontSize) document.documentElement.style.setProperty("--font-size-base", snap.fontSize + "px");
+    } catch {}
+  </script>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
@@ -47,13 +54,13 @@
         </div>
       </div>
 
-      <div class="sidebar-search">
+          <div class="sidebar-search">
         <div class="search-box">
           <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="11" cy="11" r="7"></circle>
             <line x1="20" y1="20" x2="16.65" y2="16.65"></line>
           </svg>
-          <input id="global-search-input" type="text" placeholder="搜索全部对话标题或正文…" autocomplete="off" />
+          <input id="global-search-input" type="text" placeholder="搜索全部对话标题或正文 (Ctrl+K)…" autocomplete="off" />
           <button id="global-search-clear" class="search-clear hidden" title="清除">×</button>
         </div>
         <select id="cwd-filter-select" class="hidden" aria-hidden="true">
@@ -154,6 +161,14 @@
             <button class="seg-btn" data-tab="activity" title="本会话文件改动与工具统计">改动</button>
           </div>
 
+          <button id="btn-export-md" class="icon-btn" title="导出当前会话为 Markdown 文档 (.md)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+          </button>
+
           <button id="btn-quick-bg" class="icon-btn" title="外观与开源背景壁纸商店">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
               <circle cx="12" cy="12" r="5"></circle>
@@ -177,6 +192,13 @@
               <p class="welcome-desc">
                 基于原生 Claude Code 内核打造的工作台：支持官方完整 Auth 登录与内置多 API 供应商随时切换更新、自动识别模型思考等级与上下文、历史编辑重发与重新生成、开源 MCP / Skills / 海量动态壁纸商店。
               </p>
+              <div id="welcome-resume-wrap" class="welcome-resume-wrap hidden">
+                <button id="btn-resume-latest" type="button" class="resume-latest-pill" title="一键回到最近一次对话">
+                  <span class="rl-tag">继续上次对话</span>
+                  <span id="resume-latest-title" class="rl-title"></span>
+                  <span class="rl-arrow">→</span>
+                </button>
+              </div>
               <div class="welcome-grid">
                 <div class="welcome-card glass-card" id="wc-providers">
                   <div class="wc-title">1. 原生登录 & 内置 API 管理</div>
@@ -380,9 +402,11 @@
             <div class="action-row">
               <button id="btn-save-provider" class="btn-primary">保存并更新 API</button>
               <button id="btn-activate-provider" class="btn-secondary">设为当前使用</button>
+              <button id="btn-test-provider" class="btn-secondary">⚡ 测试连接</button>
               <button id="btn-fetch-models" class="btn-secondary">联网拉取/更新模型 & 自动识别能力</button>
               <button id="btn-delete-provider" class="btn-danger">删除</button>
             </div>
+            <div id="pf-test-result" class="info-box hidden" style="margin-top:10px;"></div>
             <div class="section-label">已识别模型能力预览（思考等级 / 上下文窗口 / 视觉）</div>
             <div id="pf-caps-preview" class="caps-grid"></div>
           </div>
@@ -600,10 +624,28 @@
             <span>默认新建会话工作目录</span>
             <input id="set-default-cwd" class="text-input mono" />
           </label>
+          <label class="field full">
+            <span>可选联网代理地址（供全网商店 / 壁纸下载 / 版本检查按需使用，留空则不走自定义代理，绝不影响本地直连 API）</span>
+            <input id="set-search-proxy" class="text-input mono" placeholder="如 http://127.0.0.1:7897（留空表示不启用）" />
+          </label>
         </div>
 
         <div class="action-row" style="margin-bottom:18px;">
           <button id="btn-save-settings" class="btn-primary">保存设置</button>
+        </div>
+
+        <!-- SQLite Database Health & One-Click Optimization -->
+        <div class="settings-section updater-box" style="margin-bottom:14px;">
+          <div class="section-header-row">
+            <div>
+              <div class="section-label" style="margin:0;">本地 SQLite 数据库存储与索引维护</div>
+              <p class="modal-sub" id="db-stats-line">正在读取数据库状态…</p>
+            </div>
+            <div class="updater-controls">
+              <button id="btn-db-optimize" class="btn-secondary sm" title="合并 WAL 日志并优化 FTS5 全文索引与查询计划">⚡ 合并 WAL 与优化索引</button>
+              <button id="btn-db-purge-archived" class="btn-danger sm" title="彻底物理清除已移入回收状态的旧会话并回收磁盘体积">🧹 清理已删除归档</button>
+            </div>
+          </div>
         </div>
 
         <!-- Native Claude Code Core Channel Detector & Safe Switcher -->

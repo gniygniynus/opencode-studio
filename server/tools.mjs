@@ -10,8 +10,9 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { listMemories, saveMemory } from "./db.mjs";
+import { getAllSettings, listMemories, saveMemory } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
+import { killProcessTree, proxyFetch } from "./runtime_utils.mjs";
 
 const IGNORE_DIRS = new Set([
   ".git",
@@ -202,14 +203,7 @@ function execShell(command, cwd, timeoutMs = 60000, signal = null) {
     const killProc = () => {
       if (killed) return;
       killed = true;
-      try {
-        proc.kill("SIGTERM");
-        setTimeout(() => {
-          try {
-            proc.kill("SIGKILL");
-          } catch {}
-        }, 1200);
-      } catch {}
+      killProcessTree(proc, "SIGTERM", 1200);
     };
 
     const timer = setTimeout(() => {
@@ -312,7 +306,13 @@ export async function executeBuiltinTool(name, input, ctx) {
           output: `old_string 在文件中出现了 ${count} 次，请提供更多上下文使其唯一，或设置 replace_all=true。`,
         };
       }
-      const updated = input?.replace_all ? content.split(oldStr).join(newStr) : content.replace(oldStr, newStr);
+      let updated;
+      if (input?.replace_all) {
+        updated = content.split(oldStr).join(newStr);
+      } else {
+        const firstIdx = content.indexOf(oldStr);
+        updated = content.slice(0, firstIdx) + newStr + content.slice(firstIdx + oldStr.length);
+      }
       fs.writeFileSync(fp, updated, "utf8");
       return { ok: true, output: `已成功修改 ${fp}（替换 ${input?.replace_all ? count : 1} 处）。` };
     }
@@ -427,12 +427,14 @@ export async function executeBuiltinTool(name, input, ctx) {
     if (name === "web_fetch") {
       const url = String(input?.url || "").trim();
       if (!/^https?:\/\//i.test(url)) return { ok: false, output: "仅支持 http:// 或 https:// 链接" };
+      const proxyUrl = getAllSettings().search_engine?.proxy_url || "";
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
       try {
-        const res = await fetch(url, {
-          headers: { "User-Agent": "OpenCodeStudio/1.0 (+https://github.com/gniygniynus/opencode-studio)" },
+        const res = await proxyFetch(url, {
+          headers: { "User-Agent": "OpenCodeStudio/2.1 (+https://github.com/gniygniynus/opencode-studio)" },
           signal: controller.signal,
+          proxyUrl,
         });
         const body = await res.text();
         const plain = body

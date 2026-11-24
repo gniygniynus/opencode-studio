@@ -5,9 +5,10 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { getSetting, setSetting } from "./db.mjs";
+import { getAllSettings, getSetting, setSetting } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
 import { PROJECT_ROOT } from "./paths.mjs";
+import { proxyFetch } from "./runtime_utils.mjs";
 
 export const REPO_SLUG = process.env.OPENCODE_REPO || "gniygniynus/opencode-studio";
 
@@ -74,12 +75,14 @@ export async function checkForUpdates(channelOverride = null) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 9000);
   try {
-    const res = await fetch(apiUrl, {
+    const proxyUrl = getAllSettings().search_engine?.proxy_url || "";
+    const res = await proxyFetch(apiUrl, {
       headers: {
         "User-Agent": `OpenCodeStudio/${currentVersion}`,
         Accept: "application/vnd.github+json",
       },
       signal: controller.signal,
+      proxyUrl,
     });
     if (!res.ok) {
       return {

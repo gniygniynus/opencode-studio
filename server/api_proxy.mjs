@@ -180,7 +180,21 @@ function anthropicToOpenAiBody(antBody, provider, thinkingHint = "") {
   return out;
 }
 
-async function handleAnthropicPassthrough(req, res, provider, rawBody, subpath) {
+function attachClientAbortController(req, res) {
+  const abortCtrl = new AbortController();
+  const onDisconnect = () => {
+    if (!res.writableEnded) {
+      try {
+        abortCtrl.abort();
+      } catch {}
+    }
+  };
+  req.on("aborted", onDisconnect);
+  res.on("close", onDisconnect);
+  return abortCtrl;
+}
+
+async function handleAnthropicPassthrough(req, res, provider, rawBody, subpath, signal) {
   const url = buildApiEndpoint(provider.base_url, "anthropic", subpath);
   const headers = {
     "Content-Type": "application/json",
@@ -198,6 +212,7 @@ async function handleAnthropicPassthrough(req, res, provider, rawBody, subpath) 
     method: "POST",
     headers,
     body: rawBody,
+    signal,
   });
 
   // Auto-fallback if an Anthropic-compatible relay rejects optional thinking parameter with 400/422
@@ -210,6 +225,7 @@ async function handleAnthropicPassthrough(req, res, provider, rawBody, subpath) 
           method: "POST",
           headers,
           body: JSON.stringify(parsed),
+          signal,
         });
         if (retryRes.ok) {
           logEvent("INFO", "proxy", "anthropic_thinking_fallback_ok", `上游「${provider.name}」拒绝 thinking 参数，已自动降级恢复成功`);
@@ -229,6 +245,10 @@ async function handleAnthropicPassthrough(req, res, provider, rawBody, subpath) 
   const reader = upstream.body.getReader();
   try {
     while (true) {
+      if (signal?.aborted) {
+        await reader.cancel().catch(() => {});
+        break;
+      }
       const { done, value } = await reader.read();
       if (done) break;
       res.write(Buffer.from(value));
@@ -242,7 +262,7 @@ async function handleAnthropicPassthrough(req, res, provider, rawBody, subpath) 
 // Values: "reasoning_effort" | "strip_thinking" | "strip_all_extras"
 const _upstreamCompatMode = new Map();
 
-async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "") {
+async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "", signal = undefined) {
   const url = buildApiEndpoint(provider.base_url, "openai", "/chat/completions");
   const oaiBody = anthropicToOpenAiBody(antBody, provider, thinkingHint);
   const headers = { "Content-Type": "application/json" };
@@ -275,6 +295,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "")
     method: "POST",
     headers,
     body: JSON.stringify(sendBody),
+    signal,
   });
 
   // Zero-400 auto-fallback when a relay rejects optional thinking/stream extension fields
@@ -299,6 +320,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "")
         method: "POST",
         headers,
         body: JSON.stringify(nextBody),
+        signal,
       });
       if (retryRes.ok) {
         _upstreamCompatMode.set(compatKey, mode);
@@ -427,7 +449,107 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "")
   const closeCurrentBlock = () => {
     if (openBlockIdx !== null) {
       sendSse(res, "content_block_stop", { type: "content_block_stop", index: openBlockIdx });
+      if (openBlockIdx === thinkingIdx) thinkingIdx = null;
+      if (openBlockIdx === textIdx) textIdx = null;
       openBlockIdx = null;
+    }
+  };
+
+  const processSseLine = (rawLine) => {
+    const line = rawLine.trim();
+    if (!line.startsWith("data:")) return;
+    const payloadStr = line.slice(5).trim();
+    if (!payloadStr || payloadStr === "[DONE]") return;
+
+    let chunk;
+    try {
+      chunk = JSON.parse(payloadStr);
+    } catch {
+      return;
+    }
+
+    if (chunk.usage) {
+      usage = {
+        input_tokens: chunk.usage.prompt_tokens || usage.input_tokens,
+        output_tokens: chunk.usage.completion_tokens || usage.output_tokens,
+      };
+    }
+
+    const choice = chunk.choices?.[0];
+    if (!choice) return;
+    if (choice.finish_reason) {
+      finishReason = choice.finish_reason === "tool_calls" ? "tool_use" : choice.finish_reason === "length" ? "max_tokens" : "end_turn";
+    }
+    const delta = choice.delta || {};
+
+    // 1) Reasoning / Thinking stream
+    const rText = delta.reasoning_content || delta.reasoning || "";
+    if (rText) {
+      if (thinkingIdx === null) {
+        closeCurrentBlock();
+        thinkingIdx = nextBlockIndex++;
+        openBlockIdx = thinkingIdx;
+        sendSse(res, "content_block_start", {
+          type: "content_block_start",
+          index: thinkingIdx,
+          content_block: { type: "thinking", thinking: "" },
+        });
+      }
+      sendSse(res, "content_block_delta", {
+        type: "content_block_delta",
+        index: thinkingIdx,
+        delta: { type: "thinking_delta", thinking: rText },
+      });
+    }
+
+    // 2) Text stream
+    if (delta.content) {
+      if (textIdx === null) {
+        closeCurrentBlock();
+        textIdx = nextBlockIndex++;
+        openBlockIdx = textIdx;
+        sendSse(res, "content_block_start", {
+          type: "content_block_start",
+          index: textIdx,
+          content_block: { type: "text", text: "" },
+        });
+      }
+      sendSse(res, "content_block_delta", {
+        type: "content_block_delta",
+        index: textIdx,
+        delta: { type: "text_delta", text: delta.content },
+      });
+    }
+
+    // 3) Tool call stream
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const oaiIdx = tc.index ?? 0;
+        let antIdx = toolIndexMap.get(oaiIdx);
+        if (antIdx === undefined) {
+          closeCurrentBlock();
+          antIdx = nextBlockIndex++;
+          toolIndexMap.set(oaiIdx, antIdx);
+          openBlockIdx = antIdx;
+          sendSse(res, "content_block_start", {
+            type: "content_block_start",
+            index: antIdx,
+            content_block: {
+              type: "tool_use",
+              id: tc.id || `toolu_${Date.now()}_${oaiIdx}`,
+              name: tc.function?.name || "Tool",
+              input: {},
+            },
+          });
+        }
+        if (tc.function?.arguments) {
+          sendSse(res, "content_block_delta", {
+            type: "content_block_delta",
+            index: antIdx,
+            delta: { type: "input_json_delta", partial_json: tc.function.arguments },
+          });
+        }
+      }
     }
   };
 
@@ -437,118 +559,29 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "")
 
   try {
     while (true) {
+      if (signal?.aborted) {
+        await reader.cancel().catch(() => {});
+        break;
+      }
       const { done, value } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split(/\r?\n/);
       buf = lines.pop() || "";
-
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line.startsWith("data:")) continue;
-        const payloadStr = line.slice(5).trim();
-        if (!payloadStr || payloadStr === "[DONE]") continue;
-
-        let chunk;
-        try {
-          chunk = JSON.parse(payloadStr);
-        } catch {
-          continue;
-        }
-
-        if (chunk.usage) {
-          usage = {
-            input_tokens: chunk.usage.prompt_tokens || usage.input_tokens,
-            output_tokens: chunk.usage.completion_tokens || usage.output_tokens,
-          };
-        }
-
-        const choice = chunk.choices?.[0];
-        if (!choice) continue;
-        if (choice.finish_reason) {
-          finishReason = choice.finish_reason === "tool_calls" ? "tool_use" : choice.finish_reason === "length" ? "max_tokens" : "end_turn";
-        }
-        const delta = choice.delta || {};
-
-        // 1) Reasoning / Thinking stream
-        const rText = delta.reasoning_content || delta.reasoning || "";
-        if (rText) {
-          if (thinkingIdx === null) {
-            closeCurrentBlock();
-            thinkingIdx = nextBlockIndex++;
-            openBlockIdx = thinkingIdx;
-            sendSse(res, "content_block_start", {
-              type: "content_block_start",
-              index: thinkingIdx,
-              content_block: { type: "thinking", thinking: "" },
-            });
-          }
-          sendSse(res, "content_block_delta", {
-            type: "content_block_delta",
-            index: thinkingIdx,
-            delta: { type: "thinking_delta", thinking: rText },
-          });
-        }
-
-        // 2) Text stream
-        if (delta.content) {
-          if (textIdx === null) {
-            closeCurrentBlock();
-            textIdx = nextBlockIndex++;
-            openBlockIdx = textIdx;
-            sendSse(res, "content_block_start", {
-              type: "content_block_start",
-              index: textIdx,
-              content_block: { type: "text", text: "" },
-            });
-          }
-          sendSse(res, "content_block_delta", {
-            type: "content_block_delta",
-            index: textIdx,
-            delta: { type: "text_delta", text: delta.content },
-          });
-        }
-
-        // 3) Tool call stream
-        if (Array.isArray(delta.tool_calls)) {
-          for (const tc of delta.tool_calls) {
-            const oaiIdx = tc.index ?? 0;
-            let antIdx = toolIndexMap.get(oaiIdx);
-            if (antIdx === undefined) {
-              closeCurrentBlock();
-              antIdx = nextBlockIndex++;
-              toolIndexMap.set(oaiIdx, antIdx);
-              openBlockIdx = antIdx;
-              sendSse(res, "content_block_start", {
-                type: "content_block_start",
-                index: antIdx,
-                content_block: {
-                  type: "tool_use",
-                  id: tc.id || `toolu_${Date.now()}_${oaiIdx}`,
-                  name: tc.function?.name || "Tool",
-                  input: {},
-                },
-              });
-            }
-            if (tc.function?.arguments) {
-              sendSse(res, "content_block_delta", {
-                type: "content_block_delta",
-                index: antIdx,
-                delta: { type: "input_json_delta", partial_json: tc.function.arguments },
-              });
-            }
-          }
-        }
-      }
+      for (const rawLine of lines) processSseLine(rawLine);
     }
+    buf += decoder.decode();
+    if (buf.trim()) processSseLine(buf);
   } finally {
     closeCurrentBlock();
-    sendSse(res, "message_delta", {
-      type: "message_delta",
-      delta: { stop_reason: finishReason, stop_sequence: null },
-      usage: { output_tokens: usage.output_tokens || 0 },
-    });
-    sendSse(res, "message_stop", { type: "message_stop" });
+    if (!signal?.aborted) {
+      sendSse(res, "message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: finishReason, stop_sequence: null },
+        usage: { output_tokens: usage.output_tokens || 0 },
+      });
+      sendSse(res, "message_stop", { type: "message_stop" });
+    }
     res.end();
   }
 }
@@ -566,12 +599,13 @@ export async function handleProviderProxyRequest(req, res, providerId, subpath, 
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const rawBody = Buffer.concat(chunks).toString("utf8");
+  const abortCtrl = attachClientAbortController(req, res);
 
   // Handle count_tokens gracefully for OpenAI-compatible providers
   if (subpath.includes("count_tokens")) {
     if (provider.kind === "anthropic") {
       try {
-        return await handleAnthropicPassthrough(req, res, provider, rawBody, "/messages/count_tokens");
+        return await handleAnthropicPassthrough(req, res, provider, rawBody, "/messages/count_tokens", abortCtrl.signal);
       } catch {
         // fall through to fast local estimate
       }
@@ -593,11 +627,14 @@ export async function handleProviderProxyRequest(req, res, providerId, subpath, 
           }
         } catch {}
       }
-      return await handleAnthropicPassthrough(req, res, provider, bodyToSend, "/messages");
+      return await handleAnthropicPassthrough(req, res, provider, bodyToSend, "/messages", abortCtrl.signal);
     }
     const antBody = JSON.parse(rawBody || "{}");
-    return await handleOpenAiTranslated(res, provider, antBody, thinkingHint);
+    return await handleOpenAiTranslated(res, provider, antBody, thinkingHint, abortCtrl.signal);
   } catch (err) {
+    if (abortCtrl.signal.aborted) {
+      return res.end();
+    }
     logEvent("ERROR", "proxy", "upstream_error", `内置代理转发至 ${provider.name} 失败: ${err.message}`, {
       layer: "upstream-api",
     });

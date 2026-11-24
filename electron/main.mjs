@@ -1,17 +1,21 @@
 /**
  * Electron Main Process for OpenCode Studio (Windows / macOS / Linux).
  *
- * Guarantees single-instance local server + native OS directory picker +
- * safe external protocol launching (https:// & steam://) on the user's real visible desktop.
+ * Guarantees single-instance local server + loopback proxy bypass + flicker-free window reveal +
+ * native OS directory picker + safe external protocol launching (https:// & steam://).
  */
 
-import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { closeDb } from "../server/db.mjs";
 import { startServer } from "../server/index.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Ensure local 127.0.0.1 / localhost HTTP & WebSocket traffic NEVER detours through Clash / OS HTTP proxy
+app.commandLine.appendSwitch("proxy-bypass-list", "<-loopback>;127.0.0.1;localhost");
 
 let serverHandle = null;
 let mainWindow = null;
@@ -36,6 +40,8 @@ function createWindow(url) {
     height: 860,
     minWidth: 960,
     minHeight: 620,
+    show: false,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#0f1116" : "#f9fafb",
     title: "OpenCode Studio",
     autoHideMenuBar: true,
     webPreferences: {
@@ -43,7 +49,12 @@ function createWindow(url) {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      spellcheck: false,
     },
+  });
+
+  win.once("ready-to-show", () => {
+    win.show();
   });
 
   win.loadURL(url);
@@ -130,6 +141,23 @@ ipcMain.handle("shell:openExternal", async (_ev, targetUrl) => {
   return false;
 });
 
+let isQuitting = false;
+app.on("before-quit", async (ev) => {
+  if (isQuitting) return;
+  isQuitting = true;
+  if (serverHandle) {
+    ev.preventDefault();
+    try {
+      await serverHandle.stop();
+    } catch {}
+    serverHandle = null;
+    closeDb();
+    app.quit();
+  } else {
+    closeDb();
+  }
+});
+
 app.whenReady().then(async () => {
   try {
     try {
@@ -149,13 +177,6 @@ app.whenReady().then(async () => {
       createWindow(serverHandle.url);
     }
   });
-});
-
-app.on("before-quit", async () => {
-  if (serverHandle) {
-    await serverHandle.stop().catch(() => {});
-    serverHandle = null;
-  }
 });
 
 app.on("window-all-closed", () => {

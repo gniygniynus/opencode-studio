@@ -11,9 +11,13 @@ import { getPaths } from "./paths.mjs";
 
 const MAX_BYTES = 5 * 1024 * 1024;
 const MAX_ROTATIONS = 5;
+const TAIL_CHUNK_BYTES = 256 * 1024;
 
 const SECRET_RE =
   /(sk-[A-Za-z0-9_\-]{12,}|Bearer\s+[A-Za-z0-9._\-]{12,}|(?:api[_-]?key|token|authorization|secret)\s*[:=]\s*["']?[^\s"',}]{10,}["']?)/gi;
+
+// Track current file sizes in memory so routine log writes don't pay repeated statSync syscalls
+const _knownSizes = new Map();
 
 export function sanitizeText(str) {
   if (!str) return "";
@@ -28,11 +32,26 @@ export function newReqId() {
   return crypto.randomBytes(5).toString("hex");
 }
 
-function rotateIfNeeded(filePath) {
+function rotateIfNeeded(filePath, incomingBytes = 0) {
   try {
-    if (!fs.existsSync(filePath)) return;
+    let curSize = _knownSizes.get(filePath);
+    if (curSize === undefined) {
+      curSize = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+      _knownSizes.set(filePath, curSize);
+    }
+    if (curSize + incomingBytes < MAX_BYTES) {
+      _knownSizes.set(filePath, curSize + incomingBytes);
+      return;
+    }
+    if (!fs.existsSync(filePath)) {
+      _knownSizes.set(filePath, incomingBytes);
+      return;
+    }
     const stat = fs.statSync(filePath);
-    if (stat.size < MAX_BYTES) return;
+    if (stat.size < MAX_BYTES) {
+      _knownSizes.set(filePath, stat.size + incomingBytes);
+      return;
+    }
     const ext = path.extname(filePath);
     const stem = filePath.slice(0, -ext.length);
     for (let i = MAX_ROTATIONS - 1; i >= 1; i--) {
@@ -41,8 +60,36 @@ function rotateIfNeeded(filePath) {
       if (fs.existsSync(src)) fs.renameSync(src, dst);
     }
     fs.renameSync(filePath, `${stem}.1${ext}`);
+    _knownSizes.set(filePath, incomingBytes);
   } catch {
     // ignore rotation IO races
+  }
+}
+
+function readTailUtf8Lines(filePath, maxBytes = TAIL_CHUNK_BYTES) {
+  if (!fs.existsSync(filePath)) return { exists: false, lines: [], truncated: false };
+  const stat = fs.statSync(filePath);
+  if (stat.size <= maxBytes) {
+    return {
+      exists: true,
+      lines: fs.readFileSync(filePath, "utf8").split(/\r?\n/),
+      truncated: false,
+    };
+  }
+  let fd;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const buf = Buffer.allocUnsafe(maxBytes);
+    const got = fs.readSync(fd, buf, 0, maxBytes, stat.size - maxBytes);
+    const raw = buf.subarray(0, got).toString("utf8");
+    const lines = raw.split(/\r?\n/);
+    // Drop the first partial line sliced mid-character
+    lines.shift();
+    return { exists: true, lines, truncated: true };
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
   }
 }
 
@@ -75,8 +122,8 @@ export function logEvent(level, moduleName, event, msg, meta = {}) {
   const textLine = `${rec.ts} [${lvl.padEnd(5)}] [${moduleName}:${event}]${sidPart}${reqPart}${codePart} ${rec.msg}\n`;
 
   try {
-    rotateIfNeeded(p.jsonlLog);
-    rotateIfNeeded(p.textLog);
+    rotateIfNeeded(p.jsonlLog, Buffer.byteLength(jsonLine, "utf8"));
+    rotateIfNeeded(p.textLog, Buffer.byteLength(textLine, "utf8"));
     fs.appendFileSync(p.jsonlLog, jsonLine, "utf8");
     fs.appendFileSync(p.textLog, textLine, "utf8");
   } catch {
@@ -89,9 +136,10 @@ export function appendTurnLog(sessionId, line) {
   const p = getPaths();
   const safe = String(sessionId || "session").replace(/[^A-Za-z0-9_-]/g, "_");
   const fp = path.join(p.turnsLogDir, `${safe}.log`);
+  const formatted = `[${nowIso()}] ${sanitizeText(line).trimEnd()}\n`;
   try {
-    rotateIfNeeded(fp);
-    fs.appendFileSync(fp, `[${nowIso()}] ${sanitizeText(line).trimEnd()}\n`, "utf8");
+    rotateIfNeeded(fp, Buffer.byteLength(formatted, "utf8"));
+    fs.appendFileSync(fp, formatted, "utf8");
   } catch {
     // ignore
   }
@@ -102,45 +150,56 @@ export function readTurnLog(sessionId, tailLines = 200) {
   const p = getPaths();
   const safe = String(sessionId || "session").replace(/[^A-Za-z0-9_-]/g, "_");
   const fp = path.join(p.turnsLogDir, `${safe}.log`);
-  if (!fs.existsSync(fp)) {
+  const tail = readTailUtf8Lines(fp, TAIL_CHUNK_BYTES);
+  if (!tail.exists) {
     return { path: fp, exists: false, total_lines: 0, lines: [] };
   }
-  const all = fs.readFileSync(fp, "utf8").split(/\r?\n/).filter(Boolean);
+  const nonEmpty = tail.lines.filter(Boolean);
   return {
     path: fp,
     exists: true,
-    total_lines: all.length,
-    lines: all.slice(-tailLines),
+    total_lines: nonEmpty.length,
+    lines: nonEmpty.slice(-tailLines),
   };
 }
 
 export function tailLogs({ limit = 150, level = "ALL", sessionId = "", moduleName = "" } = {}) {
   const p = getPaths();
   if (!fs.existsSync(p.jsonlLog)) return [];
-  const rawLines = fs.readFileSync(p.jsonlLog, "utf8").split(/\r?\n/);
-  const lvl = String(level || "ALL").toUpperCase();
-  const out = [];
-  for (let i = rawLines.length - 1; i >= 0; i--) {
-    const line = rawLines[i].trim();
-    if (!line) continue;
-    let rec;
-    try {
-      rec = JSON.parse(line);
-    } catch {
-      continue;
+
+  const scanLines = (rawLines) => {
+    const lvl = String(level || "ALL").toUpperCase();
+    const out = [];
+    for (let i = rawLines.length - 1; i >= 0; i--) {
+      const line = rawLines[i].trim();
+      if (!line) continue;
+      let rec;
+      try {
+        rec = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (lvl === "WARN+") {
+        if (!["WARN", "WARNING", "ERROR", "CRITICAL"].includes(rec.level)) continue;
+      } else if (lvl !== "ALL" && rec.level !== lvl) {
+        continue;
+      }
+      if (sessionId && rec.session_id !== sessionId) continue;
+      if (moduleName && rec.module !== moduleName) continue;
+      out.push(rec);
+      if (out.length >= limit) break;
     }
-    if (lvl === "WARN+") {
-      if (!["WARN", "WARNING", "ERROR", "CRITICAL"].includes(rec.level)) continue;
-    } else if (lvl !== "ALL" && rec.level !== lvl) {
-      continue;
-    }
-    if (sessionId && rec.session_id !== sessionId) continue;
-    if (moduleName && rec.module !== moduleName) continue;
-    out.push(rec);
-    if (out.length >= limit) break;
-  }
-  out.reverse();
-  return out;
+    out.reverse();
+    return out;
+  };
+
+  // Fast tail-chunk read first; only scan full file if filtered query needs older entries
+  const fast = readTailUtf8Lines(p.jsonlLog, TAIL_CHUNK_BYTES);
+  const hits = scanLines(fast.lines);
+  if (!fast.truncated || hits.length >= limit) return hits;
+
+  const fullLines = fs.readFileSync(p.jsonlLog, "utf8").split(/\r?\n/);
+  return scanLines(fullLines);
 }
 
 export function classifyError({

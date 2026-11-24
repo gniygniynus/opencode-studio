@@ -322,3 +322,132 @@ export function enrichProviderForClient(provider) {
     model_infos: modelInfos,
   };
 }
+
+/**
+ * Live connectivity & latency probe for a provider configuration.
+ */
+export async function testProviderConnection(provider) {
+  const t0 = performance.now();
+  const model =
+    String(provider.default_model || provider.models?.[0] || "").trim() ||
+    (provider.kind === "anthropic" ? "claude-sonnet-4-6" : "gpt-4o-mini");
+
+  if (!provider.api_key && !provider.base_url) {
+    return { ok: false, error: "请先填写 Base URL 或 API Key", latency_ms: 0, model };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 14000);
+
+  try {
+    if (provider.kind === "anthropic") {
+      const url = buildApiEndpoint(provider.base_url, "anthropic", "/messages");
+      const headers = {
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+      };
+      if (provider.api_key) {
+        headers["x-api-key"] = provider.api_key;
+        headers["Authorization"] = `Bearer ${provider.api_key}`;
+      }
+      const res = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model,
+          max_tokens: 8,
+          stream: false,
+          messages: [{ role: "user", content: "Reply OK" }],
+        }),
+        signal: controller.signal,
+      });
+      const latencyMs = Math.round(performance.now() - t0);
+      const raw = await res.text();
+      if (!res.ok) {
+        return {
+          ok: false,
+          status: res.status,
+          latency_ms: latencyMs,
+          model,
+          endpoint: url,
+          error: `HTTP ${res.status}: ${raw.slice(0, 260)}`,
+        };
+      }
+      return {
+        ok: true,
+        status: res.status,
+        latency_ms: latencyMs,
+        model,
+        endpoint: url,
+        message: `连接正常（${model} · 响应耗时 ${latencyMs} ms）`,
+      };
+    }
+
+    // OpenAI-compatible protocol probe (auto-retries with stream:true if relay requires streaming)
+    const url = buildApiEndpoint(provider.base_url, "openai", "/chat/completions");
+    const headers = { "Content-Type": "application/json" };
+    if (provider.api_key) headers["Authorization"] = `Bearer ${provider.api_key}`;
+
+    let res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        max_tokens: 8,
+        stream: false,
+        messages: [{ role: "user", content: "Reply OK" }],
+      }),
+      signal: controller.signal,
+    });
+
+    if (res.status === 400 || res.status === 422) {
+      const retryRes = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model,
+          max_tokens: 8,
+          stream: true,
+          messages: [{ role: "user", content: "Reply OK" }],
+        }),
+        signal: controller.signal,
+      });
+      if (retryRes.ok) res = retryRes;
+    }
+
+    const latencyMs = Math.round(performance.now() - t0);
+    if (!res.ok) {
+      const raw = await res.text();
+      return {
+        ok: false,
+        status: res.status,
+        latency_ms: latencyMs,
+        model,
+        endpoint: url,
+        error: `HTTP ${res.status}: ${raw.slice(0, 260)}`,
+      };
+    }
+    // Drain/cancel body cleanly
+    try {
+      await res.body?.cancel();
+    } catch {}
+    return {
+      ok: true,
+      status: res.status,
+      latency_ms: latencyMs,
+      model,
+      endpoint: url,
+      message: `连接正常（${model} · 首包响应 ${latencyMs} ms）`,
+    };
+  } catch (err) {
+    const latencyMs = Math.round(performance.now() - t0);
+    return {
+      ok: false,
+      latency_ms: latencyMs,
+      model,
+      error: err.name === "AbortError" ? "请求超时（14s 无响应，请检查地址或网络）" : err.message,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}

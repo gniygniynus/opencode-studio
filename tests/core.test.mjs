@@ -560,5 +560,135 @@ describe("OpenCode Studio Core Suite", () => {
     }).then((r) => r.json());
     assert.equal(postRes.disk_synced, true);
     assert.equal(fs.readFileSync(alphaFile, "utf8"), updatedContent);
+
+    // 6. Deleting a synced memory via DELETE /api/memories/:id must NOT resurrect on subsequent GET /api/memories!
+    const delRes = await fetch(`${studioServer.url}/api/memories/${encodeURIComponent(alphaRow.id)}`, {
+      method: "DELETE",
+    }).then((r) => r.json());
+    assert.equal(delRes.ok, true);
+    const listAfterDel = await fetch(`${studioServer.url}/api/memories`).then((r) => r.json());
+    assert.equal(listAfterDel.memories.some((m) => m.id === alphaRow.id), false, "deleted disk memory must never ghost-resurrect");
+  });
+
+  it("preserves literal $&, $$, $1 patterns in edit_file without regex replacement corruption", async () => {
+    const ctx = { cwd: tmpWorkdir, signal: new AbortController().signal };
+    await executeBuiltinTool("write_file", { file_path: "dollar.sh", content: "PRICE=old_val\nEND=1\n" }, ctx);
+    const special = "PRICE=$100 && echo $& $$ $' $`";
+    const ed = await executeBuiltinTool(
+      "edit_file",
+      { file_path: "dollar.sh", old_string: "PRICE=old_val", new_string: special },
+      ctx,
+    );
+    assert.equal(ed.ok, true);
+    const raw = fs.readFileSync(path.join(tmpWorkdir, "dollar.sh"), "utf8");
+    assert.equal(raw, `${special}\nEND=1\n`);
+  });
+
+  it("supports FTS5 >=3-char search, <3-char CJK fallback, session pinning, DB optimize, provider test & ETag/Gzip", async () => {
+    // 1. Sub-80ms non-blocking /api/bootstrap + static Gzip & 304 ETag negotiation
+    const tBoot = performance.now();
+    const bootRes = await fetch(`${studioServer.url}/api/bootstrap`);
+    const bootJson = await bootRes.json();
+    const bootMs = performance.now() - tBoot;
+    assert.equal(bootRes.status, 200);
+    assert.ok(bootJson.db_stats, "bootstrap includes db_stats");
+    assert.ok(bootMs < 1200, `/api/bootstrap should respond without blocking spawnSync (took ${bootMs.toFixed(1)}ms)`);
+
+    const asset1 = await fetch(`${studioServer.url}/app.js`, { headers: { "Accept-Encoding": "gzip" } });
+    assert.equal(asset1.status, 200);
+    const etag = asset1.headers.get("etag");
+    assert.ok(etag, "static asset must return ETag");
+    await asset1.arrayBuffer();
+    const asset304 = await fetch(`${studioServer.url}/app.js`, { headers: { "If-None-Match": etag } });
+    assert.equal(asset304.status, 304);
+
+    // 2. Session pinning + FTS5 trigram (>=3 chars) + short CJK (<3 chars) search
+    const s1 = createSession({ title: "普通会话一", cwd: tmpWorkdir });
+    const s2 = createSession({ title: "置顶架构会话", cwd: tmpWorkdir });
+    addMessage({ sessionId: s1.id, role: "user", contentText: "排查 PostgreSQL 索引锁等待问题与优化方案" });
+    addMessage({ sessionId: s2.id, role: "user", contentText: "设计分布式缓存架构" });
+
+    await fetch(`${studioServer.url}/api/sessions/${encodeURIComponent(s2.id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pinned: true }),
+    });
+
+    const allListed = await fetch(`${studioServer.url}/api/sessions`).then((r) => r.json());
+    assert.equal(allListed.sessions[0].id, s2.id, "pinned session must sort first");
+    assert.equal(allListed.sessions[0].pinned, true);
+
+    // FTS5 trigram (>= 3 chars)
+    const ftsHit = await fetch(`${studioServer.url}/api/sessions?q=${encodeURIComponent("索引锁等待")}`).then((r) => r.json());
+    assert.ok(ftsHit.sessions.some((s) => s.id === s1.id && s.match_snippet?.includes("索引锁等待")));
+
+    // Short 2-char CJK query fallback
+    const shortHit = await fetch(`${studioServer.url}/api/sessions?q=${encodeURIComponent("缓存")}`).then((r) => r.json());
+    assert.ok(shortHit.sessions.some((s) => s.id === s2.id));
+
+    // 3. Provider live connectivity test endpoint
+    const testConn = await fetch(`${studioServer.url}/api/providers/test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: "Temp Probe",
+        kind: "openai",
+        base_url: mockLlmUrl,
+        api_key: "sk-probe-123",
+        default_model: "gpt-4o",
+      }),
+    }).then((r) => r.json());
+    assert.equal(testConn.ok, true);
+    assert.equal(typeof testConn.latency_ms, "number");
+
+    // 4. Delete session -> archived -> purge via POST /api/db/optimize
+    await fetch(`${studioServer.url}/api/sessions/${encodeURIComponent(s1.id)}`, { method: "DELETE" });
+    const optRes = await fetch(`${studioServer.url}/api/db/optimize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ purge_archived: true }),
+    }).then((r) => r.json());
+    assert.equal(optRes.ok, true);
+    assert.ok(optRes.purged_sessions >= 1);
+    assert.equal(optRes.after.sessions_archived, 0);
+  });
+
+  it("translates interleaved thinking -> text -> tool_call -> text streams with valid block indices", async () => {
+    const interleavedRelay = http.createServer(async (_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "先思考第一步" } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "前置说明。" } }] })}\n\n`);
+      res.write(
+        `data: ${JSON.stringify({
+          choices: [{ delta: { tool_calls: [{ index: 0, id: "call_il_1", type: "function", function: { name: "list_dir", arguments: "{}" } }] } }],
+        })}\n\n`,
+      );
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "后置补充说明。" }, finish_reason: "tool_calls" }] })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+    await new Promise((r) => interleavedRelay.listen(0, "127.0.0.1", r));
+    const ilUrl = `http://127.0.0.1:${interleavedRelay.address().port}`;
+    try {
+      const saved = saveProvider({
+        name: "Interleaved Relay",
+        kind: "openai",
+        base_url: ilUrl,
+        api_key: "sk-il",
+        default_model: "gpt-4o",
+      });
+      const res = await fetch(`${studioServer.url}/proxy/provider/${saved.id}/v1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o", stream: true, messages: [{ role: "user", content: "go" }] }),
+      });
+      const sse = await res.text();
+      const starts = [...sse.matchAll(/data: (\{"type":"content_block_start"[^\n]+)/g)].map((m) => JSON.parse(m[1]));
+      assert.equal(starts.length, 4, "must open 4 distinct content blocks (thinking=0, text=1, tool=2, text=3)");
+      assert.deepEqual(starts.map((s) => s.index), [0, 1, 2, 3]);
+      deleteProvider(saved.id);
+    } finally {
+      await new Promise((r) => interleavedRelay.close(r));
+    }
   });
 });

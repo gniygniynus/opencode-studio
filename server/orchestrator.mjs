@@ -143,8 +143,8 @@ export class SessionOrchestrator {
       return await this._handleCompact(sid, providerId, model);
     }
 
-    const timeline = getSessionTimeline(sid);
-    const parentId = timeline?.last_message_id || null;
+    const prevTimeline = getSessionTimeline(sid);
+    const parentId = prevTimeline?.last_message_id || null;
 
     // Auto-title if still default
     if (meta.title === "新会话" && cleanText) {
@@ -159,11 +159,12 @@ export class SessionOrchestrator {
       images: images || [],
     });
 
+    const nextTimeline = getSessionTimeline(sid);
     this.broadcast({
       type: "message_added",
       session_id: sid,
       message: userMsg,
-      timeline: getSessionTimeline(sid),
+      timeline: nextTimeline,
     });
 
     this._launchExecution({
@@ -173,6 +174,7 @@ export class SessionOrchestrator {
       model: model || meta.model,
       thinkingLevel: thinkingLevel || meta.thinking_level || "auto",
       forceNoCliResume: false,
+      prefetchedTimeline: nextTimeline,
     });
 
     return { ok: true, session_id: sid, message_id: userMsg.id };
@@ -358,7 +360,16 @@ export class SessionOrchestrator {
     }
   }
 
-  _launchExecution({ sessionId, userMessageId, providerId, model, thinkingLevel, forceNoCliResume, truncateAfterUserId = null }) {
+  _launchExecution({
+    sessionId,
+    userMessageId,
+    providerId,
+    model,
+    thinkingLevel,
+    forceNoCliResume,
+    truncateAfterUserId = null,
+    prefetchedTimeline = null,
+  }) {
     const reqId = newReqId();
     const meta = getSessionMeta(sessionId);
     const provider = (providerId ? getProvider(providerId, true) : null) || getActiveProvider(true);
@@ -404,7 +415,7 @@ export class SessionOrchestrator {
     (async () => {
       const t0 = Date.now();
       try {
-        const timeline = getSessionTimeline(sessionId);
+        const timeline = prefetchedTimeline || getSessionTimeline(sessionId);
         let historyItems = timeline.items;
         if (truncateAfterUserId) {
           const cutIdx = historyItems.findIndex((m) => m.id === truncateAfterUserId);
@@ -417,9 +428,12 @@ export class SessionOrchestrator {
             ? (info) => this._requestConfirm(sessionId, info)
             : null;
 
-        // Pure Native Claude Code architecture (bundled inside app installer out-of-the-box!).
-        // Only tests explicitly setting OPENCODE_FORCE_API_DIRECT=1 use the lightweight test mock engine.
-        const useNativeClaudeCode = process.env.OPENCODE_FORCE_API_DIRECT !== "1";
+        // Primary engine: Native Claude Code CLI.
+        // Smooth fallback: if native binary is absent on non-native API providers (or forced in tests), seamlessly run built-in OpenCode API Engine!
+        const rt = process.env.OPENCODE_FORCE_API_DIRECT === "1" ? { mode: "missing" } : detectClaudeRuntime(false);
+        const useNativeClaudeCode =
+          process.env.OPENCODE_FORCE_API_DIRECT !== "1" &&
+          (provider.kind === "claude_native" || rt.mode !== "missing");
 
         let lastPushTs = 0;
         const pushLive = (force = false) => {

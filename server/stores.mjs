@@ -7,20 +7,29 @@
 
 import { getAllSettings } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
+import { proxyFetch } from "./runtime_utils.mjs";
 
-const USER_AGENT = "OpenCodeStudio/1.3 (+https://github.com/gniygniynus/opencode-studio)";
+const USER_AGENT = "OpenCodeStudio/2.1 (+https://github.com/gniygniynus/opencode-studio)";
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 // ==================== DUAL SEARCH ENGINE DETECTOR (DOMESTIC DIRECT vs PROXY GLOBAL) ====================
-let _globalProbeCache = { reachable: false, checkedAt: 0 };
+let _globalProbeCache = { reachable: false, checkedAt: 0, proxyKey: "" };
+// Short-lived store response cache (45s) so switching store tabs feels instantaneous
+const _storeQueryCache = new Map();
 
-async function fetchWithTimeout(url, { timeoutMs = 8500, headers = {} } = {}) {
+function getConfiguredProxyUrl() {
+  return String(getAllSettings().search_engine?.proxy_url || "").trim();
+}
+
+async function fetchWithTimeout(url, { timeoutMs = 8500, headers = {}, useProxy = true } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
+    const proxyUrl = useProxy ? getConfiguredProxyUrl() : "";
+    const res = await proxyFetch(url, {
       headers: { "User-Agent": USER_AGENT, ...headers },
       signal: controller.signal,
+      proxyUrl,
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res;
@@ -55,13 +64,14 @@ export async function resolveSearchEngine(requested = "") {
     return { active: "proxy", requested: pref, label: "代理引擎" };
   }
 
-  // Auto-probe global network (cached 60s so switching pages is instant)
-  if (Date.now() - _globalProbeCache.checkedAt > 60_000) {
+  // Auto-probe global network (cached 60s, invalidated immediately if proxy_url changes)
+  const proxyKey = String(saved.proxy_url || "").trim();
+  if (Date.now() - _globalProbeCache.checkedAt > 60_000 || _globalProbeCache.proxyKey !== proxyKey) {
     try {
-      await fetchWithTimeout("https://api.github.com/zen", { timeoutMs: 2200 });
-      _globalProbeCache = { reachable: true, checkedAt: Date.now() };
+      await fetchWithTimeout("https://api.github.com/zen", { timeoutMs: 2200, useProxy: true });
+      _globalProbeCache = { reachable: true, checkedAt: Date.now(), proxyKey };
     } catch {
-      _globalProbeCache = { reachable: false, checkedAt: Date.now() };
+      _globalProbeCache = { reachable: false, checkedAt: Date.now(), proxyKey };
     }
   }
   return _globalProbeCache.reachable
@@ -671,6 +681,9 @@ function parseRegistryMcpEntry(entry) {
 export async function searchMcpStore(query = "", enginePref = "") {
   const q = String(query || "").trim();
   const engine = await resolveSearchEngine(enginePref);
+  const cacheKey = `mcp|${engine.active}|${q.toLowerCase()}`;
+  const cached = _storeQueryCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < 45_000) return cached.data;
   const localHits = q
     ? CURATED_MCPS.filter((m) =>
         `${m.name} ${m.title} ${m.description} ${(m.tags || []).join(" ")}`.toLowerCase().includes(q.toLowerCase()),
@@ -816,7 +829,7 @@ export async function searchMcpStore(query = "", enginePref = "") {
     const key = item.name + "::" + item.command + "::" + (item.args || []).join(" ");
     if (!dedup.has(key)) dedup.set(key, item);
   }
-  return {
+  const result = {
     ok: true,
     mode: q ? "online" : "curated+online",
     search_engine: engine,
@@ -824,6 +837,8 @@ export async function searchMcpStore(query = "", enginePref = "") {
     items: [...dedup.values()].slice(0, 36),
     online_error: errors.length && !onlineItems.length ? errors.join("；") : "",
   };
+  if (onlineItems.length > 0) _storeQueryCache.set(cacheKey, { at: Date.now(), data: result });
+  return result;
 }
 
 /**

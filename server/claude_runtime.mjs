@@ -24,9 +24,18 @@ import { appendTurnLog, classifyError, logEvent } from "./logger.mjs";
 import { buildUnifiedMemoryContext, syncDiskMemoriesToDb } from "./memory_sync.mjs";
 import { detectModelCapabilities } from "./model_registry.mjs";
 import { getPaths, PROJECT_ROOT } from "./paths.mjs";
+import { killProcessTree, proxyFetch } from "./runtime_utils.mjs";
+
+const RUNTIME_CACHE_TTL_MS = 5 * 60 * 1000;
+const AUTH_CACHE_TTL_MS = 90 * 1000;
 
 let _cachedRuntime = null;
 let _cachedAt = 0;
+let _cachedStatusSnapshot = null;
+let _cachedStatusAt = 0;
+let _cachedStatusIsoMode = "";
+let _inflightStatusPromise = null;
+
 // Track last injected memory digest per CLI session so memories are injected once per session
 // and re-injected automatically whenever disk or Web UI memories change.
 const _lastSessionMemHash = new Map();
@@ -34,6 +43,9 @@ const _lastSessionMemHash = new Map();
 export function clearRuntimeCache() {
   _cachedRuntime = null;
   _cachedAt = 0;
+  _cachedStatusSnapshot = null;
+  _cachedStatusAt = 0;
+  _cachedStatusIsoMode = "";
 }
 
 export function winPathToWsl(winPath) {
@@ -137,45 +149,74 @@ function getBundledClaudeCandidates() {
 }
 
 /**
- * Detect a genuinely working native Claude Code CLI with strict zero-conflict priority:
+ * Detect a genuinely working native Claude Code CLI with strict zero-conflict priority
+ * and short-circuit evaluation (never spawns `where.exe` or `wsl.exe` when managed/bundled binary exists!):
  *  1. OpenCode Studio private managed upgrade binary (<dataRoot>/claude-runtime) — never overwrites user's system CLI!
  *  2. Bundled official native binary shipped INSIDE OpenCode Studio installer (out-of-the-box!)
  *  3. System PATH / WSL2 fallback (only when neither managed nor bundled exists)
  */
 export function detectClaudeRuntime(force = false) {
-  if (!force && _cachedRuntime && Date.now() - _cachedAt < 10_000) {
-    return _cachedRuntime;
+  if (!force && _cachedRuntime && Date.now() - _cachedAt < RUNTIME_CACHE_TTL_MS) {
+    if (_cachedRuntime.mode === "missing" || _cachedRuntime.mode === "wsl" || fs.existsSync(_cachedRuntime.binary)) {
+      return _cachedRuntime;
+    }
   }
 
   const managedCandidates = getManagedClaudeCandidates();
   const bundledCandidates = getBundledClaudeCandidates();
   const managedSet = new Set(managedCandidates.map((p) => path.resolve(p)));
   const bundledSet = new Set(bundledCandidates.map((p) => path.resolve(p)));
-  const candidates = [...managedCandidates, ...bundledCandidates];
 
-  if (process.platform === "win32") {
-    candidates.push(path.join(os.homedir(), ".local", "bin", "claude.exe"));
-    candidates.push(path.join(process.env.LOCALAPPDATA || "", "Programs", "claude", "claude.exe"));
-    const w = spawnSync("where.exe", ["claude.exe"], { encoding: "utf8", timeout: 3000, windowsHide: true });
-    if (w.status === 0 && w.stdout) candidates.push(...w.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
-    const wc = spawnSync("where.exe", ["claude"], { encoding: "utf8", timeout: 3000, windowsHide: true });
-    if (wc.status === 0 && wc.stdout) candidates.push(...wc.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
-  } else {
-    candidates.push(path.join(os.homedir(), ".local", "bin", "claude"));
-    const w = spawnSync("which", ["claude"], { encoding: "utf8", timeout: 3000 });
-    if (w.status === 0 && w.stdout.trim()) candidates.push(w.stdout.trim());
-  }
+  const fixedSystemCandidates =
+    process.platform === "win32"
+      ? [
+          path.join(os.homedir(), ".local", "bin", "claude.exe"),
+          path.join(process.env.LOCALAPPDATA || "", "Programs", "claude", "claude.exe"),
+        ]
+      : [path.join(os.homedir(), ".local", "bin", "claude")];
+
+  const markTier = (cand, hit) => {
+    const abs = path.resolve(cand);
+    hit.managed = managedSet.has(abs);
+    hit.bundled = bundledSet.has(abs);
+    return hit;
+  };
 
   let found = null;
-  for (const c of [...new Set(candidates)]) {
+  // Tier 1 & 2 & 3: direct filesystem check without spawning `where.exe` / `which`
+  for (const c of [...new Set([...managedCandidates, ...bundledCandidates, ...fixedSystemCandidates])]) {
+    if (!c || !fs.existsSync(c)) continue;
     found = testNativeCandidate(c);
     if (found) {
-      const abs = path.resolve(c);
-      found.managed = managedSet.has(abs);
-      found.bundled = bundledSet.has(abs);
+      markTier(c, found);
       break;
     }
   }
+
+  // Tier 4: Only probe PATH via where/which if direct tiers found nothing
+  if (!found) {
+    const pathCandidates = [];
+    if (process.platform === "win32") {
+      const w = spawnSync("where.exe", ["claude.exe"], { encoding: "utf8", timeout: 2500, windowsHide: true });
+      if (w.status === 0 && w.stdout) pathCandidates.push(...w.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
+      if (!pathCandidates.length) {
+        const wc = spawnSync("where.exe", ["claude"], { encoding: "utf8", timeout: 2500, windowsHide: true });
+        if (wc.status === 0 && wc.stdout) pathCandidates.push(...wc.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
+      }
+    } else {
+      const w = spawnSync("which", ["claude"], { encoding: "utf8", timeout: 2500 });
+      if (w.status === 0 && w.stdout.trim()) pathCandidates.push(w.stdout.trim());
+    }
+    for (const c of [...new Set(pathCandidates)]) {
+      found = testNativeCandidate(c);
+      if (found) {
+        markTier(c, found);
+        break;
+      }
+    }
+  }
+
+  // Tier 5: WSL2 fallback on Windows
   if (!found && process.platform === "win32") {
     found = testWslClaude();
   }
@@ -250,13 +291,19 @@ function runClaudeSync(rt, args, timeoutMs = 8000) {
   return spawnSync(rt.binary, args, { encoding: "utf8", env: cleanEnv, timeout: timeoutMs, windowsHide: true });
 }
 
-/**
- * Full runtime + real `claude auth status` probe.
- */
-export function getClaudeRuntimeAndAuth(force = false) {
-  const rt = detectClaudeRuntime(force);
-  const iso = getClaudeIsolationConfig();
-  if (rt.mode === "missing") {
+function readInstalledPkgVersionFast(rootDir) {
+  try {
+    const pkgPath = path.join(rootDir, "node_modules", "@anthropic-ai", "claude-code", "package.json");
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+      if (pkg?.version) return `${pkg.version} (Claude Code)`;
+    }
+  } catch {}
+  return "installed";
+}
+
+function buildStatusObjectFromRuntime(rt, iso, auth) {
+  if (!rt || rt.mode === "missing") {
     return {
       installed: false,
       mode: "missing",
@@ -268,19 +315,6 @@ export function getClaudeRuntimeAndAuth(force = false) {
       note: "未检测到原生 Claude Code，可点击下方「一键安装稳定版 / 最新版」自动安装。",
     };
   }
-
-  let auth = { loggedIn: false };
-  try {
-    const res = runClaudeSync(rt, ["auth", "status"], 6000);
-    const out = (res.stdout || "").trim();
-    const jsonStart = out.indexOf("{");
-    if (jsonStart >= 0) {
-      auth = JSON.parse(out.slice(jsonStart));
-    }
-  } catch {
-    // keep default
-  }
-
   const isoNote =
     iso.mode === "isolated"
       ? "独立配置沙盒已开启（绝不修改或冲突本机原有 ~/.claude 与命令行 Claude Code）"
@@ -295,7 +329,7 @@ export function getClaudeRuntimeAndAuth(force = false) {
     config_dir: iso.configDir || path.join(os.homedir(), ".claude"),
     binary: rt.binary,
     version: rt.version,
-    auth,
+    auth: auth || { loggedIn: false },
     note: rt.managed
       ? `已启用工作台独立升级的原生 Claude Code (${rt.version}) · ${isoNote}`
       : rt.bundled
@@ -304,6 +338,272 @@ export function getClaudeRuntimeAndAuth(force = false) {
           ? `已接入 WSL2 原生 Claude Code (${rt.version}) · ${isoNote}`
           : `已接入本机原生 Claude Code (${rt.version}) · ${isoNote}`,
   };
+}
+
+function spawnAsyncText(cmd, args, { env, timeoutMs = 6000 } = {}) {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let proc;
+    try {
+      proc = spawn(cmd, args, { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    } catch (err) {
+      return resolve({ status: -1, stdout: "", stderr: err.message });
+    }
+    const timer = setTimeout(() => {
+      killProcessTree(proc);
+      resolve({ status: -1, stdout, stderr: stderr + " timeout" });
+    }, timeoutMs);
+    proc.stdout?.on("data", (d) => { stdout += d.toString("utf8"); });
+    proc.stderr?.on("data", (d) => { stderr += d.toString("utf8"); });
+    proc.on("error", (err) => { clearTimeout(timer); resolve({ status: -1, stdout, stderr: err.message }); });
+    proc.on("close", (code) => { clearTimeout(timer); resolve({ status: code ?? 0, stdout, stderr }); });
+  });
+}
+
+async function detectClaudeRuntimeAsync(force = false) {
+  if (!force && _cachedRuntime && Date.now() - _cachedAt < RUNTIME_CACHE_TTL_MS) {
+    if (_cachedRuntime.mode === "missing" || _cachedRuntime.mode === "wsl" || fs.existsSync(_cachedRuntime.binary)) {
+      return _cachedRuntime;
+    }
+  }
+
+  const managedCandidates = getManagedClaudeCandidates();
+  const bundledCandidates = getBundledClaudeCandidates();
+  const managedSet = new Set(managedCandidates.map((p) => path.resolve(p)));
+  const bundledSet = new Set(bundledCandidates.map((p) => path.resolve(p)));
+  const fixedSystemCandidates =
+    process.platform === "win32"
+      ? [
+          path.join(os.homedir(), ".local", "bin", "claude.exe"),
+          path.join(process.env.LOCALAPPDATA || "", "Programs", "claude", "claude.exe"),
+        ]
+      : [path.join(os.homedir(), ".local", "bin", "claude")];
+
+  const probeBinAsync = async (binPath) => {
+    if (!binPath || !fs.existsSync(binPath)) return null;
+    const isCmd = process.platform === "win32" && /\.(cmd|bat)$/i.test(binPath);
+    const res = isCmd
+      ? await spawnAsyncText("cmd.exe", ["/c", binPath, "--version"], { timeoutMs: 4000 })
+      : await spawnAsyncText(binPath, ["--version"], { timeoutMs: 4000 });
+    if (res.status === 0 && /claude|\d+\.\d+/i.test(res.stdout || "")) {
+      const abs = path.resolve(binPath);
+      return {
+        mode: "native",
+        binary: binPath,
+        isCmd,
+        version: (res.stdout || "").trim(),
+        managed: managedSet.has(abs),
+        bundled: bundledSet.has(abs),
+      };
+    }
+    return null;
+  };
+
+  let found = null;
+  for (const c of [...new Set([...managedCandidates, ...bundledCandidates, ...fixedSystemCandidates])]) {
+    found = await probeBinAsync(c);
+    if (found) break;
+  }
+
+  if (!found) {
+    const pathCandidates = [];
+    if (process.platform === "win32") {
+      const w = await spawnAsyncText("where.exe", ["claude.exe"], { timeoutMs: 2500 });
+      if (w.status === 0 && w.stdout) pathCandidates.push(...w.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
+      if (!pathCandidates.length) {
+        const wc = await spawnAsyncText("where.exe", ["claude"], { timeoutMs: 2500 });
+        if (wc.status === 0 && wc.stdout) pathCandidates.push(...wc.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
+      }
+    } else {
+      const w = await spawnAsyncText("which", ["claude"], { timeoutMs: 2500 });
+      if (w.status === 0 && w.stdout.trim()) pathCandidates.push(w.stdout.trim());
+    }
+    for (const c of [...new Set(pathCandidates)]) {
+      found = await probeBinAsync(c);
+      if (found) break;
+    }
+  }
+
+  if (!found && process.platform === "win32") {
+    const script = [
+      'BIN=$(command -v claude || ls -1 "$HOME/.local/bin/claude" 2>/dev/null | head -n1)',
+      'if [ -n "$BIN" ]; then',
+      '  echo "BIN=$BIN"',
+      '  "$BIN" --version',
+      "fi",
+    ].join("\n");
+    const res = await spawnAsyncText("wsl.exe", wslScriptArgs(script), { timeoutMs: 6000 });
+    if (res.status === 0 && res.stdout) {
+      const lines = res.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      const binLine = lines.find((l) => l.startsWith("BIN="));
+      const verLine = lines.find((l) => !l.startsWith("BIN="));
+      if (binLine && verLine) {
+        found = { mode: "wsl", binary: binLine.slice(4), isCmd: false, version: verLine, managed: false, bundled: false };
+      }
+    }
+  }
+
+  _cachedRuntime = found || { mode: "missing", binary: null, isCmd: false, version: null, bundled: false, managed: false };
+  _cachedAt = Date.now();
+  return _cachedRuntime;
+}
+
+async function probeClaudeAuthAsync(rt, iso) {
+  if (!rt || rt.mode === "missing") return { loggedIn: false };
+  try {
+    let res;
+    if (rt.mode === "wsl") {
+      const isoLine = iso.configDir ? `export CLAUDE_CONFIG_DIR='${winPathToWsl(iso.configDir).replace(/'/g, "'\\''")}'` : "";
+      const script = [
+        "unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY",
+        isoLine,
+        `'${rt.binary.replace(/'/g, "'\\''")}' 'auth' 'status'`,
+      ].filter(Boolean).join("\n");
+      res = await spawnAsyncText("wsl.exe", wslScriptArgs(script), { timeoutMs: 6000 });
+    } else {
+      const cleanEnv = { ...process.env };
+      delete cleanEnv.ANTHROPIC_BASE_URL;
+      delete cleanEnv.ANTHROPIC_AUTH_TOKEN;
+      delete cleanEnv.ANTHROPIC_API_KEY;
+      if (iso.configDir) cleanEnv.CLAUDE_CONFIG_DIR = iso.configDir;
+      res = rt.isCmd
+        ? await spawnAsyncText("cmd.exe", ["/c", rt.binary, "auth", "status"], { env: cleanEnv, timeoutMs: 6000 })
+        : await spawnAsyncText(rt.binary, ["auth", "status"], { env: cleanEnv, timeoutMs: 6000 });
+    }
+    const out = (res.stdout || "").trim();
+    const jsonStart = out.indexOf("{");
+    if (jsonStart >= 0) return JSON.parse(out.slice(jsonStart));
+  } catch {}
+  return { loggedIn: false };
+}
+
+/**
+ * Non-blocking async probe of Claude runtime + `claude auth status` (never blocks Node event loop!).
+ */
+export async function refreshClaudeRuntimeAndAuthAsync(force = false) {
+  const iso = getClaudeIsolationConfig();
+  if (
+    !force &&
+    _cachedStatusSnapshot &&
+    _cachedStatusIsoMode === iso.mode &&
+    Date.now() - _cachedStatusAt < AUTH_CACHE_TTL_MS
+  ) {
+    return _cachedStatusSnapshot;
+  }
+  if (_inflightStatusPromise && !force) {
+    return await _inflightStatusPromise;
+  }
+
+  const run = (async () => {
+    const rt = await detectClaudeRuntimeAsync(force);
+    const curIso = getClaudeIsolationConfig();
+    const auth = await probeClaudeAuthAsync(rt, curIso);
+    const snapshot = buildStatusObjectFromRuntime(rt, curIso, auth);
+    _cachedStatusSnapshot = snapshot;
+    _cachedStatusAt = Date.now();
+    _cachedStatusIsoMode = curIso.mode;
+    return snapshot;
+  })();
+
+  _inflightStatusPromise = run;
+  try {
+    return await run;
+  } finally {
+    if (_inflightStatusPromise === run) _inflightStatusPromise = null;
+  }
+}
+
+/**
+ * Zero-latency (<1ms) snapshot for `/api/bootstrap` and `/api/providers` when `force=false`.
+ * Uses SWR (stale-while-revalidate) + instant filesystem inspection on cold boot so UI opens instantaneously!
+ */
+export function getClaudeRuntimeAndAuth(force = false) {
+  const iso = getClaudeIsolationConfig();
+
+  if (!force) {
+    if (_cachedStatusSnapshot && _cachedStatusIsoMode === iso.mode) {
+      if (Date.now() - _cachedStatusAt >= AUTH_CACHE_TTL_MS) {
+        refreshClaudeRuntimeAndAuthAsync(false).catch(() => {});
+      }
+      return _cachedStatusSnapshot;
+    }
+
+    // Cold-start sub-millisecond fast path: inspect managed/bundled files without spawning any child process!
+    const managedHit = getManagedClaudeCandidates().find((p) => fs.existsSync(p));
+    if (managedHit) {
+      const fastRt = {
+        mode: "native",
+        binary: managedHit,
+        isCmd: /\.(cmd|bat)$/i.test(managedHit),
+        version: readInstalledPkgVersionFast(iso.runtimeDir),
+        managed: true,
+        bundled: false,
+      };
+      refreshClaudeRuntimeAndAuthAsync(false).catch(() => {});
+      return buildStatusObjectFromRuntime(fastRt, iso, { loggedIn: false });
+    }
+    const bundledHit = getBundledClaudeCandidates().find((p) => fs.existsSync(p));
+    if (bundledHit) {
+      const fastRt = {
+        mode: "native",
+        binary: bundledHit,
+        isCmd: /\.(cmd|bat)$/i.test(bundledHit),
+        version: readInstalledPkgVersionFast(PROJECT_ROOT),
+        managed: false,
+        bundled: true,
+      };
+      refreshClaudeRuntimeAndAuthAsync(false).catch(() => {});
+      return buildStatusObjectFromRuntime(fastRt, iso, { loggedIn: false });
+    }
+
+    if (_cachedRuntime) {
+      refreshClaudeRuntimeAndAuthAsync(false).catch(() => {});
+      return buildStatusObjectFromRuntime(_cachedRuntime, iso, { loggedIn: false });
+    }
+
+    // Kick off async background discovery and return optimistic placeholder without blocking HTTP!
+    refreshClaudeRuntimeAndAuthAsync(true).catch(() => {});
+    return {
+      installed: false,
+      probing: true,
+      mode: "probing",
+      binary: null,
+      version: null,
+      isolation_mode: iso.mode,
+      config_dir: iso.configDir || path.join(os.homedir(), ".claude"),
+      auth: { loggedIn: false },
+      note: "正在后台检测原生 Claude Code 运行环境…",
+    };
+  }
+
+  // Synchronous forced fallback when caller explicitly requires blocking probe
+  const rt = detectClaudeRuntime(true);
+  if (rt.mode === "missing") {
+    const miss = buildStatusObjectFromRuntime(rt, iso, { loggedIn: false });
+    _cachedStatusSnapshot = miss;
+    _cachedStatusAt = Date.now();
+    _cachedStatusIsoMode = iso.mode;
+    return miss;
+  }
+
+  let auth = { loggedIn: false };
+  try {
+    const res = runClaudeSync(rt, ["auth", "status"], 6000);
+    const out = (res.stdout || "").trim();
+    const jsonStart = out.indexOf("{");
+    if (jsonStart >= 0) {
+      auth = JSON.parse(out.slice(jsonStart));
+    }
+  } catch {
+    // keep default
+  }
+
+  const snap = buildStatusObjectFromRuntime(rt, iso, auth);
+  _cachedStatusSnapshot = snap;
+  _cachedStatusAt = Date.now();
+  _cachedStatusIsoMode = iso.mode;
+  return snap;
 }
 
 const CLAUDE_DIST_BASE = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases";
@@ -636,8 +936,9 @@ export function runClaudeAuthLogout() {
  * Check installed Claude Code version vs official `stable` and `latest` channels!
  */
 export async function checkClaudeVersions() {
-  const runtime = getClaudeRuntimeAndAuth(true);
+  const runtime = await refreshClaudeRuntimeAndAuthAsync(true);
   const currentVer = parseSemverString(runtime.version);
+  const proxyUrl = getAllSettings().search_engine?.proxy_url || "";
 
   let stableVer = "";
   let latestVer = "";
@@ -648,7 +949,11 @@ export async function checkClaudeVersions() {
     const c = new AbortController();
     const t = setTimeout(() => c.abort(), timeoutMs);
     try {
-      const r = await fetch(url, { headers: { "User-Agent": "OpenCodeStudio/1.1" }, signal: c.signal });
+      const r = await proxyFetch(url, {
+        headers: { "User-Agent": "OpenCodeStudio/2.1" },
+        signal: c.signal,
+        proxyUrl,
+      });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return (await r.text()).trim();
     } finally {
@@ -1288,14 +1593,7 @@ export async function runNativeClaudeCodeTurn({
     const proc = spawnClaudeProcess(rt, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
 
     const killProc = () => {
-      try {
-        proc.kill("SIGINT");
-        setTimeout(() => {
-          try {
-            proc.kill("SIGKILL");
-          } catch {}
-        }, 2000);
-      } catch {}
+      killProcessTree(proc, "SIGINT", 1800);
     };
     if (signal) {
       if (signal.aborted) killProc();
@@ -1327,94 +1625,96 @@ export async function runNativeClaudeCodeTurn({
       appendTurnLog(sessionId, `[claude-stderr] ${s.trim()}`);
     });
 
-    proc.stdout?.on("data", (chunk) => {
-      buf += chunk.toString("utf8");
-      const lines = buf.split(/\r?\n/);
-      buf = lines.pop() || "";
-      for (const raw of lines) {
-        const line = raw.trim();
-        if (!line) continue;
-        let ev;
-        try {
-          ev = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (ev.session_id) cliSessionId = ev.session_id;
+    const processStreamLine = (raw) => {
+      const line = raw.trim();
+      if (!line) return;
+      let ev;
+      try {
+        ev = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (ev.session_id) cliSessionId = ev.session_id;
 
-        if (ev.type === "stream_event") {
-          const inner = ev.event || {};
-          if (inner.type === "message_start") {
-            blockByIdx.clear();
-          } else if (inner.type === "content_block_start") {
-            const cb = inner.content_block || {};
-            let blk;
-            if (cb.type === "thinking") blk = { type: "thinking", text: "" };
-            else if (cb.type === "tool_use") {
-              blk = {
+      if (ev.type === "stream_event") {
+        const inner = ev.event || {};
+        if (inner.type === "message_start") {
+          blockByIdx.clear();
+        } else if (inner.type === "content_block_start") {
+          const cb = inner.content_block || {};
+          let blk;
+          if (cb.type === "thinking") blk = { type: "thinking", text: "" };
+          else if (cb.type === "tool_use") {
+            blk = {
+              type: "tool_use",
+              id: cb.id || `tu_${Date.now()}_${blocks.length}`,
+              name: cb.name || "Tool",
+              input: {},
+              status: "running",
+              is_error: false,
+              result: null,
+            };
+            toolById.set(blk.id, blk);
+          } else {
+            blk = { type: "text", text: "" };
+          }
+          blocks.push(blk);
+          blockByIdx.set(inner.index, blk);
+          onEvent({ type: "step_blocks", blocks, usage });
+        } else if (inner.type === "content_block_delta") {
+          const blk = blockByIdx.get(inner.index);
+          const d = inner.delta || {};
+          if (blk && d.type === "text_delta" && d.text) {
+            blk.text += d.text;
+            onEvent({ type: "delta", kind: "text_delta", text: d.text });
+          } else if (blk && d.type === "thinking_delta" && d.thinking) {
+            blk.text += d.thinking;
+            onEvent({ type: "delta", kind: "thinking_delta", text: d.thinking });
+          }
+        }
+      } else if (ev.type === "assistant" && ev.message) {
+        if (ev.message.usage) usage = ev.message.usage;
+        for (const b of ev.message.content || []) {
+          if (b.type === "tool_use" && b.id) {
+            const ex = toolById.get(b.id);
+            if (ex) {
+              ex.input = b.input || ex.input;
+            } else {
+              const nb = {
                 type: "tool_use",
-                id: cb.id || `tu_${Date.now()}_${blocks.length}`,
-                name: cb.name || "Tool",
-                input: {},
+                id: b.id,
+                name: b.name || "Tool",
+                input: b.input || {},
                 status: "running",
                 is_error: false,
                 result: null,
               };
-              toolById.set(blk.id, blk);
-            } else {
-              blk = { type: "text", text: "" };
-            }
-            blocks.push(blk);
-            blockByIdx.set(inner.index, blk);
-            onEvent({ type: "step_blocks", blocks, usage });
-          } else if (inner.type === "content_block_delta") {
-            const blk = blockByIdx.get(inner.index);
-            const d = inner.delta || {};
-            if (blk && d.type === "text_delta" && d.text) {
-              blk.text += d.text;
-              onEvent({ type: "delta", kind: "text_delta", text: d.text });
-            } else if (blk && d.type === "thinking_delta" && d.thinking) {
-              blk.text += d.thinking;
-              onEvent({ type: "delta", kind: "thinking_delta", text: d.thinking });
+              toolById.set(b.id, nb);
+              blocks.push(nb);
             }
           }
-        } else if (ev.type === "assistant" && ev.message) {
-          if (ev.message.usage) usage = ev.message.usage;
-          for (const b of ev.message.content || []) {
-            if (b.type === "tool_use" && b.id) {
-              const ex = toolById.get(b.id);
-              if (ex) {
-                ex.input = b.input || ex.input;
-              } else {
-                const nb = {
-                  type: "tool_use",
-                  id: b.id,
-                  name: b.name || "Tool",
-                  input: b.input || {},
-                  status: "running",
-                  is_error: false,
-                  result: null,
-                };
-                toolById.set(b.id, nb);
-                blocks.push(nb);
-              }
-            }
-          }
-          onEvent({ type: "step_blocks", blocks, usage });
-        } else if (ev.type === "user" && Array.isArray(ev.message?.content)) {
-          for (const b of ev.message.content) {
-            if (b.type === "tool_result" && b.tool_use_id && toolById.has(b.tool_use_id)) {
-              const tu = toolById.get(b.tool_use_id);
-              tu.result = typeof b.content === "string" ? b.content : JSON.stringify(b.content);
-              tu.is_error = Boolean(b.is_error);
-              tu.status = tu.is_error ? "error" : "done";
-              onEvent({ type: "tool_result", tool_id: tu.id, result: tu.result, is_error: tu.is_error, blocks });
-            }
-          }
-        } else if (ev.type === "result" && ev.is_error) {
-          resultErrorText = String(ev.result || "Claude Code 返回错误");
         }
+        onEvent({ type: "step_blocks", blocks, usage });
+      } else if (ev.type === "user" && Array.isArray(ev.message?.content)) {
+        for (const b of ev.message.content) {
+          if (b.type === "tool_result" && b.tool_use_id && toolById.has(b.tool_use_id)) {
+            const tu = toolById.get(b.tool_use_id);
+            tu.result = typeof b.content === "string" ? b.content : JSON.stringify(b.content);
+            tu.is_error = Boolean(b.is_error);
+            tu.status = tu.is_error ? "error" : "done";
+            onEvent({ type: "tool_result", tool_id: tu.id, result: tu.result, is_error: tu.is_error, blocks });
+          }
+        }
+      } else if (ev.type === "result" && ev.is_error) {
+        resultErrorText = String(ev.result || "Claude Code 返回错误");
       }
+    };
+
+    proc.stdout?.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+      const lines = buf.split(/\r?\n/);
+      buf = lines.pop() || "";
+      for (const raw of lines) processStreamLine(raw);
     });
 
     proc.on("error", (err) => {
@@ -1433,6 +1733,10 @@ export async function runNativeClaudeCodeTurn({
     });
 
     proc.on("close", (code) => {
+      if (buf.trim()) {
+        processStreamLine(buf);
+        buf = "";
+      }
       cleanupTempPrompt();
       if (cliSessionId && injectedMemHash) {
         _lastSessionMemHash.set(cliSessionId, injectedMemHash);

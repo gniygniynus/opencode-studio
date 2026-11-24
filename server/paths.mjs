@@ -14,6 +14,9 @@ const __dirname = path.dirname(__filename);
 export const PROJECT_ROOT = path.resolve(__dirname, "..");
 export const PUBLIC_DIR = path.join(PROJECT_ROOT, "public");
 
+let _cachedDataRoot = "";
+let _cachedPaths = null;
+
 export function resolveDataRoot() {
   if (process.env.OPENCODE_DATA_DIR) {
     return path.resolve(process.env.OPENCODE_DATA_DIR);
@@ -32,7 +35,11 @@ export function resolveDataRoot() {
 
 export function getPaths() {
   const dataRoot = resolveDataRoot();
-  const paths = {
+  if (_cachedPaths && _cachedDataRoot === dataRoot && fs.existsSync(dataRoot)) {
+    return _cachedPaths;
+  }
+
+  const paths = Object.freeze({
     projectRoot: PROJECT_ROOT,
     publicDir: PUBLIC_DIR,
     dataRoot,
@@ -49,7 +56,7 @@ export function getPaths() {
     claudeConfigDir: path.join(dataRoot, "claude-config"),
     claudeRuntimeDir: path.join(dataRoot, "claude-runtime"),
     defaultCwd: os.homedir(),
-  };
+  });
 
   for (const dir of [
     paths.dataRoot,
@@ -64,5 +71,8 @@ export function getPaths() {
   ]) {
     fs.mkdirSync(dir, { recursive: true });
   }
+
+  _cachedDataRoot = dataRoot;
+  _cachedPaths = paths;
   return paths;
 }

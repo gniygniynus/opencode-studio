@@ -1,11 +1,14 @@
 /**
  * Unified SQLite (WAL) storage layer using Node's built-in node:sqlite (zero native compilation!).
  *
- * Guarantees:
- *  - Safe multi-window concurrency via WAL mode + busy_timeout + versioned memory writes.
- *  - Tree-structured messages supporting Edit & Resend with non-destructive branch switching.
+ * Guarantees & Optimizations:
+ *  - Safe multi-window concurrency via WAL mode + busy_timeout + atomic transactions + versioned memory writes.
+ *  - Tuned 32MB page cache, 256MB mmap I/O, prepared-statement cache, and automatic WAL bloat checkpointing.
+ *  - Covering indexes + FTS5 (trigram) full-text search with instant CJK/ASCII substring fallback (<3 chars).
+ *  - Tree-structured messages supporting Edit & Resend with single-query recursive CTE branch switching
+ *    and metadata-first timeline loading (inactive branches never deserialize heavy JSON payloads).
+ *  - Write-through in-memory kv_settings cache (0 SQL queries on hot bootstrap/turn paths).
  *  - Local AES-256-GCM encryption for stored API keys (never exported or sent to frontend).
- *  - Single source of truth shared by both OpenCode Native API Engine & Claude Official Login Adapter.
  */
 
 import crypto from "node:crypto";
@@ -16,6 +19,10 @@ import { logEvent, nowIso } from "./logger.mjs";
 
 let _db = null;
 let _secretKey = null;
+let _ftsEnabled = false;
+let _txDepth = 0;
+let _settingsCache = null; // Map<string, string> write-through cache
+const _stmtCache = new WeakMap();
 
 export const DEFAULT_SYSTEM_PROMPT = `你是 OpenCode Studio 内置的开源透明 AI 编程与效率助手。
 核心工作原则：
@@ -51,6 +58,38 @@ export const DEFAULT_WALLPAPER_ENGINE = {
   dirs: [],                 // 已授权的绝对目录列表（零拷贝只读流式播放）
   video_muted: true,        // 视频壁纸默认静音循环，可随时手动开关声音
 };
+
+function stmt(db, sql) {
+  let map = _stmtCache.get(db);
+  if (!map) {
+    map = new Map();
+    _stmtCache.set(db, map);
+  }
+  let s = map.get(sql);
+  if (!s) {
+    s = db.prepare(sql);
+    map.set(sql, s);
+  }
+  return s;
+}
+
+function withTransaction(db, fn) {
+  if (_txDepth > 0) return fn();
+  _txDepth += 1;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const res = fn();
+    db.exec("COMMIT");
+    return res;
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {}
+    throw err;
+  } finally {
+    _txDepth -= 1;
+  }
+}
 
 function getLocalKey() {
   if (_secretKey) return _secretKey;
@@ -97,6 +136,76 @@ export function maskSecret(plain) {
   return `${plain.slice(0, 4)}••••${plain.slice(-4)}`;
 }
 
+function runSchemaMigrations(db, dbFilePath) {
+  // 1. Non-destructive column additions on existing databases
+  const sessCols = new Set(db.prepare("PRAGMA table_info(sessions)").all().map((c) => c.name));
+  if (!sessCols.has("pinned")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0");
+  }
+
+  // 2. High-selectivity covering indexes (eliminates table-page scans on large message blobs)
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_sessions_pinned_updated ON sessions(archived, pinned DESC, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_messages_active_role ON messages(session_id, is_active, role, created_at);
+    CREATE INDEX IF NOT EXISTS idx_memories_lookup ON memories(pinned DESC, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_memories_scope_cwd ON memories(scope, cwd);
+  `);
+
+  // 3. FTS5 (trigram) full-text index with content_text-scoped triggers
+  _ftsEnabled = false;
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        content_text,
+        session_id UNINDEXED,
+        message_id UNINDEXED,
+        tokenize = 'trigram'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS trg_messages_fts_ai AFTER INSERT ON messages
+      WHEN length(new.content_text) > 0
+      BEGIN
+        INSERT INTO messages_fts(content_text, session_id, message_id)
+        VALUES (new.content_text, new.session_id, new.id);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_messages_fts_ad AFTER DELETE ON messages BEGIN
+        DELETE FROM messages_fts WHERE message_id = old.id;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_messages_fts_au AFTER UPDATE OF content_text ON messages BEGIN
+        DELETE FROM messages_fts WHERE message_id = old.id;
+        INSERT INTO messages_fts(content_text, session_id, message_id)
+        SELECT new.content_text, new.session_id, new.id WHERE length(new.content_text) > 0;
+      END;
+    `);
+    const backfilled = db.prepare("SELECT value FROM kv_settings WHERE key='fts_backfilled_v1'").get();
+    if (!backfilled) {
+      withTransaction(db, () => {
+        db.exec("DELETE FROM messages_fts");
+        db.exec(`
+          INSERT INTO messages_fts(content_text, session_id, message_id)
+          SELECT content_text, session_id, id FROM messages WHERE length(content_text) > 0
+        `);
+        db.prepare("INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('fts_backfilled_v1', '1', ?)").run(nowIso());
+      });
+    }
+    _ftsEnabled = true;
+  } catch (err) {
+    _ftsEnabled = false;
+    logEvent("WARN", "db", "fts_unavailable", `FTS5 全文索引未启用，已自动回退标准索引: ${err.message}`);
+  }
+
+  // 4. Reclaim bloated WAL files (>8 MB) on startup + update query planner statistics
+  try {
+    const walPath = `${dbFilePath}-wal`;
+    if (fs.existsSync(walPath) && fs.statSync(walPath).size > 8 * 1024 * 1024) {
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+    db.exec("PRAGMA optimize");
+  } catch {}
+}
+
 export function getDb() {
   if (_db) return _db;
   const p = getPaths();
@@ -106,6 +215,10 @@ export function getDb() {
     PRAGMA synchronous = NORMAL;
     PRAGMA busy_timeout = 5000;
     PRAGMA foreign_keys = ON;
+    PRAGMA cache_size = -32000;
+    PRAGMA temp_store = MEMORY;
+    PRAGMA mmap_size = 268435456;
+    PRAGMA wal_autocheckpoint = 1000;
 
     CREATE TABLE IF NOT EXISTS kv_settings (
       key TEXT PRIMARY KEY,
@@ -137,6 +250,7 @@ export function getDb() {
       thinking_level TEXT NOT NULL DEFAULT 'auto',
       claude_cli_sid TEXT NOT NULL DEFAULT '',
       compact_count INTEGER NOT NULL DEFAULT 0,
+      pinned INTEGER NOT NULL DEFAULT 0,
       archived INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -207,6 +321,8 @@ export function getDb() {
   `);
 
   _db = db;
+  _settingsCache = null;
+  runSchemaMigrations(db, p.dbFile);
   seedInitialData(db);
   return _db;
 }
@@ -214,52 +330,58 @@ export function getDb() {
 export function closeDb() {
   if (_db) {
     try {
+      _db.exec("PRAGMA optimize");
+    } catch {}
+    try {
       _db.close();
     } catch {}
     _db = null;
+    _settingsCache = null;
+    _txDepth = 0;
   }
 }
 
 function seedInitialData(db) {
-  const now = nowIso();
-  const ensureKv = (key, val) => {
-    const existing = db.prepare("SELECT key FROM kv_settings WHERE key=?").get(key);
-    if (!existing) {
-      db.prepare("INSERT INTO kv_settings (key, value, updated_at) VALUES (?, ?, ?)").run(
-        key,
-        typeof val === "string" ? val : JSON.stringify(val),
+  withTransaction(db, () => {
+    const now = nowIso();
+    const sel = stmt(db, "SELECT key FROM kv_settings WHERE key=?");
+    const ins = stmt(db, "INSERT INTO kv_settings (key, value, updated_at) VALUES (?, ?, ?)");
+    const ensureKv = (key, val) => {
+      if (!sel.get(key)) {
+        ins.run(key, typeof val === "string" ? val : JSON.stringify(val), now);
+      }
+    };
+
+    ensureKv("system_prompt", DEFAULT_SYSTEM_PROMPT);
+    ensureKv("prompt_mode", "replace"); // replace | append | native
+    ensureKv("permission_mode", "auto"); // auto | confirm_dangerous
+    ensureKv("claude_isolation", "isolated"); // isolated (零冲突独立目录) | shared (共享系统 ~/.claude)
+    ensureKv("update_channel", "stable"); // stable | latest
+    ensureKv("appearance", DEFAULT_APPEARANCE);
+    ensureKv("search_engine", DEFAULT_SEARCH_ENGINE);
+    ensureKv("wallpaper_engine", DEFAULT_WALLPAPER_ENGINE);
+    ensureKv("default_cwd", getPaths().defaultCwd);
+
+    // Ensure the optional "Claude 原生登录" provider entry exists out of the box (inactive until chosen)
+    const nativeExists = stmt(db, "SELECT id FROM providers WHERE kind='claude_native'").get();
+    if (!nativeExists) {
+      stmt(
+        db,
+        `INSERT INTO providers (id, name, kind, base_url, api_key_enc, default_model, models_json, is_active, created_at, updated_at)
+         VALUES (?, ?, 'claude_native', '', '', 'sonnet', ?, 0, ?, ?)`,
+      ).run(
+        "claude-native-oauth",
+        "Claude 原生订阅登录 (本地 CLI)",
+        JSON.stringify(["sonnet", "opus", "haiku"]),
+        now,
         now,
       );
     }
-  };
-
-  ensureKv("system_prompt", DEFAULT_SYSTEM_PROMPT);
-  ensureKv("prompt_mode", "replace"); // replace | append | native
-  ensureKv("permission_mode", "auto"); // auto | confirm_dangerous
-  ensureKv("claude_isolation", "isolated"); // isolated (零冲突独立目录) | shared (共享系统 ~/.claude)
-  ensureKv("update_channel", "stable"); // stable | latest
-  ensureKv("appearance", DEFAULT_APPEARANCE);
-  ensureKv("search_engine", DEFAULT_SEARCH_ENGINE);
-  ensureKv("wallpaper_engine", DEFAULT_WALLPAPER_ENGINE);
-  ensureKv("default_cwd", getPaths().defaultCwd);
-
-  // Ensure the optional "Claude 原生登录" provider entry exists out of the box (inactive until chosen)
-  const nativeExists = db.prepare("SELECT id FROM providers WHERE kind='claude_native'").get();
-  if (!nativeExists) {
-    db.prepare(
-      `INSERT INTO providers (id, name, kind, base_url, api_key_enc, default_model, models_json, is_active, created_at, updated_at)
-       VALUES (?, ?, 'claude_native', '', '', 'sonnet', ?, 0, ?, ?)`,
-    ).run(
-      "claude-native-oauth",
-      "Claude 原生订阅登录 (本地 CLI)",
-      JSON.stringify(["sonnet", "opus", "haiku"]),
-      now,
-      now,
-    );
-  }
+  });
+  _settingsCache = null;
 }
 
-// ==================== KV SETTINGS ====================
+// ==================== KV SETTINGS (WRITE-THROUGH MEMORY CACHE) ====================
 
 const RAW_STRING_SETTING_KEYS = new Set([
   "system_prompt",
@@ -270,27 +392,41 @@ const RAW_STRING_SETTING_KEYS = new Set([
   "default_cwd",
 ]);
 
-export function getSetting(key, fallback = null) {
+function ensureSettingsCache() {
   const db = getDb();
-  const row = db.prepare("SELECT value FROM kv_settings WHERE key=?").get(key);
-  if (!row) return fallback;
+  if (_settingsCache) return _settingsCache;
+  _settingsCache = new Map();
+  const rows = stmt(db, "SELECT key, value FROM kv_settings").all();
+  for (const r of rows) {
+    _settingsCache.set(r.key, r.value);
+  }
+  return _settingsCache;
+}
+
+export function getSetting(key, fallback = null) {
+  const cache = ensureSettingsCache();
+  if (!cache.has(key)) return fallback;
+  const rawVal = cache.get(key);
   if (RAW_STRING_SETTING_KEYS.has(key)) {
-    return typeof row.value === "string" ? row.value : String(row.value ?? "");
+    return typeof rawVal === "string" ? rawVal : String(rawVal ?? "");
   }
   try {
-    return JSON.parse(row.value);
+    return JSON.parse(rawVal);
   } catch {
-    return row.value;
+    return rawVal;
   }
 }
 
 export function setSetting(key, value) {
   const db = getDb();
+  const cache = ensureSettingsCache();
   const serialized = typeof value === "string" ? value : JSON.stringify(value);
-  db.prepare(
+  stmt(
+    db,
     `INSERT INTO kv_settings (key, value, updated_at) VALUES (?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
   ).run(key, serialized, nowIso());
+  cache.set(key, serialized);
   return value;
 }
 
@@ -305,6 +441,85 @@ export function getAllSettings() {
     search_engine: { ...DEFAULT_SEARCH_ENGINE, ...(getSetting("search_engine", DEFAULT_SEARCH_ENGINE) || {}) },
     wallpaper_engine: { ...DEFAULT_WALLPAPER_ENGINE, ...(getSetting("wallpaper_engine", DEFAULT_WALLPAPER_ENGINE) || {}) },
     default_cwd: getSetting("default_cwd", getPaths().defaultCwd),
+  };
+}
+
+// ==================== DATABASE DIAGNOSTICS & MAINTENANCE ====================
+
+export function getDatabaseStats() {
+  const db = getDb();
+  const p = getPaths();
+  const fileBytes = (fp) => {
+    try {
+      return fs.existsSync(fp) ? fs.statSync(fp).size : 0;
+    } catch {
+      return 0;
+    }
+  };
+  const dbBytes = fileBytes(p.dbFile);
+  const walBytes = fileBytes(`${p.dbFile}-wal`);
+  const toMb = (b) => Math.round((b / (1024 * 1024)) * 100) / 100;
+
+  const activeSessions = stmt(db, "SELECT COUNT(*) AS c FROM sessions WHERE archived=0").get().c;
+  const archivedSessions = stmt(db, "SELECT COUNT(*) AS c FROM sessions WHERE archived=1").get().c;
+  const totalMessages = stmt(db, "SELECT COUNT(*) AS c FROM messages").get().c;
+  const totalMemories = stmt(db, "SELECT COUNT(*) AS c FROM memories").get().c;
+
+  return {
+    db_file: p.dbFile,
+    db_mb: toMb(dbBytes),
+    wal_mb: toMb(walBytes),
+    total_mb: toMb(dbBytes + walBytes),
+    sessions_active: activeSessions,
+    sessions_archived: archivedSessions,
+    messages_total: totalMessages,
+    memories_total: totalMemories,
+    fts_enabled: _ftsEnabled,
+  };
+}
+
+export function optimizeDatabase({ purgeArchived = false } = {}) {
+  const db = getDb();
+  const before = getDatabaseStats();
+  let purgedSessions = 0;
+
+  if (purgeArchived) {
+    const res = withTransaction(db, () => {
+      return stmt(db, "DELETE FROM sessions WHERE archived=1").run();
+    });
+    purgedSessions = Number(res?.changes || 0);
+  }
+
+  if (_ftsEnabled) {
+    try {
+      db.exec("INSERT INTO messages_fts(messages_fts) VALUES('optimize')");
+    } catch {}
+  }
+  try {
+    db.exec("PRAGMA optimize");
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    if (purgedSessions > 0) {
+      db.exec("VACUUM");
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+  } catch (err) {
+    logEvent("WARN", "db", "optimize_partial", `数据库维护部分完成: ${err.message}`);
+  }
+
+  const after = getDatabaseStats();
+  const savedMb = Math.max(0, Math.round((before.total_mb - after.total_mb) * 100) / 100);
+  logEvent(
+    "INFO",
+    "db",
+    "optimized",
+    `SQLite 维护完成: ${before.total_mb}MB -> ${after.total_mb}MB (释放 ${savedMb}MB, 清理归档=${purgedSessions})`,
+  );
+  return {
+    ok: true,
+    purged_sessions: purgedSessions,
+    freed_mb: savedMb,
+    before,
+    after,
   };
 }
 
@@ -334,21 +549,21 @@ function rowToProvider(row, includeSecret = false) {
 
 export function listProviders(includeSecret = false) {
   const db = getDb();
-  const rows = db.prepare("SELECT * FROM providers ORDER BY is_active DESC, created_at ASC").all();
+  const rows = stmt(db, "SELECT * FROM providers ORDER BY is_active DESC, created_at ASC").all();
   return rows.map((r) => rowToProvider(r, includeSecret));
 }
 
 export function getProvider(id, includeSecret = false) {
   const db = getDb();
-  const row = db.prepare("SELECT * FROM providers WHERE id=?").get(id);
+  const row = stmt(db, "SELECT * FROM providers WHERE id=?").get(id);
   return rowToProvider(row, includeSecret);
 }
 
 export function getActiveProvider(includeSecret = false) {
   const db = getDb();
-  let row = db.prepare("SELECT * FROM providers WHERE is_active=1 LIMIT 1").get();
+  let row = stmt(db, "SELECT * FROM providers WHERE is_active=1 LIMIT 1").get();
   if (!row) {
-    row = db.prepare("SELECT * FROM providers ORDER BY created_at ASC LIMIT 1").get();
+    row = stmt(db, "SELECT * FROM providers ORDER BY created_at ASC LIMIT 1").get();
   }
   return rowToProvider(row, includeSecret);
 }
@@ -357,88 +572,106 @@ export function saveProvider(input) {
   const db = getDb();
   const now = nowIso();
   const id = input.id || `prov_${crypto.randomBytes(6).toString("hex")}`;
-  const existing = db.prepare("SELECT * FROM providers WHERE id=?").get(id);
 
-  const name = String(input.name || "未命名供应商").trim();
-  const kind = ["anthropic", "openai", "claude_native"].includes(input.kind) ? input.kind : "openai";
-  const baseUrl = String(input.base_url || "").trim().replace(/\/+$/, "");
-  const apiKeyEnc =
-    input.api_key !== undefined && input.api_key !== ""
-      ? encryptSecret(String(input.api_key).trim())
+  let logName = "";
+  let logKind = "";
+  let logCount = 0;
+
+  withTransaction(db, () => {
+    const existing = stmt(db, "SELECT * FROM providers WHERE id=?").get(id);
+
+    const name = String(input.name || "未命名供应商").trim();
+    const kind = ["anthropic", "openai", "claude_native"].includes(input.kind) ? input.kind : "openai";
+    const baseUrl = String(input.base_url || "").trim().replace(/\/+$/, "");
+    const apiKeyEnc =
+      input.api_key !== undefined && input.api_key !== ""
+        ? encryptSecret(String(input.api_key).trim())
+        : existing
+          ? existing.api_key_enc
+          : "";
+    const models = Array.isArray(input.models)
+      ? [...new Set(input.models.map((m) => String(m).trim()).filter(Boolean))]
       : existing
-        ? existing.api_key_enc
-        : "";
-  const models = Array.isArray(input.models)
-    ? [...new Set(input.models.map((m) => String(m).trim()).filter(Boolean))]
-    : existing
-      ? safeJsonParse(existing.models_json, [])
-      : [];
-  const defaultModel = String(input.default_model || models[0] || existing?.default_model || "").trim();
-  const overrides = input.model_overrides ?? (existing ? safeJsonParse(existing.model_overrides_json, {}) : {});
-  const extra = input.extra ?? (existing ? safeJsonParse(existing.extra_json, {}) : {});
+        ? safeJsonParse(existing.models_json, [])
+        : [];
+    const defaultModel = String(input.default_model || models[0] || existing?.default_model || "").trim();
+    const overrides = input.model_overrides ?? (existing ? safeJsonParse(existing.model_overrides_json, {}) : {});
+    const extra = input.extra ?? (existing ? safeJsonParse(existing.extra_json, {}) : {});
 
-  const shouldActivate =
-    input.is_active === true ||
-    (!existing && db.prepare("SELECT COUNT(*) AS c FROM providers WHERE is_active=1").get().c === 0);
+    const shouldActivate =
+      input.is_active === true ||
+      (!existing && stmt(db, "SELECT COUNT(*) AS c FROM providers WHERE is_active=1").get().c === 0);
 
-  if (shouldActivate) {
-    db.prepare("UPDATE providers SET is_active=0").run();
-  }
+    if (shouldActivate) {
+      stmt(db, "UPDATE providers SET is_active=0").run();
+    }
 
-  if (existing) {
-    db.prepare(
-      `UPDATE providers SET name=?, kind=?, base_url=?, api_key_enc=?, default_model=?,
-       models_json=?, model_overrides_json=?, extra_json=?, is_active=?, updated_at=? WHERE id=?`,
-    ).run(
-      name,
-      kind,
-      baseUrl,
-      apiKeyEnc,
-      defaultModel,
-      JSON.stringify(models),
-      JSON.stringify(overrides),
-      JSON.stringify(extra),
-      shouldActivate ? 1 : existing.is_active,
-      now,
-      id,
-    );
-  } else {
-    db.prepare(
-      `INSERT INTO providers (id, name, kind, base_url, api_key_enc, default_model, models_json, model_overrides_json, extra_json, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      id,
-      name,
-      kind,
-      baseUrl,
-      apiKeyEnc,
-      defaultModel,
-      JSON.stringify(models),
-      JSON.stringify(overrides),
-      JSON.stringify(extra),
-      shouldActivate ? 1 : 0,
-      now,
-      now,
-    );
-  }
-  logEvent("INFO", "providers", "saved", `保存供应商 ${name} (${kind}), 模型数=${models.length}`);
+    if (existing) {
+      stmt(
+        db,
+        `UPDATE providers SET name=?, kind=?, base_url=?, api_key_enc=?, default_model=?,
+         models_json=?, model_overrides_json=?, extra_json=?, is_active=?, updated_at=? WHERE id=?`,
+      ).run(
+        name,
+        kind,
+        baseUrl,
+        apiKeyEnc,
+        defaultModel,
+        JSON.stringify(models),
+        JSON.stringify(overrides),
+        JSON.stringify(extra),
+        shouldActivate ? 1 : existing.is_active,
+        now,
+        id,
+      );
+    } else {
+      stmt(
+        db,
+        `INSERT INTO providers (id, name, kind, base_url, api_key_enc, default_model, models_json, model_overrides_json, extra_json, is_active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id,
+        name,
+        kind,
+        baseUrl,
+        apiKeyEnc,
+        defaultModel,
+        JSON.stringify(models),
+        JSON.stringify(overrides),
+        JSON.stringify(extra),
+        shouldActivate ? 1 : 0,
+        now,
+        now,
+      );
+    }
+
+    logName = name;
+    logKind = kind;
+    logCount = models.length;
+  });
+
+  logEvent("INFO", "providers", "saved", `保存供应商 ${logName} (${logKind}), 模型数=${logCount}`);
   return getProvider(id, false);
 }
 
 export function activateProvider(id, model = "") {
   const db = getDb();
-  const existing = db.prepare("SELECT * FROM providers WHERE id=?").get(id);
+  const existing = stmt(db, "SELECT * FROM providers WHERE id=?").get(id);
   if (!existing) throw new Error("供应商不存在");
-  db.prepare("UPDATE providers SET is_active=0").run();
-  if (model && model.trim()) {
-    db.prepare("UPDATE providers SET is_active=1, default_model=?, updated_at=? WHERE id=?").run(
-      model.trim(),
-      nowIso(),
-      id,
-    );
-  } else {
-    db.prepare("UPDATE providers SET is_active=1, updated_at=? WHERE id=?").run(nowIso(), id);
-  }
+
+  withTransaction(db, () => {
+    stmt(db, "UPDATE providers SET is_active=0").run();
+    if (model && model.trim()) {
+      stmt(db, "UPDATE providers SET is_active=1, default_model=?, updated_at=? WHERE id=?").run(
+        model.trim(),
+        nowIso(),
+        id,
+      );
+    } else {
+      stmt(db, "UPDATE providers SET is_active=1, updated_at=? WHERE id=?").run(nowIso(), id);
+    }
+  });
+
   logEvent("INFO", "providers", "activated", `切换当前供应商 -> ${existing.name}${model ? " / " + model : ""}`);
   return getProvider(id, false);
 }
@@ -448,28 +681,42 @@ export function deleteProvider(id) {
   if (id === "claude-native-oauth") {
     throw new Error("内置「Claude 原生订阅登录」模板不可删除");
   }
-  const row = db.prepare("SELECT * FROM providers WHERE id=?").get(id);
+  const row = stmt(db, "SELECT * FROM providers WHERE id=?").get(id);
   if (!row) return false;
-  db.prepare("DELETE FROM providers WHERE id=?").run(id);
-  if (row.is_active) {
-    const first = db.prepare("SELECT id FROM providers ORDER BY created_at ASC LIMIT 1").get();
-    if (first) db.prepare("UPDATE providers SET is_active=1 WHERE id=?").run(first.id);
-  }
+
+  withTransaction(db, () => {
+    stmt(db, "DELETE FROM providers WHERE id=?").run(id);
+    if (row.is_active) {
+      const first = stmt(db, "SELECT id FROM providers ORDER BY created_at ASC LIMIT 1").get();
+      if (first) stmt(db, "UPDATE providers SET is_active=1 WHERE id=?").run(first.id);
+    }
+  });
+
   logEvent("INFO", "providers", "deleted", `删除供应商 ${row.name}`);
   return true;
 }
 
 // ==================== SESSIONS & BRANCHING MESSAGE TREE ====================
 
-export function createSession({ title = "新会话", cwd = "", providerId = "", model = "", thinkingLevel = "auto" } = {}) {
+function rowToSession(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    pinned: Boolean(row.pinned),
+    archived: Boolean(row.archived),
+  };
+}
+
+export function createSession({ title = "新会话", cwd = "", providerId = "", model = "", thinkingLevel = "auto", pinned = false } = {}) {
   const db = getDb();
   const now = nowIso();
   const id = crypto.randomUUID();
   const activeProv = providerId ? getProvider(providerId) : getActiveProvider();
   const finalCwd = cwd || getSetting("default_cwd", getPaths().defaultCwd);
-  db.prepare(
-    `INSERT INTO sessions (id, title, cwd, provider_id, model, thinking_level, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  stmt(
+    db,
+    `INSERT INTO sessions (id, title, cwd, provider_id, model, thinking_level, pinned, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     title,
@@ -477,6 +724,7 @@ export function createSession({ title = "新会话", cwd = "", providerId = "", 
     activeProv?.id || "",
     model || activeProv?.default_model || "",
     thinkingLevel || "auto",
+    pinned ? 1 : 0,
     now,
     now,
   );
@@ -485,31 +733,45 @@ export function createSession({ title = "新会话", cwd = "", providerId = "", 
 
 export function getSessionMeta(id) {
   const db = getDb();
-  return db.prepare("SELECT * FROM sessions WHERE id=?").get(id) || null;
+  return rowToSession(stmt(db, "SELECT * FROM sessions WHERE id=?").get(id));
 }
 
 export function updateSessionMeta(id, patch) {
   const db = getDb();
-  const allowed = ["title", "cwd", "provider_id", "model", "thinking_level", "claude_cli_sid", "compact_count", "archived"];
+  const allowed = ["title", "cwd", "provider_id", "model", "thinking_level", "claude_cli_sid", "compact_count", "pinned", "archived"];
   const sets = [];
   const vals = [];
   for (const k of allowed) {
     if (patch[k] !== undefined) {
       sets.push(`${k}=?`);
-      vals.push(patch[k]);
+      if (k === "pinned" || k === "archived") vals.push(patch[k] ? 1 : 0);
+      else vals.push(patch[k]);
     }
   }
   if (!sets.length) return getSessionMeta(id);
-  sets.push("updated_at=?");
-  vals.push(nowIso(), id);
+  // Toggling pin alone shouldn't scramble chronological updated_at order unless requested
+  const onlyPinChange = Object.keys(patch).every((k) => k === "pinned");
+  if (!onlyPinChange) {
+    sets.push("updated_at=?");
+    vals.push(nowIso());
+  }
+  vals.push(id);
   db.prepare(`UPDATE sessions SET ${sets.join(", ")} WHERE id=?`).run(...vals);
   return getSessionMeta(id);
 }
 
 export function deleteSession(id) {
   const db = getDb();
-  db.prepare("UPDATE sessions SET archived=1, updated_at=? WHERE id=?").run(nowIso(), id);
+  stmt(db, "UPDATE sessions SET archived=1, updated_at=? WHERE id=?").run(nowIso(), id);
   return true;
+}
+
+function makeSnippet(text, qlc, rawLen) {
+  const idx = text.toLowerCase().indexOf(qlc);
+  if (idx < 0) return "";
+  const start = Math.max(0, idx - 32);
+  const end = Math.min(text.length, idx + rawLen + 52);
+  return (start > 0 ? "…" : "") + text.slice(start, end).replace(/\s+/g, " ") + (end < text.length ? "…" : "");
 }
 
 export function listSessions({ query = "", cwd = "", limit = 200 } = {}) {
@@ -517,28 +779,108 @@ export function listSessions({ query = "", cwd = "", limit = 200 } = {}) {
   const q = String(query || "").trim();
   const cwdFilter = String(cwd || "").trim();
 
-  const cwds = db
-    .prepare("SELECT cwd, COUNT(*) AS count FROM sessions WHERE archived=0 GROUP BY cwd ORDER BY count DESC")
-    .all();
+  const cwds = stmt(
+    db,
+    "SELECT cwd, COUNT(*) AS count FROM sessions WHERE archived=0 GROUP BY cwd ORDER BY count DESC",
+  ).all();
 
   if (!q) {
-    let sql = `
-      SELECT s.*,
-        (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id AND m.is_active=1 AND m.role='user') AS user_turns
-      FROM sessions s
-      WHERE s.archived=0
-    `;
-    const params = [];
-    if (cwdFilter) {
-      sql += " AND s.cwd=?";
-      params.push(cwdFilter);
-    }
-    sql += " ORDER BY s.updated_at DESC LIMIT ?";
-    params.push(limit);
-    return { sessions: db.prepare(sql).all(...params), cwds };
+    const rows = cwdFilter
+      ? stmt(
+          db,
+          `SELECT s.*,
+             (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id AND m.is_active=1 AND m.role='user') AS user_turns
+           FROM sessions s
+           WHERE s.archived=0 AND s.cwd=?
+           ORDER BY s.pinned DESC, s.updated_at DESC LIMIT ?`,
+        ).all(cwdFilter, limit)
+      : stmt(
+          db,
+          `SELECT s.*,
+             (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id AND m.is_active=1 AND m.role='user') AS user_turns
+           FROM sessions s
+           WHERE s.archived=0
+           ORDER BY s.pinned DESC, s.updated_at DESC LIMIT ?`,
+        ).all(limit);
+    return { sessions: rows.map(rowToSession), cwds };
   }
 
   const qlc = q.toLowerCase();
+  const codepointLen = [...q].length;
+
+  // Fast FTS5 trigram path for queries with >= 3 Unicode codepoints
+  if (_ftsEnabled && codepointLen >= 3) {
+    const ftsPhrase = `"${q.replace(/"/g, '""')}"`;
+    try {
+      const ftsHits = stmt(
+        db,
+        `SELECT m.session_id, m.id AS message_id, m.content_text, m.created_at
+         FROM messages_fts f
+         JOIN messages m ON m.id = f.message_id
+         WHERE messages_fts MATCH ? AND m.is_active = 1
+         ORDER BY m.created_at DESC
+         LIMIT 600`,
+      ).all(ftsPhrase);
+
+      const hitBySess = new Map();
+      for (const h of ftsHits) {
+        if (!hitBySess.has(h.session_id)) hitBySess.set(h.session_id, h);
+      }
+
+      const titleSql = cwdFilter
+        ? `SELECT s.*,
+             (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id AND m.is_active=1 AND m.role='user') AS user_turns
+           FROM sessions s
+           WHERE s.archived=0 AND s.cwd=? AND instr(lower(s.title), ?) > 0
+           ORDER BY s.pinned DESC, s.updated_at DESC LIMIT ?`
+        : `SELECT s.*,
+             (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id AND m.is_active=1 AND m.role='user') AS user_turns
+           FROM sessions s
+           WHERE s.archived=0 AND instr(lower(s.title), ?) > 0
+           ORDER BY s.pinned DESC, s.updated_at DESC LIMIT ?`;
+      const titleRows = cwdFilter
+        ? db.prepare(titleSql).all(cwdFilter, qlc, limit)
+        : db.prepare(titleSql).all(qlc, limit);
+
+      const mergedById = new Map();
+      for (const r of titleRows) mergedById.set(r.id, rowToSession(r));
+
+      const missingSids = [...hitBySess.keys()].filter((sid) => !mergedById.has(sid)).slice(0, limit);
+      if (missingSids.length) {
+        const placeholders = missingSids.map(() => "?").join(",");
+        const sessSql = cwdFilter
+          ? `SELECT s.*,
+               (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id AND m.is_active=1 AND m.role='user') AS user_turns
+             FROM sessions s
+             WHERE s.archived=0 AND s.cwd=? AND s.id IN (${placeholders})`
+          : `SELECT s.*,
+               (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id AND m.is_active=1 AND m.role='user') AS user_turns
+             FROM sessions s
+             WHERE s.archived=0 AND s.id IN (${placeholders})`;
+        const extraRows = cwdFilter
+          ? db.prepare(sessSql).all(cwdFilter, ...missingSids)
+          : db.prepare(sessSql).all(...missingSids);
+        for (const r of extraRows) mergedById.set(r.id, rowToSession(r));
+      }
+
+      const finalRows = [...mergedById.values()]
+        .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updated_at.localeCompare(a.updated_at))
+        .slice(0, limit);
+
+      for (const s of finalRows) {
+        const h = hitBySess.get(s.id);
+        if (h) {
+          s.match_snippet = makeSnippet(h.content_text, qlc, q.length);
+          s.match_message_id = h.message_id;
+        }
+      }
+      return { sessions: finalRows, cwds };
+    } catch {
+      // Fall through to exact substring query if FTS syntax encounters edge cases
+    }
+  }
+
+  // Exact substring fallback (used for 1-2 char short CJK/ASCII queries or when FTS5 is absent)
   let sql = `
     SELECT s.*,
       (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id AND m.is_active=1 AND m.role='user') AS user_turns
@@ -557,33 +899,52 @@ export function listSessions({ query = "", cwd = "", limit = 200 } = {}) {
     sql += " AND s.cwd=?";
     params.push(cwdFilter);
   }
-  sql += " ORDER BY s.updated_at DESC LIMIT ?";
+  sql += " ORDER BY s.pinned DESC, s.updated_at DESC LIMIT ?";
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params);
-  for (const s of rows) {
-    const hit = db
+  const rows = db.prepare(sql).all(...params).map(rowToSession);
+  if (rows.length) {
+    const placeholders = rows.map(() => "?").join(",");
+    const hits = db
       .prepare(
-        `SELECT id, role, content_text FROM messages
-         WHERE session_id=? AND is_active=1 AND instr(lower(content_text), ?) > 0
-         ORDER BY created_at DESC LIMIT 1`,
+        `SELECT id, session_id, content_text, created_at FROM messages
+         WHERE session_id IN (${placeholders}) AND is_active=1 AND instr(lower(content_text), ?) > 0
+         ORDER BY created_at DESC`,
       )
-      .get(s.id, qlc);
-    if (hit) {
-      const idx = hit.content_text.toLowerCase().indexOf(qlc);
-      const start = Math.max(0, idx - 32);
-      const end = Math.min(hit.content_text.length, idx + q.length + 52);
-      s.match_snippet =
-        (start > 0 ? "…" : "") + hit.content_text.slice(start, end).replace(/\s+/g, " ") + (end < hit.content_text.length ? "…" : "");
-      s.match_message_id = hit.id;
+      .all(...rows.map((r) => r.id), qlc);
+    const firstHitBySess = new Map();
+    for (const h of hits) {
+      if (!firstHitBySess.has(h.session_id)) firstHitBySess.set(h.session_id, h);
+    }
+    for (const s of rows) {
+      const hit = firstHitBySess.get(s.id);
+      if (hit) {
+        s.match_snippet = makeSnippet(hit.content_text, qlc, q.length);
+        s.match_message_id = hit.id;
+      }
     }
   }
   return { sessions: rows, cwds };
 }
 
+function setSubtreeActive(db, sessionId, rootId, activeVal) {
+  stmt(
+    db,
+    `WITH RECURSIVE subtree(id) AS (
+       VALUES(?)
+       UNION ALL
+       SELECT m.id FROM messages m
+       JOIN subtree st ON m.parent_id = st.id
+       WHERE m.session_id = ?
+     )
+     UPDATE messages SET is_active = ?
+     WHERE session_id = ? AND id IN (SELECT id FROM subtree)`,
+  ).run(rootId, sessionId, activeVal, sessionId);
+}
+
 /**
  * Append a message under parentId. If sibling branches exist at this parentId,
- * automatically deactivate sibling subtrees so the newly added branch is active.
+ * automatically deactivate sibling subtrees atomically so the newly added branch is active.
  */
 export function addMessage({
   sessionId,
@@ -601,40 +962,43 @@ export function addMessage({
   const id = `msg_${crypto.randomBytes(8).toString("hex")}`;
   const now = nowIso();
 
-  // Deactivate any active siblings sharing the same parent_id
-  const siblings = parentId
-    ? db.prepare("SELECT id FROM messages WHERE session_id=? AND parent_id=? AND is_active=1").all(sessionId, parentId)
-    : db.prepare("SELECT id FROM messages WHERE session_id=? AND parent_id IS NULL AND is_active=1").all(sessionId);
+  withTransaction(db, () => {
+    const siblings = parentId
+      ? stmt(db, "SELECT id FROM messages WHERE session_id=? AND parent_id=? AND is_active=1").all(sessionId, parentId)
+      : stmt(db, "SELECT id FROM messages WHERE session_id=? AND parent_id IS NULL AND is_active=1").all(sessionId);
 
-  for (const sib of siblings) {
-    setSubtreeActive(db, sessionId, sib.id, 0);
-  }
+    for (const sib of siblings) {
+      setSubtreeActive(db, sessionId, sib.id, 0);
+    }
 
-  db.prepare(
-    `INSERT INTO messages (id, session_id, parent_id, is_active, role, content_text, blocks_json, images_json, model, provider_name, engine, usage_json, created_at)
-     VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    sessionId,
-    parentId,
-    role,
-    contentText,
-    JSON.stringify(blocks || []),
-    JSON.stringify(images || []),
-    model,
-    providerName,
-    engine,
-    JSON.stringify(usage || {}),
-    now,
-  );
+    stmt(
+      db,
+      `INSERT INTO messages (id, session_id, parent_id, is_active, role, content_text, blocks_json, images_json, model, provider_name, engine, usage_json, created_at)
+       VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      sessionId,
+      parentId,
+      role,
+      contentText,
+      JSON.stringify(blocks || []),
+      JSON.stringify(images || []),
+      model,
+      providerName,
+      engine,
+      JSON.stringify(usage || {}),
+      now,
+    );
 
-  db.prepare("UPDATE sessions SET updated_at=? WHERE id=?").run(now, sessionId);
+    stmt(db, "UPDATE sessions SET updated_at=? WHERE id=?").run(now, sessionId);
+  });
+
   return getMessageById(id);
 }
 
 export function getMessageById(id) {
   const db = getDb();
-  const r = db.prepare("SELECT * FROM messages WHERE id=?").get(id);
+  const r = stmt(db, "SELECT * FROM messages WHERE id=?").get(id);
   if (!r) return null;
   return {
     ...r,
@@ -645,74 +1009,104 @@ export function getMessageById(id) {
   };
 }
 
-function setSubtreeActive(db, sessionId, rootId, activeVal) {
-  const queue = [rootId];
-  const stmtChildren = db.prepare("SELECT id FROM messages WHERE session_id=? AND parent_id=?");
-  const stmtUpdate = db.prepare("UPDATE messages SET is_active=? WHERE id=?");
-  while (queue.length) {
-    const cur = queue.shift();
-    stmtUpdate.run(activeVal, cur);
-    const children = stmtChildren.all(sessionId, cur);
-    for (const c of children) queue.push(c.id);
-  }
-}
-
 /**
  * Switch to an alternative branch sibling at a given message node,
- * reactivating the latest path inside that branch cleanly.
+ * reactivating the latest path inside that branch cleanly & atomically.
  */
 export function switchBranch(sessionId, targetMessageId) {
   const db = getDb();
-  const target = db.prepare("SELECT * FROM messages WHERE id=? AND session_id=?").get(targetMessageId, sessionId);
+  const target = stmt(db, "SELECT id, parent_id FROM messages WHERE id=? AND session_id=?").get(targetMessageId, sessionId);
   if (!target) throw new Error("目标分支消息不存在");
 
-  const siblings = target.parent_id
-    ? db.prepare("SELECT id FROM messages WHERE session_id=? AND parent_id=?").all(sessionId, target.parent_id)
-    : db.prepare("SELECT id FROM messages WHERE session_id=? AND parent_id IS NULL").all(sessionId);
+  withTransaction(db, () => {
+    const siblings = target.parent_id
+      ? stmt(db, "SELECT id FROM messages WHERE session_id=? AND parent_id=?").all(sessionId, target.parent_id)
+      : stmt(db, "SELECT id FROM messages WHERE session_id=? AND parent_id IS NULL").all(sessionId);
 
-  for (const sib of siblings) {
-    setSubtreeActive(db, sessionId, sib.id, 0);
-  }
+    for (const sib of siblings) {
+      setSubtreeActive(db, sessionId, sib.id, 0);
+    }
 
-  // Walk down from target activating the most recently created child at each hop
-  let curId = targetMessageId;
-  const stmtUpdate = db.prepare("UPDATE messages SET is_active=1 WHERE id=?");
-  const stmtNext = db.prepare(
-    "SELECT id FROM messages WHERE session_id=? AND parent_id=? ORDER BY created_at DESC LIMIT 1",
-  );
-  while (curId) {
-    stmtUpdate.run(curId);
-    const next = stmtNext.get(sessionId, curId);
-    curId = next ? next.id : null;
-  }
+    // Walk down from target activating the most recently created child at each hop
+    let curId = targetMessageId;
+    const stmtActivate = stmt(db, "UPDATE messages SET is_active=1 WHERE id=?");
+    const stmtNext = stmt(
+      db,
+      "SELECT id FROM messages WHERE session_id=? AND parent_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    );
+    while (curId) {
+      stmtActivate.run(curId);
+      const next = stmtNext.get(sessionId, curId);
+      curId = next ? next.id : null;
+    }
 
-  db.prepare("UPDATE sessions SET updated_at=? WHERE id=?").run(nowIso(), sessionId);
+    stmt(db, "UPDATE sessions SET updated_at=? WHERE id=?").run(nowIso(), sessionId);
+  });
+
   return getSessionTimeline(sessionId);
 }
 
 /**
  * Reconstruct the active linear timeline for a session, annotated with sibling branch info
  * (e.g. branch_index: 2, branch_total: 2, sibling_ids: [...]) so the UI can show ◀ 2/2 ▶.
+ *
+ * Optimization: loads lightweight skeleton headers for inactive branches without deserializing
+ * multi-MB `blocks_json` / `images_json`, and orders active nodes strictly by parent->child topology.
  */
 export function getSessionTimeline(sessionId) {
   const db = getDb();
   const meta = getSessionMeta(sessionId);
   if (!meta) return null;
 
-  const allRows = db
-    .prepare("SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC")
-    .all(sessionId);
+  // 1. Lightweight tree skeleton (index-friendly, zero large blob reads for inactive branches)
+  const skeletonRows = stmt(
+    db,
+    "SELECT id, parent_id, is_active, created_at FROM messages WHERE session_id=? ORDER BY created_at ASC, rowid ASC",
+  ).all(sessionId);
 
-  // Group siblings by parent_id
   const siblingsByParent = new Map();
-  for (const r of allRows) {
+  for (const r of skeletonRows) {
     const pk = r.parent_id || "__ROOT__";
-    if (!siblingsByParent.has(pk)) siblingsByParent.set(pk, []);
-    siblingsByParent.get(pk).push(r);
+    let arr = siblingsByParent.get(pk);
+    if (!arr) {
+      arr = [];
+      siblingsByParent.set(pk, arr);
+    }
+    arr.push(r.id);
   }
 
-  // Active chain ordered cleanly from root
-  const activeRows = allRows.filter((r) => r.is_active === 1);
+  // 2. Full payload ONLY for active branch messages
+  const rawActive = stmt(
+    db,
+    "SELECT * FROM messages WHERE session_id=? AND is_active=1 ORDER BY created_at ASC, rowid ASC",
+  ).all(sessionId);
+
+  // Order strictly along parent_id -> child topological chain (immune to identical-millisecond timestamps)
+  const activeById = new Map(rawActive.map((r) => [r.id, r]));
+  const activeChildByParent = new Map();
+  for (const r of rawActive) {
+    const pk = r.parent_id && activeById.has(r.parent_id) ? r.parent_id : "__ROOT__";
+    if (!activeChildByParent.has(pk)) activeChildByParent.set(pk, []);
+    activeChildByParent.get(pk).push(r);
+  }
+
+  const activeRows = [];
+  const visited = new Set();
+  const walkActive = (pk) => {
+    const kids = activeChildByParent.get(pk);
+    if (!kids) return;
+    for (const k of kids) {
+      if (visited.has(k.id)) continue;
+      visited.add(k.id);
+      activeRows.push(k);
+      walkActive(k.id);
+    }
+  };
+  walkActive("__ROOT__");
+  for (const r of rawActive) {
+    if (!visited.has(r.id)) activeRows.push(r);
+  }
+
   const items = [];
   const outline = [];
   const editedFiles = new Map();
@@ -725,9 +1119,8 @@ export function getSessionTimeline(sessionId) {
 
   for (const r of activeRows) {
     const pk = r.parent_id || "__ROOT__";
-    const sibs = siblingsByParent.get(pk) || [r];
-    const branchIndex = sibs.findIndex((x) => x.id === r.id) + 1;
-    const siblingIds = sibs.map((x) => x.id);
+    const siblingIds = siblingsByParent.get(pk) || [r.id];
+    const branchIndex = Math.max(1, siblingIds.indexOf(r.id) + 1);
 
     const blocks = safeJsonParse(r.blocks_json, []);
     const images = safeJsonParse(r.images_json, []);
@@ -779,7 +1172,7 @@ export function getSessionTimeline(sessionId) {
       usage,
       created_at: r.created_at,
       branch_index: branchIndex,
-      branch_total: sibs.length,
+      branch_total: siblingIds.length,
       sibling_ids: siblingIds,
     });
   }
@@ -807,6 +1200,12 @@ export function getSessionTimeline(sessionId) {
 
 // ==================== MEMORIES (CONCURRENCY-SAFE VERSIONED) ====================
 
+export function getMemoryById(id) {
+  const db = getDb();
+  const r = stmt(db, "SELECT * FROM memories WHERE id=?").get(id);
+  return r ? { ...r, pinned: Boolean(r.pinned) } : null;
+}
+
 export function listMemories({ scope = "", cwd = "", query = "" } = {}) {
   const db = getDb();
   let sql = "SELECT * FROM memories WHERE 1=1";
@@ -832,47 +1231,53 @@ export function saveMemory(input) {
   const db = getDb();
   const now = nowIso();
   const id = input.id || `mem_${crypto.randomBytes(6).toString("hex")}`;
-  const existing = db.prepare("SELECT * FROM memories WHERE id=?").get(id);
 
-  // Optimistic concurrency check so two windows never silently overwrite each other
-  if (existing && input.expected_version !== undefined && Number(input.expected_version) !== existing.version) {
-    const err = new Error("该记忆刚被另一窗口修改，请刷新后重试（已防止覆盖冲突）");
-    err.code = "ERR_MEMORY_CONFLICT";
-    throw err;
-  }
+  return withTransaction(db, () => {
+    const existing = stmt(db, "SELECT * FROM memories WHERE id=?").get(id);
 
-  const scope = input.scope === "project" ? "project" : "global";
-  const cwd = scope === "project" ? String(input.cwd || "") : "";
-  const title = String(input.title || "未命名记忆").trim();
-  const category = String(input.category || "general").trim();
-  const content = String(input.content || "");
-  const pinned = input.pinned ? 1 : 0;
+    // Optimistic concurrency check so two windows never silently overwrite each other
+    if (existing && input.expected_version !== undefined && Number(input.expected_version) !== existing.version) {
+      const err = new Error("该记忆刚被另一窗口修改，请刷新后重试（已防止覆盖冲突）");
+      err.code = "ERR_MEMORY_CONFLICT";
+      throw err;
+    }
 
-  if (existing) {
-    db.prepare(
-      `UPDATE memories SET scope=?, cwd=?, title=?, category=?, content=?, pinned=?, version=version+1, updated_at=? WHERE id=?`,
-    ).run(scope, cwd, title, category, content, pinned, now, id);
-  } else {
-    db.prepare(
-      `INSERT INTO memories (id, scope, cwd, title, category, content, pinned, version, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-    ).run(id, scope, cwd, title, category, content, pinned, now);
-  }
-  return db.prepare("SELECT * FROM memories WHERE id=?").get(id);
+    const scope = input.scope === "project" ? "project" : "global";
+    const cwd = scope === "project" ? String(input.cwd || "") : "";
+    const title = String(input.title || "未命名记忆").trim();
+    const category = String(input.category || "general").trim();
+    const content = String(input.content || "");
+    const pinned = input.pinned ? 1 : 0;
+
+    if (existing) {
+      stmt(
+        db,
+        `UPDATE memories SET scope=?, cwd=?, title=?, category=?, content=?, pinned=?, version=version+1, updated_at=? WHERE id=?`,
+      ).run(scope, cwd, title, category, content, pinned, now, id);
+    } else {
+      stmt(
+        db,
+        `INSERT INTO memories (id, scope, cwd, title, category, content, pinned, version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+      ).run(id, scope, cwd, title, category, content, pinned, now);
+    }
+    const saved = stmt(db, "SELECT * FROM memories WHERE id=?").get(id);
+    return saved ? { ...saved, pinned: Boolean(saved.pinned) } : null;
+  });
 }
 
 export function deleteMemory(id) {
   const db = getDb();
-  db.prepare("DELETE FROM memories WHERE id=?").run(id);
-  return true;
+  const existing = stmt(db, "SELECT * FROM memories WHERE id=?").get(id);
+  stmt(db, "DELETE FROM memories WHERE id=?").run(id);
+  return existing || null;
 }
 
 // ==================== INSTALLED MCPS & SKILLS & BACKGROUNDS ====================
 
 export function listInstalledMcps() {
   const db = getDb();
-  return db
-    .prepare("SELECT * FROM installed_mcps ORDER BY installed_at DESC")
+  return stmt(db, "SELECT * FROM installed_mcps ORDER BY installed_at DESC")
     .all()
     .map((r) => ({
       ...r,
@@ -886,7 +1291,7 @@ export function saveInstalledMcp(input) {
   const db = getDb();
   const now = nowIso();
   const id = input.id || `mcp_${crypto.randomBytes(5).toString("hex")}`;
-  const existing = db.prepare("SELECT * FROM installed_mcps WHERE id=?").get(id);
+  const existing = stmt(db, "SELECT * FROM installed_mcps WHERE id=?").get(id);
   const name = String(input.name || "mcp-server").trim();
   const sourceId = String(input.source_id || "");
   const description = String(input.description || "");
@@ -896,11 +1301,13 @@ export function saveInstalledMcp(input) {
   const enabled = input.enabled === false ? 0 : 1;
 
   if (existing) {
-    db.prepare(
+    stmt(
+      db,
       `UPDATE installed_mcps SET name=?, source_id=?, description=?, command=?, args_json=?, env_json=?, enabled=? WHERE id=?`,
     ).run(name, sourceId, description, command, JSON.stringify(args), JSON.stringify(env), enabled, id);
   } else {
-    db.prepare(
+    stmt(
+      db,
       `INSERT INTO installed_mcps (id, name, source_id, description, command, args_json, env_json, enabled, installed_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(id, name, sourceId, description, command, JSON.stringify(args), JSON.stringify(env), enabled, now);
@@ -909,14 +1316,14 @@ export function saveInstalledMcp(input) {
 }
 
 export function deleteInstalledMcp(id) {
-  getDb().prepare("DELETE FROM installed_mcps WHERE id=?").run(id);
+  const db = getDb();
+  stmt(db, "DELETE FROM installed_mcps WHERE id=?").run(id);
   return true;
 }
 
 export function listInstalledSkills() {
   const db = getDb();
-  return db
-    .prepare("SELECT * FROM installed_skills ORDER BY installed_at DESC")
+  return stmt(db, "SELECT * FROM installed_skills ORDER BY installed_at DESC")
     .all()
     .map((r) => ({ ...r, enabled: Boolean(r.enabled) }));
 }
@@ -924,11 +1331,12 @@ export function listInstalledSkills() {
 export function saveInstalledSkill(input) {
   const db = getDb();
   const now = nowIso();
-  const slug = String(input.slug || input.name || "skill")
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^-|-$/g, "") || `skill-${Date.now()}`;
-  const existing = db.prepare("SELECT * FROM installed_skills WHERE slug=? OR id=?").get(slug, input.id || "");
+  const slug =
+    String(input.slug || input.name || "skill")
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-|-$/g, "") || `skill-${Date.now()}`;
+  const existing = stmt(db, "SELECT * FROM installed_skills WHERE slug=? OR id=?").get(slug, input.id || "");
   const id = existing?.id || input.id || `sk_${crypto.randomBytes(5).toString("hex")}`;
   const name = String(input.name || slug).trim();
   const description = String(input.description || "");
@@ -937,39 +1345,48 @@ export function saveInstalledSkill(input) {
   const enabled = input.enabled === false ? 0 : 1;
 
   if (existing) {
-    db.prepare(
+    stmt(
+      db,
       `UPDATE installed_skills SET name=?, slug=?, description=?, content=?, source_url=?, enabled=? WHERE id=?`,
     ).run(name, slug, description, content, sourceUrl, enabled, id);
   } else {
-    db.prepare(
-      `INSERT INTO installed_skills (id, name, slug, description, content, source_url, enabled, installed_at)
+    stmt(
+      db,
+      `INSERT INTO installed_skills (id, name, source_url, slug, description, content, enabled, installed_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, name, slug, description, content, sourceUrl, enabled, now);
+    ).run(id, name, sourceUrl, slug, description, content, enabled, now);
   }
   return listInstalledSkills().find((s) => s.id === id);
 }
 
 export function deleteInstalledSkill(id) {
-  getDb().prepare("DELETE FROM installed_skills WHERE id=?").run(id);
+  const db = getDb();
+  stmt(db, "DELETE FROM installed_skills WHERE id=?").run(id);
   return true;
 }
 
 export function listCustomBackgrounds() {
-  return getDb().prepare("SELECT * FROM custom_backgrounds ORDER BY created_at DESC").all();
+  const db = getDb();
+  return stmt(db, "SELECT * FROM custom_backgrounds ORDER BY created_at DESC").all();
 }
 
 export function addCustomBackground({ name, url, source = "upload" }) {
+  const db = getDb();
   const id = `bg_${crypto.randomBytes(5).toString("hex")}`;
-  getDb()
-    .prepare("INSERT INTO custom_backgrounds (id, name, url, source, created_at) VALUES (?, ?, ?, ?, ?)")
-    .run(id, name, url, source, nowIso());
-  return getDb().prepare("SELECT * FROM custom_backgrounds WHERE id=?").get(id);
+  stmt(db, "INSERT INTO custom_backgrounds (id, name, url, source, created_at) VALUES (?, ?, ?, ?, ?)").run(
+    id,
+    name,
+    url,
+    source,
+    nowIso(),
+  );
+  return stmt(db, "SELECT * FROM custom_backgrounds WHERE id=?").get(id);
 }
 
 export function deleteCustomBackground(id) {
   const db = getDb();
-  const row = db.prepare("SELECT * FROM custom_backgrounds WHERE id=?").get(id);
-  db.prepare("DELETE FROM custom_backgrounds WHERE id=?").run(id);
+  const row = stmt(db, "SELECT * FROM custom_backgrounds WHERE id=?").get(id);
+  stmt(db, "DELETE FROM custom_backgrounds WHERE id=?").run(id);
   return row || null;
 }
 

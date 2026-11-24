@@ -325,6 +325,9 @@
     // 1. Update CSS tokens & body classes (instant, zero media disruption!)
     document.documentElement.setAttribute("data-theme", theme);
     document.documentElement.style.setProperty("--font-size-base", `${ap.fontSize || 14.5}px`);
+    try {
+      localStorage.setItem("ocs_ap_snap", JSON.stringify({ theme, fontSize: ap.fontSize || 14.5 }));
+    } catch {}
 
     const blurPx = bgMode === "hd" ? 0 : (ap.bgBlur ?? 10);
     document.documentElement.style.setProperty("--bg-blur", `${blurPx}px`);
@@ -523,9 +526,20 @@
     return s.replace(/\x00C(\d+)\x00/g, (_, i) => slots[Number(i)]);
   }
 
+  const _mdCache = new Map();
+  const MD_CACHE_MAX = 400;
+
   function renderMarkdown(md) {
     if (!md) return "";
-    const lines = String(md).replace(/\r\n/g, "\n").split("\n");
+    const str = String(md);
+    const cacheable = str.length <= 65536;
+    if (cacheable && _mdCache.has(str)) {
+      const hit = _mdCache.get(str);
+      _mdCache.delete(str);
+      _mdCache.set(str, hit);
+      return hit;
+    }
+    const lines = str.replace(/\r\n/g, "\n").split("\n");
     const out = [];
     let i = 0;
     while (i < lines.length) {
@@ -599,7 +613,15 @@
       }
       out.push(`<p>${p.map(renderInlineMd).join("<br />")}</p>`);
     }
-    return out.join("");
+    const html = out.join("");
+    if (cacheable) {
+      if (_mdCache.size >= MD_CACHE_MAX) {
+        const oldestKey = _mdCache.keys().next().value;
+        _mdCache.delete(oldestKey);
+      }
+      _mdCache.set(str, html);
+    }
+    return html;
   }
 
   function highlightHtml(text, query) {
@@ -837,12 +859,50 @@
     renderGlassMenu("gd-thinking", "gd-thinking-menu", "gd-thinking-label", thinkItems, chosen, onPickThink);
   }
 
-  // ==================== SESSION LIST ====================
+  // ==================== SESSION LIST (PINNING + TIME GROUPING) ====================
+
+  function classifySessionTimeGroup(s) {
+    if (s.pinned) return "📌 已置顶";
+    const ms = Date.parse(s.updated_at || "") || 0;
+    if (!ms) return "更早";
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    if (ms >= todayStart) return "今天";
+    if (ms >= todayStart - 6 * 86400_000) return "近 7 天";
+    return "更早";
+  }
+
+  function syncWelcomeResumePill() {
+    const wrap = $("welcome-resume-wrap");
+    const titleEl = $("resume-latest-title");
+    if (!wrap || !titleEl) return;
+    const latest = state.sessions?.[0];
+    if (!state.activeSessionId && latest) {
+      titleEl.textContent = latest.title || "未命名会话";
+      wrap.classList.remove("hidden");
+    } else {
+      wrap.classList.add("hidden");
+    }
+  }
+
+  async function togglePinSession(sid, nextPinned) {
+    try {
+      await apiJson(`/api/sessions/${encodeURIComponent(sid)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ pinned: Boolean(nextPinned) }),
+      });
+      toast(nextPinned ? "已置顶该会话" : "已取消置顶");
+      refreshSessions();
+    } catch (err) {
+      toast("更新置顶状态失败: " + err.message);
+    }
+  }
 
   function renderSessionList() {
     const list = state.sessions;
     const q = $("global-search-input").value.trim();
     const el = $("session-list");
+    syncWelcomeResumePill();
 
     if (!list.length) {
       el.innerHTML = `<div class="empty-hint">${q ? "没有找到匹配的对话" : "点击右上角 + 开启新会话"}</div>`;
@@ -850,16 +910,31 @@
     }
 
     const frag = document.createDocumentFragment();
+    let lastGroup = "";
+    const showGroups = !q && list.length >= 4;
+
     for (const s of list) {
+      if (showGroups) {
+        const grp = classifySessionTimeGroup(s);
+        if (grp !== lastGroup) {
+          lastGroup = grp;
+          const gl = document.createElement("div");
+          gl.className = "session-group-label";
+          gl.textContent = grp;
+          frag.appendChild(gl);
+        }
+      }
+
       const item = document.createElement("div");
       item.className = "session-item" + (s.id === state.activeSessionId ? " active" : "");
       const running = state.runningIds.has(s.id);
       const snippet = q && s.match_snippet ? `<div class="session-item-snippet">${highlightHtml(s.match_snippet, q)}</div>` : "";
       item.innerHTML =
         `<div class="session-item-row">` +
-          (running ? `<span class="pulse-dot" title="后台运行中"></span>` : "") +
+          (running ? `<span class="pulse-dot" title="后台运行中"></span>` : s.pinned ? `<span class="session-pin-mark" title="已置顶">📌</span>` : "") +
           `<span class="session-item-title">${highlightHtml(s.title, q)}</span>` +
           `<div class="session-item-actions">` +
+            `<button class="icon-btn xs btn-pin${s.pinned ? " is-pinned" : ""}" title="${s.pinned ? "取消置顶" : "置顶会话"}">📌</button>` +
             `<button class="icon-btn xs btn-rn" title="重命名">✎</button>` +
             `<button class="icon-btn xs btn-del" title="删除">🗑</button>` +
           `</div>` +
@@ -870,6 +945,10 @@
       item.addEventListener("click", (ev) => {
         if (ev.target.closest(".session-item-actions")) return;
         openSession(s.id, { jumpMessageId: s.match_message_id || null, highlightQuery: q || null });
+      });
+      item.querySelector(".btn-pin")?.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        togglePinSession(s.id, !s.pinned);
       });
       item.querySelector(".btn-rn")?.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -1069,16 +1148,27 @@
         `</div>`;
       const ta = wrap.querySelector("#inline-edit-ta");
       setTimeout(() => { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }, 20);
-      wrap.querySelector("#btn-cancel-edit").addEventListener("click", () => {
+      const cancelInlineEdit = () => {
         state.editingMessageId = null;
         renderConversation();
-      });
-      wrap.querySelector("#btn-submit-edit").addEventListener("click", () => {
+      };
+      const submitInlineEdit = () => {
         const nextText = ta.value.trim();
         if (!nextText) return toast("消息内容不能为空");
         state.editingMessageId = null;
         sendEditResend(item.id, nextText);
+      };
+      ta.addEventListener("keydown", (ev) => {
+        if ((ev.ctrlKey || ev.metaKey) && ev.key === "Enter") {
+          ev.preventDefault();
+          submitInlineEdit();
+        } else if (ev.key === "Escape") {
+          ev.stopPropagation();
+          cancelInlineEdit();
+        }
       });
+      wrap.querySelector("#btn-cancel-edit").addEventListener("click", cancelInlineEdit);
+      wrap.querySelector("#btn-submit-edit").addEventListener("click", submitInlineEdit);
       return wrap;
     }
 
@@ -1232,6 +1322,7 @@
     if (!hasItems && !live) {
       box.innerHTML = "";
       welcomeEl?.classList.remove("hidden");
+      syncWelcomeResumePill();
       $("ctx-pill").classList.add("hidden");
       renderOutline([]);
       renderActivity(null);
@@ -1239,6 +1330,7 @@
     }
 
     welcomeEl?.classList.add("hidden");
+    $("welcome-resume-wrap")?.classList.add("hidden");
     const frag = document.createDocumentFragment();
     for (const item of tl?.items || []) {
       if (item.role === "user") frag.appendChild(createUserMsgEl(item));
@@ -1485,6 +1577,67 @@
     updateRunningButtons();
     restoreDraft();
     $("composer-input").focus();
+  }
+
+  function exportCurrentSessionMarkdown() {
+    const tl = state.activeTimeline;
+    if (!tl?.items?.length) {
+      return toast("当前会话暂无内容可导出");
+    }
+    const sess = tl.session || {};
+    const lines = [
+      `# ${sess.title || "OpenCode Studio 对话记录"}`,
+      "",
+      `- **工作目录**: \`${sess.cwd || "-"}\``,
+      `- **模型**: \`${sess.model || "-"}\``,
+      `- **导出时间**: \`${new Date().toLocaleString("zh-CN", { hour12: false })}\``,
+      "",
+      "---",
+      "",
+    ];
+
+    for (const it of tl.items) {
+      if (it.role === "user") {
+        lines.push(`## 🙋 提问 #${it.turn_index || ""} (${fmtClock(it.created_at)})`, "");
+        if (it.images?.length) {
+          lines.push(`> 附带文件/图片: ${it.images.map((f) => f.name || "附件").join(", ")}`, "");
+        }
+        lines.push(it.content_text || "", "");
+      } else if (it.role === "assistant") {
+        const metaTag = [it.provider_name, it.model].filter(Boolean).join(" / ");
+        lines.push(`## 🤖 回复${metaTag ? ` (${metaTag})` : ""} (${fmtClock(it.created_at)})`, "");
+        for (const blk of it.blocks || []) {
+          if (blk.type === "thinking" && blk.text) {
+            lines.push("<details><summary>思考过程</summary>", "", blk.text.trim(), "", "</details>", "");
+          } else if (blk.type === "tool_use") {
+            lines.push(`- 🔧 **工具调用** \`${blk.name}\`: \`${summarizeTool(blk.name, blk.input)}\``);
+          } else if (blk.type === "text" && blk.text) {
+            lines.push("", blk.text.trim(), "");
+          }
+        }
+        if (!it.blocks?.length && it.content_text) {
+          lines.push(it.content_text.trim(), "");
+        }
+        lines.push("---", "");
+      } else if (it.role === "compact") {
+        lines.push(`> 📦 **上下文压缩摘要**: ${it.content_text || ""}`, "", "---", "");
+      }
+    }
+
+    const mdContent = lines.join("\n");
+    const safeName = String(sess.title || "conversation")
+      .replace(/[\\/:*?"<>|]+/g, "_")
+      .slice(0, 48) || "conversation";
+    const blob = new Blob([mdContent], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${safeName}.md`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    toast(`已导出 Markdown：${safeName}.md`);
   }
 
   async function switchToBranch(targetMessageId) {
@@ -1753,6 +1906,12 @@
     }
     if (t === "session_meta_updated" || t === "session_deleted") {
       refreshSessions();
+      return;
+    }
+    if (t === "memories_updated") {
+      if (!$("modal-memory")?.classList.contains("hidden")) {
+        openMemoryModal().catch(() => {});
+      }
       return;
     }
     if (t === "message_added" || t === "timeline_updated") {
@@ -2135,6 +2294,11 @@
     $("pf-default-model").value = p?.default_model || "";
     $("pf-models").value = (p?.models || []).join("\n");
     $("btn-delete-provider").disabled = !p || p.id === "claude-native-oauth";
+    const testBox = $("pf-test-result");
+    if (testBox) {
+      testBox.classList.add("hidden");
+      testBox.textContent = "";
+    }
     toggleProviderKindFields();
     renderModelCapsPreview(p?.model_infos || []);
   }
@@ -2266,6 +2430,51 @@
       toast(`已保存供应商「${res.provider.name}」`);
     } catch (err) {
       toast("保存失败: " + err.message);
+    }
+  }
+
+  async function testSelectedProviderConnection() {
+    const btn = $("btn-test-provider");
+    const box = $("pf-test-result");
+    if (btn) btn.disabled = true;
+    if (box) {
+      box.classList.remove("hidden");
+      box.style.color = "var(--text-secondary)";
+      box.textContent = "正在发起真实连通性与鉴权探测…";
+    }
+    const models = $("pf-models").value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    try {
+      const res = await apiJson("/api/providers/test", {
+        method: "POST",
+        body: JSON.stringify({
+          id: state.selectedProviderId || undefined,
+          name: $("pf-name").value.trim(),
+          kind: $("pf-kind").value,
+          base_url: $("pf-baseurl").value.trim(),
+          api_key: $("pf-apikey").value.trim() || undefined,
+          default_model: $("pf-default-model").value.trim() || models[0] || "",
+          models,
+        }),
+      });
+      if (box) {
+        if (res.ok) {
+          box.style.color = "var(--ok)";
+          box.textContent = `● ${res.message || `连接成功 (${res.latency_ms || 0} ms)`}`;
+          toast(res.message || "供应商连接测试通过！");
+        } else {
+          box.style.color = "var(--err)";
+          box.textContent = `✕ 连接未通过：${res.error || res.message || "未知错误"}`;
+          toast("测试未通过，请查看下方提示", 3600);
+        }
+      }
+    } catch (err) {
+      if (box) {
+        box.style.color = "var(--err)";
+        box.textContent = `✕ 测试请求失败：${err.message}`;
+      }
+      toast("测试连接异常: " + err.message);
+    } finally {
+      if (btn) btn.disabled = false;
     }
   }
 
@@ -2813,6 +3022,50 @@
     }, 550);
   }
 
+  function renderDbStats(st) {
+    if (st) state.dbStats = st;
+    const info = state.dbStats;
+    const el = $("db-stats-line");
+    if (!el || !info) return;
+    el.textContent =
+      `主库 ${info.db_mb} MB + WAL 日志 ${info.wal_mb} MB（总计 ${info.total_mb} MB） · ` +
+      `活跃会话 ${info.sessions_active} 个 / 已删除归档 ${info.sessions_archived} 个 · ` +
+      `消息 ${info.messages_total} 条 · 记忆 ${info.memories_total} 篇 · ` +
+      `FTS5 全文索引：${info.fts_enabled ? "已启用" : "标准模式"}`;
+    const purgeBtn = $("btn-db-purge-archived");
+    if (purgeBtn) purgeBtn.disabled = !info.sessions_archived;
+  }
+
+  async function runDatabaseMaintenance(purgeArchived = false) {
+    if (
+      purgeArchived &&
+      !window.confirm(
+        `确定彻底清除 ${state.dbStats?.sessions_archived || 0} 个已删除归档的旧会话并压缩回收数据库空间？\n（不会影响任何当前正常展示的活跃会话与记忆）`,
+      )
+    ) {
+      return;
+    }
+    const btnOpt = $("btn-db-optimize");
+    const btnPurge = $("btn-db-purge-archived");
+    if (btnOpt) btnOpt.disabled = true;
+    if (btnPurge) btnPurge.disabled = true;
+    try {
+      const res = await apiJson("/api/db/optimize", {
+        method: "POST",
+        body: JSON.stringify({ purge_archived: purgeArchived }),
+      });
+      if (res.after) renderDbStats(res.after);
+      const freedTxt = res.freed_mb > 0 ? `，已释放 ${res.freed_mb} MB 磁盘空间` : "";
+      const purgedTxt = res.purged_sessions > 0 ? `，彻底清理 ${res.purged_sessions} 个归档会话` : "";
+      toast(`SQLite 维护完成${purgedTxt}${freedTxt}（当前总计 ${res.after?.total_mb ?? 0} MB）`, 3800);
+    } catch (err) {
+      toast("数据库维护失败: " + err.message, 4000);
+    } finally {
+      if (btnOpt) btnOpt.disabled = false;
+      renderDbStats();
+    }
+  }
+
   async function openSettingsModal() {
     openModal("modal-settings");
     const syncFieldsFromSettings = (s) => {
@@ -2820,6 +3073,7 @@
       if (!state._promptDirty) $("set-system-prompt").value = savedPrompt;
       if ($("set-prompt-mode")) $("set-prompt-mode").value = s.prompt_mode || "replace";
       if ($("set-search-mode")) $("set-search-mode").value = s.search_engine?.mode || "auto";
+      if ($("set-search-proxy")) $("set-search-proxy").value = s.search_engine?.proxy_url || "";
       if ($("set-claude-isolation")) $("set-claude-isolation").value = s.claude_isolation || "isolated";
       $("set-permission-mode").value = s.permission_mode || "auto";
       $("set-default-cwd").value = s.default_cwd || "";
@@ -2830,16 +3084,20 @@
     setPromptSaveBadge("ok", "● 已保存");
     $("updater-current-line").textContent = `当前外壳版本：v${state.version} · 仓库：github.com/gniygniynus/opencode-studio`;
     renderClaudeStatusViews();
-    // Always fetch fresh persisted settings from SQLite so opening early or across tabs NEVER shows stale/empty values
-    try {
-      const fresh = await apiJson("/api/settings");
+    renderDbStats();
+    // Fetch fresh persisted settings & live DB stats in parallel
+    Promise.all([
+      apiJson("/api/settings").catch(() => null),
+      apiJson("/api/db/stats").catch(() => null),
+    ]).then(([fresh, dbRes]) => {
       if (fresh && typeof fresh === "object") {
         state.settings = { ...(state.settings || {}), ...fresh };
         if (!state._promptDirty && document.activeElement !== $("set-system-prompt")) {
           syncFieldsFromSettings(state.settings);
         }
       }
-    } catch {}
+      if (dbRes?.stats) renderDbStats(dbRes.stats);
+    });
   }
 
   async function checkClaudeCoreVersions() {
@@ -3198,15 +3456,20 @@
     });
     $("cwd-filter-select").addEventListener("change", refreshSessions);
 
-    // Quick welcome cards
+    // Quick welcome cards & resume latest pill
     $("wc-providers")?.addEventListener("click", () => openProvidersModal());
     $("wc-stores")?.addEventListener("click", () => openStoresModal("mcp"));
     $("wc-wallpaper")?.addEventListener("click", () => openStoresModal("wallpapers"));
     $("wc-settings")?.addEventListener("click", openSettingsModal);
+    $("btn-resume-latest")?.addEventListener("click", () => {
+      const latest = state.sessions?.[0];
+      if (latest?.id) openSession(latest.id);
+    });
 
     // Navigation buttons
     $("btn-open-providers").addEventListener("click", () => openProvidersModal());
     $("btn-open-stores").addEventListener("click", () => openStoresModal("mcp"));
+    $("btn-export-md")?.addEventListener("click", exportCurrentSessionMarkdown);
     $("btn-quick-bg").addEventListener("click", () => openStoresModal("wallpapers"));
     $("btn-open-memory").addEventListener("click", openMemoryModal);
     $("btn-open-settings").addEventListener("click", openSettingsModal);
@@ -3429,6 +3692,7 @@
       openProvidersModal(state.selectedProviderId);
       toast("已切换为当前活跃供应商");
     });
+    $("btn-test-provider")?.addEventListener("click", testSelectedProviderConnection);
     $("btn-fetch-models").addEventListener("click", fetchModelsForSelected);
     $("btn-delete-provider").addEventListener("click", async () => {
       if (!state.selectedProviderId || !window.confirm("确定删除该供应商？")) return;
@@ -3722,6 +3986,7 @@
       setPromptSaveBadge("saving", "保存中…");
       try {
         const searchMode = $("set-search-mode")?.value || state.settings.search_engine?.mode || "auto";
+        const searchProxy = ($("set-search-proxy")?.value || "").trim();
         const claudeIsolation = $("set-claude-isolation")?.value || state.settings.claude_isolation || "isolated";
         const res = await apiJson("/api/settings", {
           method: "PUT",
@@ -3730,7 +3995,7 @@
             prompt_mode: $("set-prompt-mode")?.value || "replace",
             permission_mode: $("set-permission-mode").value,
             claude_isolation: claudeIsolation,
-            search_engine: { ...(state.settings.search_engine || {}), mode: searchMode },
+            search_engine: { ...(state.settings.search_engine || {}), mode: searchMode, proxy_url: searchProxy },
             default_cwd: $("set-default-cwd").value.trim(),
             update_channel: $("set-update-channel").value,
           }),
@@ -3753,6 +4018,8 @@
         btn.textContent = oldTxt;
       }
     });
+    $("btn-db-optimize")?.addEventListener("click", () => runDatabaseMaintenance(false));
+    $("btn-db-purge-archived")?.addEventListener("click", () => runDatabaseMaintenance(true));
     $("btn-claude-check-ver")?.addEventListener("click", checkClaudeCoreVersions);
     $("btn-claude-install-stable")?.addEventListener("click", () => installOrSwitchClaudeCore("stable"));
     $("btn-claude-install-latest")?.addEventListener("click", () => installOrSwitchClaudeCore("latest"));
@@ -3829,7 +4096,14 @@
 
     // Shortcuts
     window.addEventListener("keydown", (ev) => {
-      if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "f" && state.activeTimeline) {
+      if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "k") {
+        ev.preventDefault();
+        $("sidebar")?.classList.remove("collapsed");
+        $("btn-expand-sidebar")?.classList.add("hidden");
+        const gs = $("global-search-input");
+        gs?.focus();
+        gs?.select();
+      } else if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "f" && state.activeTimeline) {
         ev.preventDefault();
         openDrawer("find");
       } else if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.key.toLowerCase() === "o") {
@@ -3846,11 +4120,16 @@
     });
   }
 
-  // ==================== BOOTSTRAP ====================
+  // ==================== BOOTSTRAP (PARALLEL ZERO-WAIT INIT) ====================
 
   async function init() {
     bindEvents();
-    const boot = await apiJson("/api/bootstrap");
+    connectWs();
+
+    const [boot] = await Promise.all([
+      apiJson("/api/bootstrap"),
+      refreshSessions().catch(() => {}),
+    ]);
     state.version = boot.version || "1.0.0";
     state.settings = boot.settings || {};
     state.providers = boot.providers || [];
@@ -3860,6 +4139,7 @@
     state.installedSkills = boot.installed_skills || [];
     state.customBackgrounds = boot.custom_backgrounds || [];
     if (boot.wallpaper_storage) renderWallpaperStorage(boot.wallpaper_storage);
+    if (boot.db_stats) renderDbStats(boot.db_stats);
     state.activeCwd = state.settings.default_cwd || "";
 
     $("app-version-badge").textContent = `v${state.version} · 开源透明`;
@@ -3868,8 +4148,7 @@
     applyAppearance(state.settings.appearance || {});
     renderComposerSelectors();
     renderClaudeStatusViews();
-    connectWs();
-    await refreshSessions();
+    syncWelcomeResumePill();
     restoreDraft();
     $("composer-input").focus();
   }
