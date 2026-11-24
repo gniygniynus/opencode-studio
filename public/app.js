@@ -374,7 +374,16 @@
     }
 
     // 2. Dirty-check wallpaper media: dragging sliders / switching themes / async settings save NEVER restarts video or flashes wallpaper!
-    if (nextSig !== state._activeBgSig) {
+    const isSeamlessOfflinePin =
+      normKind === "image" &&
+      Boolean(ap.sourceUrl) &&
+      String(ap.bgUrl || "").startsWith("/api/bg-files/active_wallpaper_") &&
+      state._activeBgSig === `image|${ap.sourceUrl}`;
+
+    if (isSeamlessOfflinePin) {
+      state._activeBgSig = nextSig;
+    } else if (nextSig !== state._activeBgSig) {
+      const prevSig = state._activeBgSig;
       state._activeBgSig = nextSig;
       const token = ++state._bgSwapToken;
 
@@ -454,7 +463,12 @@
             commit();
           }
         };
-        preloader.onerror = commit;
+        preloader.onerror = () => {
+          if (done || token !== state._bgSwapToken) return;
+          done = true;
+          state._activeBgSig = prevSig;
+          toast("该壁纸资源暂时加载超时，请换一张壁纸或检查网络设置", 3200);
+        };
         preloader.src = targetUrl;
         if (preloader.complete && preloader.naturalWidth > 0) commit();
       }
@@ -3323,7 +3337,7 @@
       `<div class="wp-meta"><div class="wp-name">${escHtml(w.name || w.title || "壁纸")}</div><div class="wp-sub" title="${escHtml(subText)}">${escHtml(subText)}</div></div>`;
 
     if (!w.preview_css && (w.thumb || w.url)) {
-      observeLazyThumb(card.querySelector(".wp-thumb"), w.thumb || w.url, idx < 8);
+      observeLazyThumb(card.querySelector(".wp-thumb"), w.thumb || w.url, idx < 12);
     }
 
     card.querySelector(".wp-fav-btn")?.addEventListener("click", (ev) => {
@@ -3399,8 +3413,11 @@
       if (!items.length && !append) {
         grid.innerHTML = `<div class="muted-text">未搜索到匹配壁纸${data.online_error ? `（${escHtml(data.online_error)}）` : "，试试「星空」「极光」「海洋」「樱花」「赛博」或英文关键词"}。</div>`;
       } else {
-        items.forEach((w, idx) => {
-          grid.appendChild(buildWallpaperCard(w, grid, append ? idx + 12 : idx));
+        let imgSeq = append ? 12 : 0;
+        items.forEach((w) => {
+          const isRealImg = !w.preview_css && Boolean(w.thumb || w.url);
+          const cardIdx = isRealImg ? imgSeq++ : 99;
+          grid.appendChild(buildWallpaperCard(w, grid, cardIdx));
         });
       }
 
@@ -3496,6 +3513,38 @@
       `FTS5 全文索引：${info.fts_enabled ? "已启用" : "标准模式"}`;
     const purgeBtn = $("btn-db-purge-archived");
     if (purgeBtn) purgeBtn.disabled = !info.sessions_archived;
+  }
+
+  async function runLegacyCleanup() {
+    const btn = $("btn-cleanup-legacy");
+    if (btn) btn.disabled = true;
+    toast("正在扫描并清理旧便携版残留、0轮空壳会话与预览缓存…");
+    try {
+      const res = await apiJson("/api/system/cleanup-legacy", {
+        method: "POST",
+        body: JSON.stringify({ purge_archived: false }),
+      });
+      if (res.after_db) renderDbStats(res.after_db);
+      if (res.wallpaper_storage) renderWallpaperStorage(res.wallpaper_storage);
+      if (res.purged_empty_shells > 0) {
+        if (state.activeSessionId && (!state.activeTimeline?.items?.length)) {
+          startNewSession();
+        }
+        await refreshSessions().catch(() => {});
+      }
+      const parts = [];
+      if (res.portable_dirs_removed > 0) parts.push(`旧便携版解包残留 ${res.portable_dirs_removed} 处`);
+      if (res.purged_empty_shells > 0) parts.push(`0 轮空壳会话 ${res.purged_empty_shells} 个`);
+      if (res.wp_cache_removed > 0) parts.push(`壁纸预览缓存 ${res.wp_cache_removed} 项`);
+      if (res.orphan_prompts_removed > 0) parts.push(`临时文件 ${res.orphan_prompts_removed} 个`);
+      const detailTxt = parts.length ? `已清理：${parts.join("、")}` : "检查完毕，当前环境非常干净无残留";
+      const freedTxt = res.total_freed_mb > 0 ? `（共释放 ${res.total_freed_mb} MB）` : "";
+      toast(`🧼 ${detailTxt}${freedTxt}`, 4200);
+    } catch (err) {
+      toast("清理旧版残留失败: " + err.message, 4000);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   }
 
   async function runDatabaseMaintenance(purgeArchived = false) {
@@ -4550,6 +4599,7 @@
         btn.textContent = oldTxt;
       }
     });
+    $("btn-cleanup-legacy")?.addEventListener("click", runLegacyCleanup);
     $("btn-db-optimize")?.addEventListener("click", () => runDatabaseMaintenance(false));
     $("btn-db-purge-archived")?.addEventListener("click", () => runDatabaseMaintenance(true));
     $("btn-claude-reset-bundled")?.addEventListener("click", resetToBundledClaudeCore);

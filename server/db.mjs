@@ -75,8 +75,8 @@ function stmt(db, sql) {
 
 function withTransaction(db, fn) {
   if (_txDepth > 0) return fn();
-  _txDepth += 1;
   db.exec("BEGIN IMMEDIATE");
+  _txDepth += 1;
   try {
     const res = fn();
     db.exec("COMMIT");
@@ -136,6 +136,77 @@ export function maskSecret(plain) {
   return `${plain.slice(0, 4)}••••${plain.slice(-4)}`;
 }
 
+function healUnsupportedFtsSchema(db, dbFilePath) {
+  let hasFtsArtifacts = false;
+  try {
+    hasFtsArtifacts = Boolean(
+      db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE name LIKE 'messages_fts%' OR tbl_name = 'messages_fts' OR name LIKE 'trg_messages_fts_%' LIMIT 1",
+        )
+        .get(),
+    );
+  } catch {
+    hasFtsArtifacts = false;
+  }
+  if (!hasFtsArtifacts) return { db, healed: false };
+
+  try {
+    db.prepare("SELECT rowid FROM messages_fts LIMIT 0").all();
+    return { db, healed: false };
+  } catch (probeErr) {
+    // Current SQLite runtime (e.g. Electron's Chromium SQLite) lacks `fts5` while the DB file
+    // contains virtual table / triggers created earlier under standalone Node.js.
+    // Cleanly strip FTS triggers + shadow tables + virtual schema entry and reopen cleanly!
+    try {
+      db.exec(`
+        DROP TRIGGER IF EXISTS trg_messages_fts_ai;
+        DROP TRIGGER IF EXISTS trg_messages_fts_ad;
+        DROP TRIGGER IF EXISTS trg_messages_fts_au;
+      `);
+    } catch {}
+
+    try {
+      db.exec("DROP TABLE IF EXISTS messages_fts");
+    } catch {
+      for (const sub of [
+        "messages_fts_data",
+        "messages_fts_idx",
+        "messages_fts_docsize",
+        "messages_fts_config",
+        "messages_fts_content",
+      ]) {
+        try {
+          db.exec(`DROP TABLE IF EXISTS ${sub}`);
+        } catch {}
+      }
+      try {
+        db.exec("PRAGMA writable_schema = ON");
+        db.exec("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%' OR tbl_name = 'messages_fts'");
+        db.exec("PRAGMA writable_schema = OFF");
+      } catch {}
+    }
+
+    try {
+      db.exec("DELETE FROM kv_settings WHERE key = 'fts_backfilled_v1'");
+    } catch {}
+
+    try {
+      db.close();
+    } catch {}
+    const reopened = new DatabaseSync(dbFilePath);
+    // Also remove 0-message broken shell sessions left behind by the prior FTS trigger failure
+    try {
+      reopened.exec(`
+        DELETE FROM sessions
+        WHERE claude_cli_sid = ''
+          AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = sessions.id)
+      `);
+    } catch {}
+    return { db: reopened, healed: true, reason: probeErr?.message || "fts5 unavailable" };
+  }
+}
+
 function runSchemaMigrations(db, dbFilePath) {
   // 1. Non-destructive column additions on existing databases
   const sessCols = new Set(db.prepare("PRAGMA table_info(sessions)").all().map((c) => c.name));
@@ -151,49 +222,60 @@ function runSchemaMigrations(db, dbFilePath) {
     CREATE INDEX IF NOT EXISTS idx_memories_scope_cwd ON memories(scope, cwd);
   `);
 
-  // 3. FTS5 (trigram) full-text index with content_text-scoped triggers
+  // 3. FTS5 (trigram) full-text index — only enabled when the current SQLite build genuinely supports fts5
+  //    (Skip creating virtual tables inside Electron builds where Chromium SQLite omits fts5)
   _ftsEnabled = false;
-  try {
-    db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-        content_text,
-        session_id UNINDEXED,
-        message_id UNINDEXED,
-        tokenize = 'trigram'
-      );
+  const isElectronRuntime = Boolean(process.versions?.electron);
+  if (!isElectronRuntime) {
+    try {
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+          content_text,
+          session_id UNINDEXED,
+          message_id UNINDEXED,
+          tokenize = 'trigram'
+        );
 
-      CREATE TRIGGER IF NOT EXISTS trg_messages_fts_ai AFTER INSERT ON messages
-      WHEN length(new.content_text) > 0
-      BEGIN
-        INSERT INTO messages_fts(content_text, session_id, message_id)
-        VALUES (new.content_text, new.session_id, new.id);
-      END;
-
-      CREATE TRIGGER IF NOT EXISTS trg_messages_fts_ad AFTER DELETE ON messages BEGIN
-        DELETE FROM messages_fts WHERE message_id = old.id;
-      END;
-
-      CREATE TRIGGER IF NOT EXISTS trg_messages_fts_au AFTER UPDATE OF content_text ON messages BEGIN
-        DELETE FROM messages_fts WHERE message_id = old.id;
-        INSERT INTO messages_fts(content_text, session_id, message_id)
-        SELECT new.content_text, new.session_id, new.id WHERE length(new.content_text) > 0;
-      END;
-    `);
-    const backfilled = db.prepare("SELECT value FROM kv_settings WHERE key='fts_backfilled_v1'").get();
-    if (!backfilled) {
-      withTransaction(db, () => {
-        db.exec("DELETE FROM messages_fts");
-        db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_messages_fts_ai AFTER INSERT ON messages
+        WHEN length(new.content_text) > 0
+        BEGIN
           INSERT INTO messages_fts(content_text, session_id, message_id)
-          SELECT content_text, session_id, id FROM messages WHERE length(content_text) > 0
+          VALUES (new.content_text, new.session_id, new.id);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_messages_fts_ad AFTER DELETE ON messages BEGIN
+          DELETE FROM messages_fts WHERE message_id = old.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_messages_fts_au AFTER UPDATE OF content_text ON messages BEGIN
+          DELETE FROM messages_fts WHERE message_id = old.id;
+          INSERT INTO messages_fts(content_text, session_id, message_id)
+          SELECT new.content_text, new.session_id, new.id WHERE length(new.content_text) > 0;
+        END;
+      `);
+      const backfilled = db.prepare("SELECT value FROM kv_settings WHERE key='fts_backfilled_v1'").get();
+      if (!backfilled) {
+        withTransaction(db, () => {
+          db.exec("DELETE FROM messages_fts");
+          db.exec(`
+            INSERT INTO messages_fts(content_text, session_id, message_id)
+            SELECT content_text, session_id, id FROM messages WHERE length(content_text) > 0
+          `);
+          db.prepare("INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('fts_backfilled_v1', '1', ?)").run(nowIso());
+        });
+      }
+      _ftsEnabled = true;
+    } catch (err) {
+      _ftsEnabled = false;
+      try {
+        db.exec(`
+          DROP TRIGGER IF EXISTS trg_messages_fts_ai;
+          DROP TRIGGER IF EXISTS trg_messages_fts_ad;
+          DROP TRIGGER IF EXISTS trg_messages_fts_au;
         `);
-        db.prepare("INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('fts_backfilled_v1', '1', ?)").run(nowIso());
-      });
+      } catch {}
+      logEvent("WARN", "db", "fts_unavailable", `FTS5 全文索引未启用，已自动回退标准索引: ${err.message}`);
     }
-    _ftsEnabled = true;
-  } catch (err) {
-    _ftsEnabled = false;
-    logEvent("WARN", "db", "fts_unavailable", `FTS5 全文索引未启用，已自动回退标准索引: ${err.message}`);
   }
 
   // 4. Reclaim bloated WAL files (>8 MB) on startup + update query planner statistics
@@ -209,7 +291,8 @@ function runSchemaMigrations(db, dbFilePath) {
 export function getDb() {
   if (_db) return _db;
   const p = getPaths();
-  const db = new DatabaseSync(p.dbFile);
+  const healRes = healUnsupportedFtsSchema(new DatabaseSync(p.dbFile), p.dbFile);
+  const db = healRes.db;
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -322,6 +405,14 @@ export function getDb() {
 
   _db = db;
   _settingsCache = null;
+  if (healRes.healed) {
+    logEvent(
+      "INFO",
+      "db",
+      "fts_schema_healed",
+      `检测到跨运行时 SQLite FTS5 差异，已自动无损修复索引与触发器 (${healRes.reason})`,
+    );
+  }
   runSchemaMigrations(db, p.dbFile);
   seedInitialData(db);
   return _db;
@@ -432,6 +523,16 @@ export function setSetting(key, value) {
   return value;
 }
 
+function resolveValidDefaultCwd() {
+  const fallback = getPaths().defaultCwd;
+  const saved = String(getSetting("default_cwd", fallback) || "").trim();
+  if (!saved) return fallback;
+  try {
+    if (fs.existsSync(saved) && fs.statSync(saved).isDirectory()) return saved;
+  } catch {}
+  return fallback;
+}
+
 export function getAllSettings() {
   return {
     system_prompt: getSetting("system_prompt", DEFAULT_SYSTEM_PROMPT),
@@ -444,7 +545,7 @@ export function getAllSettings() {
     appearance: { ...DEFAULT_APPEARANCE, ...(getSetting("appearance", DEFAULT_APPEARANCE) || {}) },
     search_engine: { ...DEFAULT_SEARCH_ENGINE, ...(getSetting("search_engine", DEFAULT_SEARCH_ENGINE) || {}) },
     wallpaper_engine: { ...DEFAULT_WALLPAPER_ENGINE, ...(getSetting("wallpaper_engine", DEFAULT_WALLPAPER_ENGINE) || {}) },
-    default_cwd: getSetting("default_cwd", getPaths().defaultCwd),
+    default_cwd: resolveValidDefaultCwd(),
   };
 }
 
@@ -482,16 +583,34 @@ export function getDatabaseStats() {
   };
 }
 
-export function optimizeDatabase({ purgeArchived = false } = {}) {
+export function optimizeDatabase({ purgeArchived = false, purgeEmptyShells = false, activeSessionIds = [] } = {}) {
   const db = getDb();
   const before = getDatabaseStats();
   let purgedSessions = 0;
+  let purgedEmptyShells = 0;
 
-  if (purgeArchived) {
-    const res = withTransaction(db, () => {
-      return stmt(db, "DELETE FROM sessions WHERE archived=1").run();
+  if (purgeArchived || purgeEmptyShells) {
+    withTransaction(db, () => {
+      if (purgeArchived) {
+        const res = stmt(db, "DELETE FROM sessions WHERE archived=1").run();
+        purgedSessions = Number(res?.changes || 0);
+      }
+      if (purgeEmptyShells) {
+        const activeSet = new Set(activeSessionIds || []);
+        const candidates = stmt(
+          db,
+          `SELECT s.id FROM sessions s
+           WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id)`,
+        ).all();
+        const delStmt = stmt(db, "DELETE FROM sessions WHERE id=?");
+        for (const row of candidates) {
+          if (!activeSet.has(row.id)) {
+            delStmt.run(row.id);
+            purgedEmptyShells += 1;
+          }
+        }
+      }
     });
-    purgedSessions = Number(res?.changes || 0);
   }
 
   if (_ftsEnabled) {
@@ -502,7 +621,7 @@ export function optimizeDatabase({ purgeArchived = false } = {}) {
   try {
     db.exec("PRAGMA optimize");
     db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-    if (purgedSessions > 0) {
+    if (purgedSessions > 0 || purgedEmptyShells > 0) {
       db.exec("VACUUM");
       db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     }
@@ -516,11 +635,12 @@ export function optimizeDatabase({ purgeArchived = false } = {}) {
     "INFO",
     "db",
     "optimized",
-    `SQLite 维护完成: ${before.total_mb}MB -> ${after.total_mb}MB (释放 ${savedMb}MB, 清理归档=${purgedSessions})`,
+    `SQLite 维护完成: ${before.total_mb}MB -> ${after.total_mb}MB (释放 ${savedMb}MB, 清理归档=${purgedSessions}, 空壳=${purgedEmptyShells})`,
   );
   return {
     ok: true,
     purged_sessions: purgedSessions,
+    purged_empty_shells: purgedEmptyShells,
     freed_mb: savedMb,
     before,
     after,
@@ -716,7 +836,7 @@ export function createSession({ title = "新会话", cwd = "", providerId = "", 
   const now = nowIso();
   const id = crypto.randomUUID();
   const activeProv = providerId ? getProvider(providerId) : getActiveProvider();
-  const finalCwd = cwd || getSetting("default_cwd", getPaths().defaultCwd);
+  const finalCwd = cwd || resolveValidDefaultCwd();
   stmt(
     db,
     `INSERT INTO sessions (id, title, cwd, provider_id, model, thinking_level, pinned, created_at, updated_at)
@@ -767,6 +887,12 @@ export function updateSessionMeta(id, patch) {
 export function deleteSession(id) {
   const db = getDb();
   stmt(db, "UPDATE sessions SET archived=1, updated_at=? WHERE id=?").run(nowIso(), id);
+  return true;
+}
+
+export function hardDeleteSession(id) {
+  const db = getDb();
+  stmt(db, "DELETE FROM sessions WHERE id=?").run(id);
   return true;
 }
 

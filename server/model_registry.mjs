@@ -223,8 +223,19 @@ export function buildApiEndpoint(baseUrl, kind, suffix) {
   let clean = String(baseUrl || "").trim().replace(/\/+$/, "");
   if (!clean) {
     clean = kind === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com";
+  } else if (!/^https?:\/\//i.test(clean)) {
+    const isLocal = /^(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(clean);
+    clean = `${isLocal ? "http" : "https"}://${clean}`;
   }
-  if (clean.endsWith("/v1")) {
+  // Strip accidentally pasted endpoint tails (e.g. `.../v1/chat/completions`, `.../v1/messages`, `.../v1/models`)
+  clean = clean
+    .replace(/\/chat\/completions$/i, "")
+    .replace(/\/messages\/count_tokens$/i, "")
+    .replace(/\/messages$/i, "")
+    .replace(/\/models$/i, "")
+    .replace(/\/+$/, "");
+
+  if (/\/v\d+(?:beta\d*)?$/i.test(clean)) {
     return `${clean}${suffix}`;
   }
   return `${clean}/v1${suffix}`;

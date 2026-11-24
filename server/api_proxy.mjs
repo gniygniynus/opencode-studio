@@ -17,6 +17,26 @@ function sendSse(res, eventName, dataObj) {
   res.write(`event: ${eventName}\ndata: ${JSON.stringify(dataObj)}\n\n`);
 }
 
+function sanitizeOpenAiJsonSchema(schema) {
+  if (!schema || typeof schema !== "object") {
+    return { type: "object", properties: {} };
+  }
+  const cleanNode = (node) => {
+    if (Array.isArray(node)) return node.map(cleanNode);
+    if (!node || typeof node !== "object") return node;
+    const copy = {};
+    for (const [k, v] of Object.entries(node)) {
+      if (k === "$schema" || k === "$id") continue;
+      copy[k] = cleanNode(v);
+    }
+    return copy;
+  };
+  const root = cleanNode(schema);
+  if (!root.type) root.type = "object";
+  if (root.type === "object" && !root.properties) root.properties = {};
+  return root;
+}
+
 function anthropicToOpenAiBody(antBody, provider, thinkingHint = "") {
   let model = antBody.model || provider.default_model || "";
   // If Claude Code internally issues an auxiliary request for a haiku/claude model that this
@@ -143,7 +163,7 @@ function anthropicToOpenAiBody(antBody, provider, thinkingHint = "") {
         function: {
           name: t.name,
           description: t.description || t.name,
-          parameters: t.input_schema || { type: "object", properties: {} },
+          parameters: sanitizeOpenAiJsonSchema(t.input_schema),
         },
       }));
   }

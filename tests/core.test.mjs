@@ -855,8 +855,8 @@ describe("OpenCode Studio Core Suite", () => {
     const nestedBinPath = path.join(nestedPkgDir, binName);
     fs.writeFileSync(nestedBinPath, Buffer.alloc(64, 0x7f));
 
-    const origResourcesPath = process.resourcesPath;
-    process.resourcesPath = mockResDir;
+    const origDesc = Object.getOwnPropertyDescriptor(process, "resourcesPath");
+    Object.defineProperty(process, "resourcesPath", { value: mockResDir, configurable: true, writable: true });
     try {
       clearRuntimeCache();
       const fastSnap = getClaudeRuntimeAndAuth(false);
@@ -865,8 +865,8 @@ describe("OpenCode Studio Core Suite", () => {
       assert.equal(path.resolve(fastSnap.binary), path.resolve(nestedBinPath));
       assert.ok(String(fastSnap.version || "").includes("2.1.323"));
     } finally {
-      if (origResourcesPath === undefined) delete process.resourcesPath;
-      else process.resourcesPath = origResourcesPath;
+      if (origDesc) Object.defineProperty(process, "resourcesPath", origDesc);
+      else delete process.resourcesPath;
       clearRuntimeCache();
     }
 
@@ -878,5 +878,36 @@ describe("OpenCode Studio Core Suite", () => {
     }).then((r) => r.json());
     assert.equal(resetRes.ok, true);
     assert.ok(resetRes.runtime);
+  });
+
+  it("normalizes pasted relay endpoints and cleans up 0-turn empty shell sessions via /api/system/cleanup-legacy", async () => {
+    const { buildApiEndpoint } = await import("../server/model_registry.mjs");
+    assert.equal(
+      buildApiEndpoint("https://relay.example.com/v1/chat/completions", "openai", "/chat/completions"),
+      "https://relay.example.com/v1/chat/completions",
+    );
+    assert.equal(
+      buildApiEndpoint("relay.example.com", "openai", "/chat/completions"),
+      "https://relay.example.com/v1/chat/completions",
+    );
+    assert.equal(
+      buildApiEndpoint("https://ark.cn-beijing.volces.com/api/v3", "openai", "/chat/completions"),
+      "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+    );
+    assert.equal(
+      buildApiEndpoint("127.0.0.1:3000/v1/messages", "anthropic", "/messages"),
+      "http://127.0.0.1:3000/v1/messages",
+    );
+
+    // Create an empty 0-turn shell session and verify /api/system/cleanup-legacy removes it cleanly
+    const emptySess = createSession({ title: "空壳测试会话", cwd: tmpWorkdir });
+    assert.ok(emptySess.id);
+    const cleanRes = await fetch(`${studioServer.url}/api/system/cleanup-legacy`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ purge_archived: false }),
+    }).then((r) => r.json());
+    assert.equal(cleanRes.ok, true);
+    assert.ok(cleanRes.purged_empty_shells >= 1, "must remove 0-turn empty shell sessions");
   });
 });

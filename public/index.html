@@ -667,8 +667,9 @@
               <div class="section-label" style="margin:0;">本地 SQLite 数据库存储与索引维护</div>
               <p class="modal-sub" id="db-stats-line">正在读取数据库状态…</p>
             </div>
-            <div class="updater-controls">
-              <button id="btn-db-optimize" class="btn-secondary sm" title="合并 WAL 日志并优化 FTS5 全文索引与查询计划">⚡ 合并 WAL 与优化索引</button>
+            <div class="updater-controls" style="flex-wrap:wrap;">
+              <button id="btn-cleanup-legacy" class="btn-primary sm" title="一键清理便携版旧临时解包目录、0轮空壳会话、壁纸预览缓存并压缩 WAL（完全保留正常对话、记忆与供应商配置）">🧼 一键清理旧版残留与缓存</button>
+              <button id="btn-db-optimize" class="btn-secondary sm" title="合并 WAL 日志并优化索引与查询计划">⚡ 合并 WAL 与优化索引</button>
               <button id="btn-db-purge-archived" class="btn-danger sm" title="彻底物理清除已移入回收状态的旧会话并回收磁盘体积">🧹 清理已删除归档</button>
             </div>
           </div>
@@ -712,7 +713,7 @@
           <div class="section-header-row">
             <div>
               <div class="section-label" style="margin:0;">OpenCode Studio 项目最新版本</div>
-              <p class="modal-sub" id="updater-current-line">当前版本：v2.2.1</p>
+              <p class="modal-sub" id="updater-current-line">当前版本：v2.2.2</p>
             </div>
             <div class="updater-controls">
               <button id="btn-check-update" class="btn-primary sm">检测最新版本</button>

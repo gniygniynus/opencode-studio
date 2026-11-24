@@ -244,6 +244,98 @@ function clearWallpaperPreviewCache(dir) {
   return { removed, freed_mb: Math.round((freedBytes / (1024 * 1024)) * 100) / 100 };
 }
 
+function cleanupLegacyResidues(paths, activeSessionIds = [], purgeArchived = false) {
+  let portableDirsRemoved = 0;
+  let tempFreedBytes = 0;
+  const currentExecDir = path.resolve(path.dirname(process.execPath || "")).toLowerCase();
+
+  const dirSizeBytes = (dirPath, depth = 0) => {
+    if (depth > 4) return 0;
+    let sum = 0;
+    try {
+      for (const ent of fs.readdirSync(dirPath, { withFileTypes: true })) {
+        const full = path.join(dirPath, ent.name);
+        if (ent.isFile()) {
+          try {
+            sum += fs.statSync(full).size || 0;
+          } catch {}
+        } else if (ent.isDirectory()) {
+          sum += dirSizeBytes(full, depth + 1);
+        }
+      }
+    } catch {}
+    return sum;
+  };
+
+  // 1. Clean exited electron-builder portable temp extraction folders (`%TEMP%/...` containing `OpenCode Studio.exe`)
+  try {
+    const tmpRoot = os.tmpdir();
+    for (const ent of fs.readdirSync(tmpRoot, { withFileTypes: true })) {
+      if (!ent.isDirectory()) continue;
+      const candDir = path.join(tmpRoot, ent.name);
+      if (path.resolve(candDir).toLowerCase() === currentExecDir) continue;
+      const markerExe = path.join(candDir, "OpenCode Studio.exe");
+      if (!fs.existsSync(markerExe)) continue;
+      const bytes = dirSizeBytes(candDir);
+      try {
+        fs.rmSync(candDir, { recursive: true, force: true });
+        if (!fs.existsSync(candDir)) {
+          portableDirsRemoved += 1;
+          tempFreedBytes += bytes;
+        }
+      } catch {
+        // Still running / locked by OS — safely skip
+      }
+    }
+  } catch {}
+
+  // 2. Clean leftover temporary system prompt files in logsDir (`prompt_*.txt` older than 2 minutes)
+  let orphanPromptsRemoved = 0;
+  try {
+    const cutoff = Date.now() - 2 * 60 * 1000;
+    for (const f of fs.readdirSync(paths.logsDir)) {
+      if (!/^prompt_.*\.txt$/i.test(f)) continue;
+      const fp = path.join(paths.logsDir, f);
+      try {
+        const st = fs.statSync(fp);
+        if (st.mtimeMs < cutoff) {
+          tempFreedBytes += st.size || 0;
+          fs.unlinkSync(fp);
+          orphanPromptsRemoved += 1;
+        }
+      } catch {}
+    }
+  } catch {}
+
+  // 3. Clear wallpaper preview cache (`wp_cache_*`, keeps active offline wallpaper & user uploads intact)
+  const wpCleared = clearWallpaperPreviewCache(paths.backgroundsDir);
+
+  // 4. Purge 0-turn empty shell sessions (+ optional archived sessions) & compact SQLite WAL
+  const dbRes = optimizeDatabase({
+    purgeArchived: Boolean(purgeArchived),
+    purgeEmptyShells: true,
+    activeSessionIds,
+  });
+
+  const tempFreedMb = Math.round((tempFreedBytes / (1024 * 1024)) * 100) / 100;
+  const totalFreedMb = Math.round(((tempFreedMb + (wpCleared.freed_mb || 0) + (dbRes.freed_mb || 0))) * 100) / 100;
+
+  return {
+    ok: true,
+    portable_dirs_removed: portableDirsRemoved,
+    orphan_prompts_removed: orphanPromptsRemoved,
+    wp_cache_removed: wpCleared.removed || 0,
+    purged_empty_shells: dbRes.purged_empty_shells || 0,
+    purged_sessions: dbRes.purged_sessions || 0,
+    temp_freed_mb: tempFreedMb,
+    wp_cache_freed_mb: wpCleared.freed_mb || 0,
+    db_freed_mb: dbRes.freed_mb || 0,
+    total_freed_mb: totalFreedMb,
+    after_db: dbRes.after,
+    wallpaper_storage: getWallpaperStorageStats(paths.backgroundsDir, true),
+  };
+}
+
 function extFromMediaMime(mime, urlHint = "") {
   const m = String(mime || "").toLowerCase().split(";")[0].trim();
   const map = {
@@ -261,37 +353,52 @@ function extFromMediaMime(mime, urlHint = "") {
   return extMatch ? `.${extMatch[1].toLowerCase()}` : ".jpg";
 }
 
+const _inflightMediaFetches = new Map();
+
 async function fetchPublicMediaBuffer(rawUrl, fbUrl = "") {
-  const proxyUrl = getAllSettings().search_engine?.proxy_url || "";
-  const tryFetch = async (targetUrl) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 14000);
+  const inflightKey = `${rawUrl}||${fbUrl}`;
+  if (_inflightMediaFetches.has(inflightKey)) {
+    return await _inflightMediaFetches.get(inflightKey);
+  }
+  const task = (async () => {
+    const proxyUrl = getAllSettings().search_engine?.proxy_url || "";
+    const tryFetch = async (targetUrl) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10000);
+      try {
+        const originRef = new URL(targetUrl).origin + "/";
+        const upstream = await proxyFetch(targetUrl, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+            Referer: originRef,
+            Accept: "image/avif,image/webp,image/apng,image/gif,image/*,video/webm,video/mp4,*/*;q=0.8",
+          },
+          signal: controller.signal,
+          proxyUrl,
+        });
+        if (!upstream.ok) throw new Error(`HTTP ${upstream.status}`);
+        const mime = (upstream.headers.get("content-type") || "image/jpeg").split(";")[0];
+        if (!mime.startsWith("image/") && !mime.startsWith("video/")) throw new Error(`不支持的媒体类型 ${mime}`);
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        if (buf.length > 35 * 1024 * 1024) throw new Error("超过 35MB 限制");
+        return { buf, mime };
+      } finally {
+        clearTimeout(timer);
+      }
+    };
     try {
-      const originRef = new URL(targetUrl).origin + "/";
-      const upstream = await proxyFetch(targetUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-          Referer: originRef,
-          Accept: "image/avif,image/webp,image/apng,image/gif,image/*,video/webm,video/mp4,*/*;q=0.8",
-        },
-        signal: controller.signal,
-        proxyUrl,
-      });
-      if (!upstream.ok) throw new Error(`HTTP ${upstream.status}`);
-      const mime = (upstream.headers.get("content-type") || "image/jpeg").split(";")[0];
-      if (!mime.startsWith("image/") && !mime.startsWith("video/")) throw new Error(`不支持的媒体类型 ${mime}`);
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      if (buf.length > 35 * 1024 * 1024) throw new Error("超过 35MB 限制");
-      return { buf, mime };
-    } finally {
-      clearTimeout(timer);
+      return await tryFetch(rawUrl);
+    } catch (e1) {
+      if (fbUrl && isPublicMediaUrl(fbUrl)) return await tryFetch(fbUrl);
+      throw e1;
     }
-  };
+  })();
+
+  _inflightMediaFetches.set(inflightKey, task);
   try {
-    return await tryFetch(rawUrl);
-  } catch (e1) {
-    if (fbUrl && isPublicMediaUrl(fbUrl)) return await tryFetch(fbUrl);
-    throw e1;
+    return await task;
+  } finally {
+    _inflightMediaFetches.delete(inflightKey);
   }
 }
 
@@ -824,7 +931,22 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       }
       if (method === "POST" && pathname === "/api/db/optimize") {
         const body = await readJsonBody(req).catch(() => ({}));
-        const result = optimizeDatabase({ purgeArchived: Boolean(body.purge_archived) });
+        const result = optimizeDatabase({
+          purgeArchived: Boolean(body.purge_archived),
+          purgeEmptyShells: Boolean(body.purge_empty_shells),
+          activeSessionIds: orchestrator.runningSessionIds(),
+        });
+        if (result.purged_empty_shells > 0) {
+          broadcast({ type: "session_meta_updated" });
+        }
+        return sendJson(res, 200, result);
+      }
+      if (method === "POST" && pathname === "/api/system/cleanup-legacy") {
+        const body = await readJsonBody(req).catch(() => ({}));
+        const result = cleanupLegacyResidues(paths, orchestrator.runningSessionIds(), Boolean(body.purge_archived));
+        if (result.purged_empty_shells > 0 || result.purged_sessions > 0) {
+          broadcast({ type: "session_meta_updated" });
+        }
         return sendJson(res, 200, result);
       }
 
@@ -1590,43 +1712,59 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       } catch {
         return;
       }
-      if (msg.type === "ping") {
-        ws.send(JSON.stringify({ type: "pong" }));
-      } else if (msg.type === "send_message") {
-        await orchestrator.sendMessage({
-          sessionId: msg.session_id || "",
-          text: msg.text || "",
-          images: msg.images || [],
-          cwd: msg.cwd || "",
-          providerId: msg.provider_id || "",
-          model: msg.model || "",
-          thinkingLevel: msg.thinking_level || "auto",
-          webSearchEnabled: msg.web_search !== undefined ? Boolean(msg.web_search) : null,
+      try {
+        if (msg.type === "ping") {
+          ws.send(JSON.stringify({ type: "pong" }));
+        } else if (msg.type === "send_message") {
+          await orchestrator.sendMessage({
+            sessionId: msg.session_id || "",
+            text: msg.text || "",
+            images: msg.images || [],
+            cwd: msg.cwd || "",
+            providerId: msg.provider_id || "",
+            model: msg.model || "",
+            thinkingLevel: msg.thinking_level || "auto",
+            webSearchEnabled: msg.web_search !== undefined ? Boolean(msg.web_search) : null,
+          });
+        } else if (msg.type === "edit_resend") {
+          await orchestrator.editAndResend({
+            sessionId: msg.session_id,
+            messageId: msg.message_id,
+            newText: msg.new_text,
+            images: msg.images ?? null,
+            providerId: msg.provider_id || "",
+            model: msg.model || "",
+            thinkingLevel: msg.thinking_level || "",
+            webSearchEnabled: msg.web_search !== undefined ? Boolean(msg.web_search) : null,
+          });
+        } else if (msg.type === "regenerate_reply") {
+          await orchestrator.regenerateReply({
+            sessionId: msg.session_id,
+            assistantMessageId: msg.assistant_message_id,
+            providerId: msg.provider_id || "",
+            model: msg.model || "",
+            thinkingLevel: msg.thinking_level || "",
+            webSearchEnabled: msg.web_search !== undefined ? Boolean(msg.web_search) : null,
+          });
+        } else if (msg.type === "stop_turn") {
+          orchestrator.stopTurn(msg.session_id);
+        } else if (msg.type === "confirm_response") {
+          orchestrator.resolveConfirm(msg.confirm_id, Boolean(msg.approved));
+        }
+      } catch (err) {
+        const sid = msg?.session_id || "";
+        const classified = classifyError({
+          message: err?.message || String(err),
+          sessionId: sid,
+          codeHint: err?.code || "ERR_WS_HANDLER",
         });
-      } else if (msg.type === "edit_resend") {
-        await orchestrator.editAndResend({
-          sessionId: msg.session_id,
-          messageId: msg.message_id,
-          newText: msg.new_text,
-          images: msg.images ?? null,
-          providerId: msg.provider_id || "",
-          model: msg.model || "",
-          thinkingLevel: msg.thinking_level || "",
-          webSearchEnabled: msg.web_search !== undefined ? Boolean(msg.web_search) : null,
+        logEvent("ERROR", "ws", "handler_error", `WS ${msg?.type || "unknown"} 异常: ${classified.cause}`, {
+          sessionId: sid,
+          layer: "websocket",
         });
-      } else if (msg.type === "regenerate_reply") {
-        await orchestrator.regenerateReply({
-          sessionId: msg.session_id,
-          assistantMessageId: msg.assistant_message_id,
-          providerId: msg.provider_id || "",
-          model: msg.model || "",
-          thinkingLevel: msg.thinking_level || "",
-          webSearchEnabled: msg.web_search !== undefined ? Boolean(msg.web_search) : null,
-        });
-      } else if (msg.type === "stop_turn") {
-        orchestrator.stopTurn(msg.session_id);
-      } else if (msg.type === "confirm_response") {
-        orchestrator.resolveConfirm(msg.confirm_id, Boolean(msg.approved));
+        try {
+          ws.send(JSON.stringify({ type: "turn_error", session_id: sid, error: classified }));
+        } catch {}
       }
     });
 

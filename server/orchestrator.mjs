@@ -19,11 +19,13 @@ import {
   getProvider,
   getSessionMeta,
   getSessionTimeline,
+  hardDeleteSession,
   updateSessionMeta,
 } from "./db.mjs";
 import { runApiCompact, runOpenCodeApiTurn } from "./engine_api.mjs";
 import { cleanupClaudeSessionFiles, detectClaudeRuntime, runNativeClaudeCodeTurn } from "./claude_runtime.mjs";
 import { classifyError, logEvent, newReqId } from "./logger.mjs";
+import { getPaths } from "./paths.mjs";
 
 export class SessionOrchestrator {
   constructor({ broadcast, mcpManager, getPort }) {
@@ -109,6 +111,7 @@ export class SessionOrchestrator {
 
     let sid = sessionId;
     let meta = sid ? getSessionMeta(sid) : null;
+    let createdNewSession = false;
     if (!meta) {
       const firstAtt = images?.[0];
       const attFallback = firstAtt?.kind === "text" || firstAtt?.kind === "file"
@@ -123,7 +126,7 @@ export class SessionOrchestrator {
         thinkingLevel,
       });
       sid = meta.id;
-      this.broadcast({ type: "session_created", session: meta });
+      createdNewSession = true;
     } else if (cwd && cwd !== meta.cwd) {
       meta = updateSessionMeta(sid, { cwd });
     }
@@ -141,26 +144,49 @@ export class SessionOrchestrator {
 
     // Handle /compact slash command cleanly across engines
     if (cleanText === "/compact" || cleanText.startsWith("/compact ")) {
+      if (createdNewSession) this.broadcast({ type: "session_created", session: meta });
       return await this._handleCompact(sid, providerId, model);
     }
 
-    const prevTimeline = getSessionTimeline(sid);
-    const parentId = prevTimeline?.last_message_id || null;
+    let userMsg;
+    let nextTimeline;
+    try {
+      const prevTimeline = getSessionTimeline(sid);
+      const parentId = prevTimeline?.last_message_id || null;
 
-    // Auto-title if still default
-    if (meta.title === "新会话" && cleanText) {
-      updateSessionMeta(sid, { title: cleanText.replace(/\s+/g, " ").slice(0, 64) });
+      // Auto-title if still default
+      if (meta.title === "新会话" && cleanText) {
+        meta = updateSessionMeta(sid, { title: cleanText.replace(/\s+/g, " ").slice(0, 64) });
+      }
+
+      userMsg = addMessage({
+        sessionId: sid,
+        parentId,
+        role: "user",
+        contentText: cleanText,
+        images: images || [],
+      });
+      nextTimeline = getSessionTimeline(sid);
+    } catch (err) {
+      if (createdNewSession && sid) {
+        try {
+          hardDeleteSession(sid);
+        } catch {}
+      }
+      const classified = classifyError({
+        message: `保存会话消息失败: ${err?.message || err}`,
+        sessionId: createdNewSession ? "" : sid,
+        codeHint: "ERR_DB_WRITE",
+      });
+      this.lastError = classified;
+      logEvent("ERROR", "orchestrator", "send_message_db_err", classified.cause, { sessionId: sid });
+      this.broadcast({ type: "turn_error", session_id: createdNewSession ? "" : sid, error: classified });
+      return { ok: false, error: classified };
     }
 
-    const userMsg = addMessage({
-      sessionId: sid,
-      parentId,
-      role: "user",
-      contentText: cleanText,
-      images: images || [],
-    });
-
-    const nextTimeline = getSessionTimeline(sid);
+    if (createdNewSession) {
+      this.broadcast({ type: "session_created", session: meta });
+    }
     this.broadcast({
       type: "message_added",
       session_id: sid,
@@ -378,26 +404,48 @@ export class SessionOrchestrator {
     prefetchedTimeline = null,
   }) {
     const reqId = newReqId();
-    const meta = getSessionMeta(sessionId);
+    let meta = getSessionMeta(sessionId);
     const provider = (providerId ? getProvider(providerId, true) : null) || getActiveProvider(true);
 
     if (!provider || (provider.kind !== "claude_native" && !provider.api_key && !provider.base_url)) {
       const err = classifyError({ codeHint: "ERR_NO_PROVIDER", sessionId, reqId });
       this.lastError = err;
-      this.broadcast({ type: "turn_error", session_id: sessionId, error: err });
+      this.broadcast({
+        type: "turn_error",
+        session_id: sessionId,
+        error: err,
+        timeline: prefetchedTimeline || getSessionTimeline(sessionId),
+      });
       return;
     }
 
-    if (!fs.existsSync(meta.cwd)) {
-      const err = classifyError({
-        message: `工作目录不存在: ${meta.cwd}`,
-        codeHint: "ERR_CWD_INVALID",
-        sessionId,
-        reqId,
-      });
-      this.lastError = err;
-      this.broadcast({ type: "turn_error", session_id: sessionId, error: err });
-      return;
+    if (!meta.cwd || !fs.existsSync(meta.cwd)) {
+      const fallbackCwd = getPaths().defaultCwd;
+      if (fallbackCwd && fs.existsSync(fallbackCwd)) {
+        const oldCwd = meta.cwd;
+        meta = updateSessionMeta(sessionId, { cwd: fallbackCwd });
+        if (prefetchedTimeline?.session) prefetchedTimeline.session = meta;
+        logEvent("WARN", "orchestrator", "cwd_auto_healed", `原工作目录不存在 (${oldCwd})，已平滑回退至 ${fallbackCwd}`, {
+          sessionId,
+          reqId,
+        });
+        this.broadcast({ type: "session_meta_updated", session: meta });
+      } else {
+        const err = classifyError({
+          message: `工作目录不存在: ${meta.cwd}`,
+          codeHint: "ERR_CWD_INVALID",
+          sessionId,
+          reqId,
+        });
+        this.lastError = err;
+        this.broadcast({
+          type: "turn_error",
+          session_id: sessionId,
+          error: err,
+          timeline: prefetchedTimeline || getSessionTimeline(sessionId),
+        });
+        return;
+      }
     }
 
     const effectiveModel = model || provider.default_model || provider.models?.[0] || "sonnet";

@@ -64,11 +64,15 @@ export async function resolveSearchEngine(requested = "") {
     return { active: "proxy", requested: pref, label: "代理引擎" };
   }
 
-  // Auto-probe global network (cached 60s, invalidated immediately if proxy_url changes)
+  // Auto-probe global media/store reachability (cached 60s, invalidated immediately if proxy_url changes).
+  // Note: `api.github.com` is intermittently reachable in mainland China while `wallhaven.cc` / `wikimedia.org`
+  // are blocked without a proxy — probing `wallhaven.cc` when no proxy is configured prevents false-positive
+  // 3.5s~14s timeouts on first wallpaper load!
   const proxyKey = String(saved.proxy_url || "").trim();
   if (Date.now() - _globalProbeCache.checkedAt > 60_000 || _globalProbeCache.proxyKey !== proxyKey) {
     try {
-      await fetchWithTimeout("https://api.github.com/zen", { timeoutMs: 2200, useProxy: true });
+      const probeUrl = proxyKey ? "https://api.github.com/zen" : "https://wallhaven.cc/api/v1/tag/1";
+      await fetchWithTimeout(probeUrl, { timeoutMs: proxyKey ? 2200 : 1500, useProxy: true });
       _globalProbeCache = { reachable: true, checkedAt: Date.now(), proxyKey };
     } catch {
       _globalProbeCache = { reachable: false, checkedAt: Date.now(), proxyKey };
@@ -457,24 +461,6 @@ export const CURATED_WALLPAPERS = [
     preview_css: "linear-gradient(125deg, #e6f4ea 0%, #eef6f9 52%, #f4f1ea 100%)",
   },
   ...LIVE_WALLPAPERS,
-  {
-    id: "wp-wm-alps",
-    name: "雪峰晨曦（Wikimedia CC）",
-    author: "Wikimedia Commons",
-    license: "CC BY-SA",
-    type: "image",
-    thumb: proxyImageUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg?width=640"),
-    url: proxyImageUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg?width=1920"),
-  },
-  {
-    id: "wp-wm-aurora",
-    name: "极光夜空（Wikimedia CC）",
-    author: "Wikimedia Commons",
-    license: "CC BY",
-    type: "image",
-    thumb: proxyImageUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Polarlicht_2.jpg?width=640"),
-    url: proxyImageUrl("https://commons.wikimedia.org/wiki/Special:FilePath/Polarlicht_2.jpg?width=1920"),
-  },
 ];
 
 // Chinese -> English wallpaper keyword mapping so Wallhaven returns rich 4K hits for Chinese queries
@@ -1534,7 +1520,10 @@ export async function searchWallpaperStore(query = "", page = 1, category = "all
     pageNum === 1 && !q && (category === "all" || category === "scenery")
       ? (await fetchBingOfficialUhdWallpapers()).slice(0, category === "scenery" ? 10 : 8)
       : [];
-  const baseItems = pageNum === 1 && !q && category === "all" ? [...CURATED_WALLPAPERS, ...officialUhd] : officialUhd;
+  const baseItems =
+    pageNum === 1 && !q && category === "all"
+      ? [CURATED_WALLPAPERS[0], ...officialUhd, ...CURATED_WALLPAPERS.slice(1)]
+      : officialUhd;
   return {
     ok: true,
     mode: q ? "online" : "curated+online",
