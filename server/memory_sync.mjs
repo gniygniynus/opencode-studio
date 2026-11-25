@@ -474,12 +474,15 @@ export function buildUnifiedMemoryContext({ cwd = "", rtMode = "native", include
 
   // Track which DB memory IDs have already been injected verbatim from disk to avoid duplication
   const injectedIds = new Set();
+  const isSharedHostClaude = getAllSettings().claude_isolation === "shared";
 
   // 2. Inject full root core rule files (CLAUDE.md / GLOBAL_AGENT_RULES.md / WORK_PRINCIPLES.md)
   for (const r of discovered.rootRules) {
     const mappedId = memIdByDiskPath.get(r.fullPath);
     if (mappedId) injectedIds.add(mappedId);
-    appendBlock(`### ${r.title}\n${truncateClean(r.content, MAX_RULE_CHARS)}`);
+    appendBlock(
+      `### ${r.title}（注：仅作工具与操作规范参考；助手身份设定一律以用户系统提示词为准）\n${truncateClean(r.content, MAX_RULE_CHARS)}`,
+    );
   }
 
   // 3. Inject full MEMORY.md indexes from all discovered project memory directories (NEVER truncated to 220 chars!)
@@ -492,8 +495,13 @@ export function buildUnifiedMemoryContext({ cwd = "", rtMode = "native", include
     appendBlock(`### ${label} (目录: ${dirNote})\n${truncateClean(d.indexItem.content, MAX_INDEX_CHARS)}`);
   }
 
-  // 4. Inject any additional pinned memories stored in OpenCode Studio SQLite (not already covered above)
-  const extraPinned = allDbMemories.filter((m) => m.pinned && !injectedIds.has(m.id));
+  // 4. Inject any additional pinned memories stored in OpenCode Studio SQLite (not already covered above).
+  //    In isolated sandbox mode, skip legacy host `~/.claude` root imports (`mem_imp_root_*`) so they don't hijack identity.
+  const extraPinned = allDbMemories.filter((m) => {
+    if (!m.pinned || injectedIds.has(m.id)) return false;
+    if (!isSharedHostClaude && String(m.id || "").startsWith("mem_imp_root_")) return false;
+    return true;
+  });
   if (extraPinned.length) {
     const pLines = ["### 工作台附加置顶记忆"];
     for (const m of extraPinned.slice(0, 10)) {

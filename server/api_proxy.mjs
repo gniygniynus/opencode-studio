@@ -9,12 +9,107 @@
  * Completely replaces external switchers (like CC Switch) without touching ~/.claude/settings.json.
  */
 
-import { getProvider } from "./db.mjs";
+import { getAllSettings, getProvider } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
 import { buildApiEndpoint, detectModelCapabilities } from "./model_registry.mjs";
 
 function sendSse(res, eventName, dataObj) {
   res.write(`event: ${eventName}\ndata: ${JSON.stringify(dataObj)}\n\n`);
+}
+
+const CLAUDE_SDK_IDENTITY_RE =
+  /^(?:You are a Claude agent,\s*built on Anthropic's Claude Agent SDK\.?|You are Claude Code,\s*Anthropic's official CLI for Claude\.?)\s*$/gim;
+const CLAUDE_GIT_ATTR_REMINDER_RE =
+  /<system-reminder>\s*Attribution for git commits and pull requests[\s\S]*?<\/system-reminder>\s*/gi;
+
+/**
+ * Scrub hardcoded Claude Agent SDK / CLI identity injections when the user configured
+ * `prompt_mode === "replace"` (or `"append"`), ensuring custom system prompts govern 100%!
+ */
+export function enforceCustomPromptOnAnthropicBody(antBody, settingsOverride = null) {
+  if (!antBody || typeof antBody !== "object") return antBody;
+  const settings = settingsOverride || getAllSettings();
+  const mode = settings.prompt_mode || "replace";
+  const customPrompt = String(settings.system_prompt || "").trim();
+  const isReplace = mode === "replace";
+
+  const cleanSystemPiece = (txt) => {
+    let s = String(txt || "")
+      .split(/\r?\n/)
+      .filter((line) => !/^x-anthropic-billing-header:/i.test(line.trim()))
+      .join("\n");
+    if (isReplace) {
+      s = s.replace(CLAUDE_SDK_IDENTITY_RE, "");
+    }
+    return s.trim();
+  };
+
+  // 1. Clean & anchor `antBody.system`
+  if (typeof antBody.system === "string") {
+    let cleaned = cleanSystemPiece(antBody.system);
+    if (isReplace && customPrompt) {
+      if (!cleaned.includes(customPrompt)) {
+        cleaned = `${customPrompt}\n\n${cleaned}`.trim();
+      }
+      cleaned += `\n\n[身份与回复最高准则：请严格以用户设定的系统提示词为准（除非上述自定义提示词明确要求，否则回答“你是谁”或自我介绍时严禁自称 Claude Code 或 Anthropic 命令行助手）。]`;
+    }
+    antBody.system = cleaned;
+  } else if (Array.isArray(antBody.system)) {
+    const nextBlocks = [];
+    for (const blk of antBody.system) {
+      if (typeof blk === "string") {
+        const c = cleanSystemPiece(blk);
+        if (c) nextBlocks.push({ type: "text", text: c });
+      } else if (blk && typeof blk === "object") {
+        const c = cleanSystemPiece(blk.text || "");
+        if (c) nextBlocks.push({ ...blk, text: c });
+      }
+    }
+    if (isReplace && customPrompt) {
+      const joined = nextBlocks.map((b) => b.text || "").join("\n");
+      if (!joined.includes(customPrompt)) {
+        nextBlocks.unshift({ type: "text", text: customPrompt });
+      }
+      nextBlocks.push({
+        type: "text",
+        text: `[身份与回复最高准则：请严格以用户设定的系统提示词为准（除非上述自定义提示词明确要求，否则回答“你是谁”或自我介绍时严禁自称 Claude Code 或 Anthropic 命令行助手）。]`,
+      });
+    }
+    antBody.system = nextBlocks;
+  }
+
+  // 2. Strip Claude CLI's hardcoded git attribution `<system-reminder>` from user messages in non-native mode
+  if (mode !== "native" && Array.isArray(antBody.messages)) {
+    for (const m of antBody.messages) {
+      if (m?.role !== "user") continue;
+      if (typeof m.content === "string") {
+        m.content = m.content.replace(CLAUDE_GIT_ATTR_REMINDER_RE, "").trim() || m.content;
+      } else if (Array.isArray(m.content)) {
+        const cleanedContent = [];
+        for (const b of m.content) {
+          if (b?.type === "text" && typeof b.text === "string") {
+            const stripped = b.text.replace(CLAUDE_GIT_ATTR_REMINDER_RE, "");
+            if (stripped.trim()) {
+              cleanedContent.push({ ...b, text: stripped });
+            }
+          } else {
+            cleanedContent.push(b);
+          }
+        }
+        if (cleanedContent.length) m.content = cleanedContent;
+      }
+    }
+  }
+
+  // 3. Neutralize `Claude Code` brand mentions inside tool descriptions in `replace` mode
+  if (isReplace && Array.isArray(antBody.tools)) {
+    antBody.tools = antBody.tools.map((t) => {
+      if (!t || typeof t.description !== "string" || !/Claude Code/i.test(t.description)) return t;
+      return { ...t, description: t.description.replace(/Claude Code/gi, "the assistant") };
+    });
+  }
+
+  return antBody;
 }
 
 function sanitizeOpenAiJsonSchema(schema) {
@@ -38,6 +133,7 @@ function sanitizeOpenAiJsonSchema(schema) {
 }
 
 function anthropicToOpenAiBody(antBody, provider, thinkingHint = "") {
+  enforceCustomPromptOnAnthropicBody(antBody);
   let model = antBody.model || provider.default_model || "";
   // If Claude Code internally issues an auxiliary request for a haiku/claude model that this
   // OpenAI-compatible provider doesn't host, cleanly fall back to the provider's selected default model.
@@ -638,11 +734,14 @@ export async function handleProviderProxyRequest(req, res, providerId, subpath, 
   try {
     if (provider.kind === "anthropic") {
       let bodyToSend = rawBody;
-      if (thinkingHint === "off" && rawBody) {
+      if (rawBody) {
         try {
           const parsed = JSON.parse(rawBody);
-          if (parsed && typeof parsed === "object" && parsed.thinking) {
-            delete parsed.thinking;
+          if (parsed && typeof parsed === "object") {
+            enforceCustomPromptOnAnthropicBody(parsed);
+            if (thinkingHint === "off" && parsed.thinking) {
+              delete parsed.thinking;
+            }
             bodyToSend = JSON.stringify(parsed);
           }
         } catch {}

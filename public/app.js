@@ -1323,7 +1323,10 @@
 
     const head = document.createElement("div");
     head.className = "msg-assistant-head";
-    const engLabel = item.engine === "claude_code" || item.engine === "claude_native" ? "Claude Code" : "OpenCode API";
+    const isPureNative =
+      item.engine === "claude_native" ||
+      (item.engine === "claude_code" && state.settings?.prompt_mode === "native");
+    const engLabel = isPureNative ? "Claude Code" : "AI 助手";
     head.innerHTML =
       `<span class="asst-badge">${engLabel}</span>` +
       (item.provider_name ? `<span class="asst-tag">${escHtml(item.provider_name)}</span>` : "") +

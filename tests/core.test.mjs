@@ -910,4 +910,57 @@ describe("OpenCode Studio Core Suite", () => {
     assert.equal(cleanRes.ok, true);
     assert.ok(cleanRes.purged_empty_shells >= 1, "must remove 0-turn empty shell sessions");
   });
+
+  it("scrubs hardcoded Claude SDK identity & git reminder in replace mode and resets claude_cli_sid when system_prompt changes", async () => {
+    const { enforceCustomPromptOnAnthropicBody } = await import("../server/api_proxy.mjs");
+    const { getSessionMeta, updateSessionMeta } = await import("../server/db.mjs");
+
+    const rawBody = {
+      model: "deepseek-v4.1-flash",
+      system: [
+        { type: "text", text: "x-anthropic-billing-header: cc_version=2.1.323;" },
+        { type: "text", text: "You are a Claude agent, built on Anthropic's Claude Agent SDK." },
+        { type: "text", text: "你是小智助教，负责Python课程辅导。" },
+      ],
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "<system-reminder>\nAttribution for git commits and pull requests you create from here on:\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n</system-reminder>\n",
+            },
+            { type: "text", text: "你是谁" },
+          ],
+        },
+      ],
+      tools: [{ name: "ScheduleWakeup", description: "Wake up inside Claude Code session", input_schema: { type: "object" } }],
+    };
+
+    enforceCustomPromptOnAnthropicBody(rawBody, {
+      prompt_mode: "replace",
+      system_prompt: "你是小智助教，负责Python课程辅导。",
+    });
+
+    const sysJoined = rawBody.system.map((b) => b.text).join("\n");
+    assert.ok(!sysJoined.includes("Claude agent"), "must strip hardcoded Claude Agent SDK identity");
+    assert.ok(!sysJoined.includes("x-anthropic-billing-header"), "must strip billing header");
+    assert.ok(sysJoined.includes("你是小智助教"), "must retain custom system prompt");
+    assert.equal(rawBody.messages[0].content.length, 1, "must strip Claude git attribution system-reminder");
+    assert.equal(rawBody.messages[0].content[0].text, "你是谁");
+    assert.ok(!rawBody.tools[0].description.includes("Claude Code"), "must neutralize Claude Code mention in tool description");
+
+    // Verify PUT /api/settings invalidates cached claude_cli_sid on existing sessions
+    const sess = createSession({ title: "提示词热更新测试", cwd: tmpWorkdir });
+    updateSessionMeta(sess.id, { claude_cli_sid: "cli_sid_old_12345" });
+    assert.equal(getSessionMeta(sess.id).claude_cli_sid, "cli_sid_old_12345");
+
+    const putRes = await fetch(`${studioServer.url}/api/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ system_prompt: "全新的自定义系统提示词角色", prompt_mode: "replace" }),
+    }).then((r) => r.json());
+    assert.equal(putRes.ok, true);
+    assert.equal(getSessionMeta(sess.id).claude_cli_sid, "", "must reset cached claude_cli_sid immediately on prompt change");
+  });
 });

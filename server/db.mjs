@@ -896,6 +896,16 @@ export function hardDeleteSession(id) {
   return true;
 }
 
+export function clearAllClaudeCliSids() {
+  const db = getDb();
+  const rows = stmt(db, "SELECT claude_cli_sid FROM sessions WHERE claude_cli_sid != ''").all();
+  const sids = rows.map((r) => r.claude_cli_sid).filter(Boolean);
+  if (sids.length) {
+    stmt(db, "UPDATE sessions SET claude_cli_sid='' WHERE claude_cli_sid != ''").run();
+  }
+  return sids;
+}
+
 function makeSnippet(text, qlc, rawLen) {
   const idx = text.toLowerCase().indexOf(qlc);
   if (idx < 0) return "";

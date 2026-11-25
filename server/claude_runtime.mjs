@@ -1824,7 +1824,15 @@ export function buildCustomPromptAndMcp(cwd, rtMode, { webSearchEnabled = null }
         : "";
   const effectivePromptText =
     mode === "replace"
-      ? [basePrompt, extraContext].filter(Boolean).join("\n\n")
+      ? [
+          basePrompt ? `[最高优先级自定义系统提示词 — 身份、语气与回复规范严格以此为准]\n${basePrompt}` : "",
+          extraContext,
+          basePrompt
+            ? `[最高优先级身份锚定：请严格遵循上方自定义系统提示词设定的身份与职责作答；除非自定义提示词本身明确要求，否则切勿自称 Claude Code 或 Anthropic 命令行助手。]`
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n\n")
       : mode === "append"
         ? [basePrompt, extraContext].filter(Boolean).join("\n\n")
         : extraContext;
@@ -1947,9 +1955,11 @@ export async function runNativeClaudeCodeTurn({
   );
   const effectiveThinking =
     thinkingLevel && thinkingLevel !== "auto" ? thinkingLevel : (cap.thinking_supported ? cap.default_thinking : "off");
-  const { memoryBlock, promptFlag, promptText, mcpConfigPath } = buildCustomPromptAndMcp(cwd, rt.mode, {
-    webSearchEnabled,
-  });
+  const { promptMode, basePrompt, memoryBlock, promptFlag, promptText, mcpConfigPath } = buildCustomPromptAndMcp(
+    cwd,
+    rt.mode,
+    { webSearchEnabled },
+  );
 
   // Build strictly isolated environment so native auth & API providers NEVER collide
   const env = {
@@ -2067,17 +2077,25 @@ export async function runNativeClaudeCodeTurn({
   const promptBody =
     resumeCliSid ? latestUser.content_text || "" : buildBridgeHistoryPrefix(historyItems) + (latestUser.content_text || "");
 
-  // Inject unified memories as a clean <system-reminder> in the first turn (or whenever memories change).
-  // Many OpenAI-compatible relays truncate Claude Code's ~28KB system prompt tail; placing memories
-  // in <system-reminder> matches Claude Code's own dynamic memory delivery and guarantees 100% recall!
+  // Inject unified memories + active custom prompt anchor as a clean <system-reminder> in the first turn
+  // (or whenever the user edits `system_prompt`, `prompt_mode`, or memories!).
   let memoryReminderPrefix = "";
   let injectedMemHash = "";
-  if (memoryBlock) {
-    injectedMemHash = crypto.createHash("sha1").update(memoryBlock).digest("hex").slice(0, 12);
+  const customAnchor =
+    promptMode !== "native" && basePrompt
+      ? `[当前生效的用户自定义系统提示词（最高优先级，若与上方参考记忆中的旧身份称呼冲突，100% 以本提示词设定的身份与规则为准）]:\n${basePrompt}`
+      : "";
+  const reminderBody = [memoryBlock, customAnchor].filter(Boolean).join("\n\n");
+  if (reminderBody) {
+    injectedMemHash = crypto
+      .createHash("sha1")
+      .update(`${promptMode}||${reminderBody}`)
+      .digest("hex")
+      .slice(0, 12);
     const sessionKey = resumeCliSid || sessionId || "default";
     const needInject = !resumeCliSid || _lastSessionMemHash.get(sessionKey) !== injectedMemHash;
     if (needInject) {
-      memoryReminderPrefix = `<system-reminder>\n${memoryBlock}\n</system-reminder>\n\n`;
+      memoryReminderPrefix = `<system-reminder>\n${reminderBody}\n</system-reminder>\n\n`;
       _lastSessionMemHash.set(sessionKey, injectedMemHash);
       if (sessionId) _lastSessionMemHash.set(sessionId, injectedMemHash);
     }

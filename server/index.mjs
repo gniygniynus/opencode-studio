@@ -30,6 +30,7 @@ import {
 import {
   activateProvider,
   addCustomBackground,
+  clearAllClaudeCliSids,
   closeDb,
   createSession,
   deleteCustomBackground,
@@ -1006,9 +1007,13 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         if (body.appearance && typeof body.appearance === "object") {
           body.appearance = await pinActiveWallpaperIfNeeded(body.appearance, paths.backgroundsDir);
         }
-        const prevIsolation = getAllSettings().claude_isolation;
+        const prevSettings = getAllSettings();
+        const prevIsolation = prevSettings.claude_isolation;
         const isolationChanged =
           body.claude_isolation !== undefined && body.claude_isolation !== prevIsolation;
+        const promptChanged =
+          (body.system_prompt !== undefined && String(body.system_prompt) !== String(prevSettings.system_prompt)) ||
+          (body.prompt_mode !== undefined && String(body.prompt_mode) !== String(prevSettings.prompt_mode));
         for (const key of [
           "system_prompt",
           "prompt_mode",
@@ -1023,6 +1028,15 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           "default_cwd",
         ]) {
           if (body[key] !== undefined) setSetting(key, body[key]);
+        }
+        if (promptChanged) {
+          // Reset cached CLI session IDs so ongoing conversations immediately adopt the new system prompt!
+          const staleCliSids = clearAllClaudeCliSids();
+          if (staleCliSids.length) {
+            try {
+              cleanupClaudeSessionFiles(staleCliSids);
+            } catch {}
+          }
         }
         const next = getAllSettings();
         broadcast({ type: "settings_updated", settings: next });
