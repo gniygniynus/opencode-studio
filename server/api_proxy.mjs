@@ -9,9 +9,9 @@
  * Completely replaces external switchers (like CC Switch) without touching ~/.claude/settings.json.
  */
 
-import { getAllSettings, getProvider } from "./db.mjs";
+import { getAllSettings, getProvider, getSessionTimeline } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
-import { buildApiEndpoint, detectModelCapabilities } from "./model_registry.mjs";
+import { buildApiEndpoint, detectModelCapabilities, estimateTextTokens } from "./model_registry.mjs";
 
 function sendSse(res, eventName, dataObj) {
   res.write(`event: ${eventName}\ndata: ${JSON.stringify(dataObj)}\n\n`);
@@ -110,6 +110,151 @@ export function enforceCustomPromptOnAnthropicBody(antBody, settingsOverride = n
   }
 
   return antBody;
+}
+
+function extractUserTextFromAntMsg(msg) {
+  if (!msg || msg.role !== "user") return null;
+  if (typeof msg.content === "string") return msg.content;
+  if (!Array.isArray(msg.content)) return null;
+  const hasRealInput = msg.content.some((b) => b?.type === "text" || b?.type === "image");
+  if (!hasRealInput) return null; // pure tool_result turn step
+  return msg.content
+    .filter((b) => b?.type === "text" && typeof b.text === "string")
+    .map((b) => b.text)
+    .join("\n");
+}
+
+function extractAssistantTextFromTimelineItem(item) {
+  if (!item) return "";
+  if (item.content_text && String(item.content_text).trim()) {
+    return String(item.content_text).trim().slice(0, 24000);
+  }
+  const parts = [];
+  for (const b of item.blocks || []) {
+    if (b?.type === "text" && b.text) parts.push(b.text);
+    else if (b?.type === "tool_use" && b.name) {
+      parts.push(`[已调用工具 ${b.name}]`);
+    }
+  }
+  return parts.join("\n\n").trim().slice(0, 24000);
+}
+
+/**
+ * Lossless multi-turn history hydration from SQLite timeline!
+ * Whenever the user switches models mid-session (e.g. DeepSeek -> Gemini -> GPT) or branches via Edit & Resend,
+ * Claude CLI's ephemeral session file either starts fresh (`resume=none`) or only holds turns after the switch.
+ * This reconstructs missing earlier turns directly from SQLite as genuine alternating `user`/`assistant` messages!
+ */
+export function hydrateMissingSessionHistory(antBody, sessionId) {
+  if (!sessionId || sessionId === "stateless" || !antBody || !Array.isArray(antBody.messages) || !antBody.messages.length) {
+    return antBody;
+  }
+  const timeline = getSessionTimeline(sessionId);
+  if (!timeline || !Array.isArray(timeline.items) || timeline.items.length < 2) {
+    return antBody;
+  }
+
+  let lastCompactIdx = -1;
+  for (let i = timeline.items.length - 1; i >= 0; i--) {
+    if (timeline.items[i].role === "compact") {
+      lastCompactIdx = i;
+      break;
+    }
+  }
+  const compactSummary = lastCompactIdx >= 0 ? String(timeline.items[lastCompactIdx].content_text || "").trim() : "";
+  const segItems = lastCompactIdx >= 0 ? timeline.items.slice(lastCompactIdx + 1) : timeline.items;
+
+  const cliUserTexts = antBody.messages.map(extractUserTextFromAntMsg).filter((t) => t !== null);
+  if (!cliUserTexts.length) return antBody;
+  const lastCliUserText = cliUserTexts[cliUserTexts.length - 1] || "";
+
+  let curUserIdx = -1;
+  for (let i = segItems.length - 1; i >= 0; i--) {
+    if (segItems[i].role !== "user") continue;
+    const needle = String(segItems[i].content_text || "").trim().slice(0, 48);
+    if (!needle || lastCliUserText.includes(needle)) {
+      curUserIdx = i;
+      break;
+    }
+  }
+  if (curUserIdx <= 0 && !compactSummary) return antBody;
+
+  // Group prior SQLite items (`segItems[0 .. curUserIdx - 1]`) into strict user->assistant turn pairs
+  const dbTurns = [];
+  let pendingUser = null;
+  for (let i = 0; i < curUserIdx; i++) {
+    const it = segItems[i];
+    if (it.role === "user") {
+      if (pendingUser) {
+        dbTurns.push({ userText: pendingUser, asstText: "（该轮未完成回复）" });
+      }
+      const imgNote = it.images?.length ? `[附带 ${it.images.length} 个文件/图片]\n` : "";
+      pendingUser = `${imgNote}${it.content_text || ""}`.trim() || "（发送了附件）";
+    } else if (it.role === "assistant") {
+      const aTxt = extractAssistantTextFromTimelineItem(it) || "好的。";
+      if (pendingUser !== null) {
+        dbTurns.push({ userText: pendingUser, asstText: aTxt });
+        pendingUser = null;
+      } else if (dbTurns.length > 0) {
+        dbTurns[dbTurns.length - 1].asstText += `\n\n${aTxt}`;
+      }
+    }
+  }
+  if (pendingUser !== null) {
+    dbTurns.push({ userText: pendingUser, asstText: "（该轮未完成回复）" });
+  }
+
+  const cliPriorTurns = Math.max(0, cliUserTexts.length - 1);
+  if (dbTurns.length <= cliPriorTurns && (!compactSummary || cliPriorTurns > 0)) {
+    return antBody;
+  }
+
+  const missingCount = Math.max(0, dbTurns.length - cliPriorTurns);
+  const missingTurns = dbTurns.slice(0, missingCount);
+  const prefixMsgs = [];
+
+  if (compactSummary && cliPriorTurns === 0) {
+    prefixMsgs.push(
+      { role: "user", content: `[此前长对话的压缩摘要]\n${compactSummary}` },
+      { role: "assistant", content: "明白，我已完整读取此前对话摘要，请继续。" },
+    );
+  }
+  for (const t of missingTurns) {
+    prefixMsgs.push(
+      { role: "user", content: t.userText },
+      { role: "assistant", content: t.asstText },
+    );
+  }
+
+  if (prefixMsgs.length) {
+    antBody.messages = [...prefixMsgs, ...antBody.messages];
+  }
+  return antBody;
+}
+
+function estimateOpenAiBodyInputTokens(oaiBody) {
+  if (!oaiBody || typeof oaiBody !== "object") return 0;
+  let total = 0;
+  for (const m of oaiBody.messages || []) {
+    total += 4;
+    if (typeof m.content === "string") {
+      total += estimateTextTokens(m.content);
+    } else if (Array.isArray(m.content)) {
+      for (const p of m.content) {
+        if (p?.type === "text" && p.text) total += estimateTextTokens(p.text);
+        else if (p?.type === "image_url") total += 650;
+      }
+    }
+    if (Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        total += estimateTextTokens(`${tc.function?.name || ""} ${tc.function?.arguments || ""}`);
+      }
+    }
+  }
+  if (Array.isArray(oaiBody.tools) && oaiBody.tools.length) {
+    total += estimateTextTokens(JSON.stringify(oaiBody.tools));
+  }
+  return Math.max(1, total);
 }
 
 function sanitizeOpenAiJsonSchema(schema) {
@@ -495,25 +640,37 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
     );
   }
 
+  const estimatedInputTokens = estimateOpenAiBodyInputTokens(sendBody);
+
   // Non-streaming response translation
   if (!oaiBody.stream) {
     const data = await upstream.json();
     const choice = data.choices?.[0] || {};
     const msg = choice.message || {};
     const content = [];
+    let outTextAccum = "";
     if (msg.reasoning_content || msg.reasoning) {
-      content.push({ type: "thinking", thinking: msg.reasoning_content || msg.reasoning });
+      const rTxt = msg.reasoning_content || msg.reasoning;
+      outTextAccum += rTxt;
+      content.push({ type: "thinking", thinking: rTxt });
     }
-    if (msg.content) content.push({ type: "text", text: msg.content });
+    if (msg.content) {
+      outTextAccum += msg.content;
+      content.push({ type: "text", text: msg.content });
+    }
     for (const tc of msg.tool_calls || []) {
+      const rawArgs = tc.function?.arguments || "{}";
+      outTextAccum += rawArgs;
       let parsed = {};
       try {
-        parsed = JSON.parse(tc.function?.arguments || "{}");
+        parsed = JSON.parse(rawArgs);
       } catch {
-        parsed = { raw: tc.function?.arguments || "" };
+        parsed = { raw: rawArgs };
       }
       content.push({ type: "tool_use", id: tc.id || "call_0", name: tc.function?.name || "Tool", input: parsed });
     }
+    const finalIn = data.usage?.prompt_tokens > 0 ? data.usage.prompt_tokens : estimatedInputTokens;
+    const finalOut = data.usage?.completion_tokens > 0 ? data.usage.completion_tokens : Math.max(1, estimateTextTokens(outTextAccum));
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(
       JSON.stringify({
@@ -525,8 +682,8 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
         stop_reason: choice.finish_reason === "tool_calls" ? "tool_use" : "end_turn",
         stop_sequence: null,
         usage: {
-          input_tokens: data.usage?.prompt_tokens || 0,
-          output_tokens: data.usage?.completion_tokens || 0,
+          input_tokens: finalIn,
+          output_tokens: finalOut,
         },
       }),
     );
@@ -550,7 +707,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
       content: [],
       stop_reason: null,
       stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 },
+      usage: { input_tokens: estimatedInputTokens, output_tokens: 0 },
     },
   });
 
@@ -560,7 +717,8 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
   const toolIndexMap = new Map(); // openai tool_call index -> anthropic block index
   let openBlockIdx = null;
   let finishReason = "end_turn";
-  let usage = { input_tokens: 0, output_tokens: 0 };
+  let usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 };
+  let streamedOutChars = "";
 
   const closeCurrentBlock = () => {
     if (openBlockIdx !== null) {
@@ -585,9 +743,11 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
     }
 
     if (chunk.usage) {
+      const cached = chunk.usage.prompt_tokens_details?.cached_tokens || chunk.usage.prompt_cache_hit_tokens || 0;
       usage = {
         input_tokens: chunk.usage.prompt_tokens || usage.input_tokens,
         output_tokens: chunk.usage.completion_tokens || usage.output_tokens,
+        cache_read_input_tokens: cached || usage.cache_read_input_tokens || 0,
       };
     }
 
@@ -601,6 +761,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
     // 1) Reasoning / Thinking stream
     const rText = delta.reasoning_content || delta.reasoning || "";
     if (rText) {
+      streamedOutChars += rText;
       if (thinkingIdx === null) {
         closeCurrentBlock();
         thinkingIdx = nextBlockIndex++;
@@ -620,6 +781,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
 
     // 2) Text stream
     if (delta.content) {
+      streamedOutChars += delta.content;
       if (textIdx === null) {
         closeCurrentBlock();
         textIdx = nextBlockIndex++;
@@ -659,6 +821,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
           });
         }
         if (tc.function?.arguments) {
+          streamedOutChars += tc.function.arguments;
           sendSse(res, "content_block_delta", {
             type: "content_block_delta",
             index: antIdx,
@@ -691,10 +854,17 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
   } finally {
     closeCurrentBlock();
     if (!signal?.aborted) {
+      const finalInputTokens = usage.input_tokens > 0 ? usage.input_tokens : estimatedInputTokens;
+      const finalOutputTokens =
+        usage.output_tokens > 0 ? usage.output_tokens : Math.max(1, estimateTextTokens(streamedOutChars));
       sendSse(res, "message_delta", {
         type: "message_delta",
         delta: { stop_reason: finishReason, stop_sequence: null },
-        usage: { output_tokens: usage.output_tokens || 0 },
+        usage: {
+          input_tokens: finalInputTokens,
+          output_tokens: finalOutputTokens,
+          ...(usage.cache_read_input_tokens ? { cache_read_input_tokens: usage.cache_read_input_tokens } : {}),
+        },
       });
       sendSse(res, "message_stop", { type: "message_stop" });
     }
@@ -703,9 +873,9 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
 }
 
 /**
- * Main HTTP handler for `/proxy/provider/:providerId/v1/...`
+ * Main HTTP handler for `/proxy/provider/:providerId[/:thinkingHint[/:sessionId]]/v1/...`
  */
-export async function handleProviderProxyRequest(req, res, providerId, subpath, thinkingHint = "") {
+export async function handleProviderProxyRequest(req, res, providerId, subpath, thinkingHint = "", sessionId = "") {
   const provider = getProvider(providerId, true);
   if (!provider) {
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -738,6 +908,7 @@ export async function handleProviderProxyRequest(req, res, providerId, subpath, 
         try {
           const parsed = JSON.parse(rawBody);
           if (parsed && typeof parsed === "object") {
+            if (sessionId) hydrateMissingSessionHistory(parsed, sessionId);
             enforceCustomPromptOnAnthropicBody(parsed);
             if (thinkingHint === "off" && parsed.thinking) {
               delete parsed.thinking;
@@ -749,6 +920,7 @@ export async function handleProviderProxyRequest(req, res, providerId, subpath, 
       return await handleAnthropicPassthrough(req, res, provider, bodyToSend, "/messages", abortCtrl.signal);
     }
     const antBody = JSON.parse(rawBody || "{}");
+    if (sessionId) hydrateMissingSessionHistory(antBody, sessionId);
     return await handleOpenAiTranslated(res, provider, antBody, thinkingHint, abortCtrl.signal);
   } catch (err) {
     if (abortCtrl.signal.aborted) {

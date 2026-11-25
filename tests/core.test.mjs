@@ -963,4 +963,114 @@ describe("OpenCode Studio Core Suite", () => {
     assert.equal(putRes.ok, true);
     assert.equal(getSessionMeta(sess.id).claude_cli_sid, "", "must reset cached claude_cli_sid immediately on prompt change");
   });
+
+  it("hydrates full multi-turn history across model switches & emits non-zero token usage even when OpenAI relay omits usage", async () => {
+    // 1. Reproduce exact 4-turn cross-model session (DeepSeek -> Gemini -> GPT switch -> GPT follow-up)
+    const multiSess = createSession({ title: "跨模型历史继承测试", cwd: tmpWorkdir });
+    const u1 = addMessage({ sessionId: multiSess.id, parentId: null, role: "user", contentText: "你是谁" });
+    const a1 = addMessage({
+      sessionId: multiSess.id,
+      parentId: u1.id,
+      role: "assistant",
+      model: "deepseek-v4.1-flash",
+      contentText: "我是你的编程助教。",
+      usage: { input_tokens: 0, output_tokens: 0 },
+    });
+    const u2 = addMessage({ sessionId: multiSess.id, parentId: a1.id, role: "user", contentText: "请分析登录状态机风险" });
+    const a2 = addMessage({
+      sessionId: multiSess.id,
+      parentId: u2.id,
+      role: "assistant",
+      model: "gemini-4-neon-thinking",
+      contentText: "应重点核查通道切换是否绑定原始会话。",
+      usage: { input_tokens: 0, output_tokens: 0 },
+    });
+    const u3 = addMessage({ sessionId: multiSess.id, parentId: a2.id, role: "user", contentText: "继续" });
+    const a3 = addMessage({
+      sessionId: multiSess.id,
+      parentId: u3.id,
+      role: "assistant",
+      model: "cx/gpt-6-luna[1m]",
+      contentText: "补充说明：还需在服务端记录挑战创建与最终认证关联 ID。",
+      usage: { input_tokens: 0, output_tokens: 0 },
+    });
+    addMessage({ sessionId: multiSess.id, parentId: a3.id, role: "user", contentText: "我第一句话说的什么" });
+
+    // Even when all historical rows had usage={0,0}, getSessionTimeline must compute non-zero context_tokens
+    const tlBefore = getSessionTimeline(multiSess.id);
+    assert.ok(tlBefore.activity.context_tokens > 20, `expected fallback context_tokens > 20, got ${tlBefore.activity.context_tokens}`);
+
+    // 2. Capture upstream OpenAI payload & omit chunk.usage in SSE stream
+    let capturedOaiBody = null;
+    const gptRelay = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      capturedOaiBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "你第一句话说的是：“你是谁”。" } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+    await new Promise((r) => gptRelay.listen(0, "127.0.0.1", r));
+    const gptUrl = `http://127.0.0.1:${gptRelay.address().port}`;
+
+    try {
+      const gptProv = saveProvider({
+        name: "GPT Relay No Usage",
+        kind: "openai",
+        base_url: gptUrl,
+        api_key: "sk-gpt-test",
+        default_model: "cx/gpt-6-luna[1m]",
+      });
+
+      // Simulate resumed partial CLI session that only recorded Turn 3 ("继续") + Turn 4 ("我第一句话说的什么")
+      const proxyRes = await fetch(
+        `${studioServer.url}/proxy/provider/${gptProv.id}/off/${encodeURIComponent(multiSess.id)}/v1/messages`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "cx/gpt-6-luna[1m]",
+            stream: true,
+            messages: [
+              { role: "user", content: [{ type: "text", text: "继续" }] },
+              {
+                role: "assistant",
+                content: [{ type: "text", text: "补充说明：还需在服务端记录挑战创建与最终认证关联 ID。" }],
+              },
+              { role: "user", content: [{ type: "text", text: "我第一句话说的什么" }] },
+            ],
+          }),
+        },
+      );
+      assert.equal(proxyRes.status, 200);
+      const sseText = await proxyRes.text();
+
+      // Verify full history was losslessly prepended before Turn 3 without duplicating Turn 3
+      assert.ok(capturedOaiBody, "upstream OpenAI relay must receive translated body");
+      const nonSysMsgs = capturedOaiBody.messages.filter((m) => m.role !== "system");
+      assert.equal(nonSysMsgs.length, 7, "must contain all 4 user turns and 3 assistant turns (7 messages)");
+      assert.equal(nonSysMsgs[0].role, "user");
+      assert.equal(nonSysMsgs[0].content, "你是谁");
+      assert.equal(nonSysMsgs[1].role, "assistant");
+      assert.equal(nonSysMsgs[2].content, "请分析登录状态机风险");
+      assert.equal(nonSysMsgs[4].content, "继续");
+      assert.equal(nonSysMsgs[6].content, "我第一句话说的什么");
+
+      // Verify SSE message_start & message_delta emit non-zero token usage even when OpenAI relay omits chunk.usage
+      const msgStartMatch = sseText.match(/event: message_start\ndata: (\{[^\n]+\})/);
+      const msgDeltaMatch = sseText.match(/event: message_delta\ndata: (\{[^\n]+\})/);
+      assert.ok(msgStartMatch && msgDeltaMatch, "SSE must include message_start and message_delta events");
+      const msgStart = JSON.parse(msgStartMatch[1]);
+      const msgDelta = JSON.parse(msgDeltaMatch[1]);
+      assert.ok(msgStart.message.usage.input_tokens > 0, "message_start input_tokens must be > 0");
+      assert.ok(msgDelta.usage.input_tokens > 0, "message_delta input_tokens must be > 0");
+      assert.ok(msgDelta.usage.output_tokens > 0, "message_delta output_tokens must be > 0");
+
+      deleteProvider(gptProv.id);
+    } finally {
+      await new Promise((r) => gptRelay.close(r));
+    }
+  });
 });

@@ -1901,13 +1901,18 @@ export function buildCustomPromptAndMcp(cwd, rtMode, { webSearchEnabled = null }
 }
 
 function buildBridgeHistoryPrefix(historyItems) {
-  const prior = historyItems.slice(0, -1).slice(-16);
-  if (!prior.length) return "";
-  const lines = ["[以下是当前对话此前的历史上下文，请自然衔接继续回答最后一条提问]"];
+  const allPrior = historyItems.slice(0, -1);
+  if (!allPrior.length) return "";
+  // Always keep the very first turn (first 2 items) + most recent 30 items so early context is never lost
+  const prior =
+    allPrior.length > 32
+      ? [...allPrior.slice(0, 2), { role: "compact", content_text: "（中间部分轮次已省略）" }, ...allPrior.slice(-30)]
+      : allPrior;
+  const lines = ["[以下是当前对话此前的完整历史上下文，请自然衔接继续回答最后一条提问]"];
   for (const m of prior) {
-    if (m.role === "compact") lines.push(`[历史压缩摘要]: ${m.content_text.slice(0, 1200)}`);
-    else if (m.role === "user") lines.push(`用户: ${(m.content_text || "").slice(0, 800)}`);
-    else if (m.role === "assistant") lines.push(`助手: ${(m.content_text || "").slice(0, 1000)}`);
+    if (m.role === "compact") lines.push(`[历史摘要]: ${(m.content_text || "").slice(0, 2000)}`);
+    else if (m.role === "user") lines.push(`用户: ${(m.content_text || "").slice(0, 2400)}`);
+    else if (m.role === "assistant") lines.push(`助手: ${(m.content_text || "").slice(0, 3000)}`);
   }
   return lines.join("\n") + "\n\n[当前用户提问]\n";
 }
@@ -1988,7 +1993,8 @@ export async function runNativeClaudeCodeTurn({
     env.https_proxy = null;
     env.ALL_PROXY = null;
     env.all_proxy = null;
-    const proxyBase = `http://127.0.0.1:${localServerPort}/proxy/provider/${provider.id}/${encodeURIComponent(effectiveThinking || "auto")}`;
+    const proxySid = encodeURIComponent(sessionId || "stateless");
+    const proxyBase = `http://127.0.0.1:${localServerPort}/proxy/provider/${provider.id}/${encodeURIComponent(effectiveThinking || "auto")}/${proxySid}`;
     env.ANTHROPIC_BASE_URL = proxyBase;
     env.ANTHROPIC_AUTH_TOKEN = "OPENCODE_STUDIO_PROXY";
     env.ANTHROPIC_API_KEY = null;
@@ -2021,7 +2027,8 @@ export async function runNativeClaudeCodeTurn({
     CLAUDE_CODE_MAX_RETRIES: "3",
   };
   if (provider.kind !== "claude_native") {
-    inlineSettingsEnv.ANTHROPIC_BASE_URL = `http://127.0.0.1:${localServerPort}/proxy/provider/${provider.id}/${encodeURIComponent(effectiveThinking || "auto")}`;
+    const proxySid = encodeURIComponent(sessionId || "stateless");
+    inlineSettingsEnv.ANTHROPIC_BASE_URL = `http://127.0.0.1:${localServerPort}/proxy/provider/${provider.id}/${encodeURIComponent(effectiveThinking || "auto")}/${proxySid}`;
     inlineSettingsEnv.ANTHROPIC_AUTH_TOKEN = "OPENCODE_STUDIO_PROXY";
     if (model) {
       inlineSettingsEnv.ANTHROPIC_MODEL = model;
@@ -2074,8 +2081,14 @@ export async function runNativeClaudeCodeTurn({
     args.push("--mcp-config", mcpConfigPath);
   }
 
+  // For built-in API providers (`provider.kind !== "claude_native"`), `api_proxy.mjs` hydrates the
+  // full multi-turn `user`/`assistant` message array losslessly from SQLite using `sessionId`,
+  // avoiding any text flattening that could confuse models about which turn was the first message!
+  const useProxyHistoryHydration = provider.kind !== "claude_native" && Boolean(sessionId);
   const promptBody =
-    resumeCliSid ? latestUser.content_text || "" : buildBridgeHistoryPrefix(historyItems) + (latestUser.content_text || "");
+    resumeCliSid || useProxyHistoryHydration
+      ? latestUser.content_text || ""
+      : buildBridgeHistoryPrefix(historyItems) + (latestUser.content_text || "");
 
   // Inject unified memories + active custom prompt anchor as a clean <system-reminder> in the first turn
   // (or whenever the user edits `system_prompt`, `prompt_mode`, or memories!).
@@ -2186,6 +2199,16 @@ export async function runNativeClaudeCodeTurn({
       appendTurnLog(sessionId, `[claude-stderr] ${s.trim()}`);
     });
 
+    const mergeUsage = (u) => {
+      if (!u || typeof u !== "object") return;
+      for (const k of ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]) {
+        const v = Number(u[k] || 0);
+        if (v > 0 && v >= Number(usage[k] || 0)) {
+          usage[k] = v;
+        }
+      }
+    };
+
     const processStreamLine = (raw) => {
       const line = raw.trim();
       if (!line) return;
@@ -2201,6 +2224,15 @@ export async function runNativeClaudeCodeTurn({
         const inner = ev.event || {};
         if (inner.type === "message_start") {
           blockByIdx.clear();
+          if (inner.message?.usage) {
+            mergeUsage(inner.message.usage);
+            onEvent({ type: "usage_update", usage });
+          }
+        } else if (inner.type === "message_delta") {
+          if (inner.usage) {
+            mergeUsage(inner.usage);
+            onEvent({ type: "usage_update", usage });
+          }
         } else if (inner.type === "content_block_start") {
           const cb = inner.content_block || {};
           let blk;
@@ -2234,7 +2266,7 @@ export async function runNativeClaudeCodeTurn({
           }
         }
       } else if (ev.type === "assistant" && ev.message) {
-        if (ev.message.usage) usage = ev.message.usage;
+        if (ev.message.usage) mergeUsage(ev.message.usage);
         for (const b of ev.message.content || []) {
           if (b.type === "tool_use" && b.id) {
             const ex = toolById.get(b.id);
@@ -2266,8 +2298,11 @@ export async function runNativeClaudeCodeTurn({
             onEvent({ type: "tool_result", tool_id: tu.id, result: tu.result, is_error: tu.is_error, blocks });
           }
         }
-      } else if (ev.type === "result" && ev.is_error) {
-        resultErrorText = String(ev.result || "Claude Code 返回错误");
+      } else if (ev.type === "result") {
+        if (ev.usage) mergeUsage(ev.usage);
+        if (ev.is_error) {
+          resultErrorText = String(ev.result || "Claude Code 返回错误");
+        }
       }
     };
 

@@ -1164,6 +1164,8 @@ body.has-wallpaper.bubble-text-only .welcome-badge {
 .edit-box-textarea {
   width: 100%;
   min-height: 76px;
+  max-height: 360px;
+  overflow-y: auto;
   border: none;
   outline: none;
   resize: vertical;
@@ -1172,10 +1174,15 @@ body.has-wallpaper.bubble-text-only .welcome-badge {
   font-family: var(--font-sans);
   font-size: var(--font-size-base);
   line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .edit-box-actions {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 8px;
   padding-top: 8px;
@@ -1412,6 +1419,9 @@ mark.search-hl { background: var(--mark-bg); color: var(--mark-text); padding: 0
   line-height: 1.55;
   padding: 6px 4px;
   overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .composer-toolbar {

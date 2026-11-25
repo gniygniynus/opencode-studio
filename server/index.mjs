@@ -886,10 +886,11 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       const method = (req.method || "GET").toUpperCase();
 
       // ==================== BUILT-IN TRANSPARENT API PROXY FOR NATIVE CLAUDE CODE ====================
-      const proxyMatch = pathname.match(/^\/proxy\/provider\/([^/]+)(?:\/([^/]+))?(\/v1\/.*)$/);
+      const proxyMatch = pathname.match(/^\/proxy\/provider\/([^/]+)(?:\/([^/]+))?(?:\/([^/]+))?(\/v1\/.*)$/);
       if (method === "POST" && proxyMatch) {
         const thinkingHint = proxyMatch[2] ? decodeURIComponent(proxyMatch[2]) : "";
-        return await handleProviderProxyRequest(req, res, proxyMatch[1], proxyMatch[3], thinkingHint);
+        const sessionIdHint = proxyMatch[3] ? decodeURIComponent(proxyMatch[3]) : "";
+        return await handleProviderProxyRequest(req, res, proxyMatch[1], proxyMatch[4], thinkingHint, sessionIdHint);
       }
 
       // ==================== HEALTH & BOOTSTRAP ====================

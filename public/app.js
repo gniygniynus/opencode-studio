@@ -235,8 +235,28 @@
     return data;
   }
 
+  function autoResizeTextarea(el, minH = 76, maxH = 360) {
+    if (!el) return;
+    el.style.height = minH + "px";
+    el.style.height = Math.min(Math.max(el.scrollHeight, minH), maxH) + "px";
+  }
+
+  function insertNewlineAtTextarea(el, afterInsert) {
+    if (!el) return;
+    const start = typeof el.selectionStart === "number" ? el.selectionStart : el.value.length;
+    const end = typeof el.selectionEnd === "number" ? el.selectionEnd : el.value.length;
+    el.value = el.value.slice(0, start) + "\n" + el.value.slice(end);
+    const caret = start + 1;
+    el.selectionStart = caret;
+    el.selectionEnd = caret;
+    if (typeof afterInsert === "function") afterInsert();
+    // Ensure caret remains visible when adding lines near bottom of max-height
+    if (caret >= el.value.length) el.scrollTop = el.scrollHeight;
+  }
+
   function autoResizeComposer() {
     const el = $("composer-input");
+    if (!el) return;
     if (!el.value) {
       el.style.height = "44px";
       return;
@@ -754,12 +774,20 @@
   function updateContextDisplay() {
     const info = getSelectedModelInfo();
     const maxCtx = info?.context_window || 128000;
-    const usedCtx = state.activeTimeline?.activity?.context_tokens || 0;
+    const live = state.activeSessionId ? state.liveStream.get(state.activeSessionId) : null;
+    const liveTok =
+      (Number(live?.usage?.input_tokens) || 0) +
+      (Number(live?.usage?.cache_read_input_tokens) || 0) +
+      (Number(live?.usage?.output_tokens) || 0);
+    const usedCtx = Math.max(state.activeTimeline?.activity?.context_tokens || 0, liveTok);
     const ctxPill = $("ctx-pill");
     if (!ctxPill) return;
-    if (state.activeTimeline?.items?.length) {
+    if (state.activeTimeline?.items?.length || liveTok > 0) {
       const pct = maxCtx > 0 ? Math.min(100, (usedCtx / maxCtx) * 100) : 0;
-      const pctText = pct > 0 && pct < 0.1 ? "<0.1%" : `${pct.toFixed(pct >= 10 ? 0 : 1)}%`;
+      let pctText = "0%";
+      if (usedCtx > 0 && pct > 0) {
+        pctText = pct < 1 ? `${Math.max(0.01, pct).toFixed(2)}%` : `${pct.toFixed(pct >= 10 ? 0 : 1)}%`;
+      }
       ctxPill.textContent = `上下文 ${usedCtx > 0 ? fmtTokens(usedCtx) : "0"}/${fmtTokens(maxCtx)} (${pctText})`;
       ctxPill.title = `当前会话已用约 ${usedCtx.toLocaleString()} Tokens / 模型上限 ${maxCtx.toLocaleString()} Tokens`;
       ctxPill.classList.remove("hidden");
@@ -834,17 +862,22 @@
       mSel.appendChild(opt);
       modelItems.push({ value: val, label: val || "请在左侧供应商拉取模型", triggerLabel: val || "未配置模型", sub: "" });
     } else {
+      const dispCounts = new Map();
       for (const info of infos) {
+        dispCounts.set(info.display_name, (dispCounts.get(info.display_name) || 0) + 1);
+      }
+      for (const info of infos) {
+        const shownName = (dispCounts.get(info.display_name) || 0) > 1 ? info.id : info.display_name;
         const opt = document.createElement("option");
         opt.value = info.id;
-        opt.textContent = info.display_name;
+        opt.textContent = shownName;
         mSel.appendChild(opt);
         const ctxTag = fmtTokens(info.context_window);
         const subParts = [ctxTag, info.thinking_supported ? "思考" : "", info.vision ? "识图" : ""].filter(Boolean);
         modelItems.push({
           value: info.id,
-          label: info.display_name,
-          triggerLabel: info.display_name,
+          label: shownName,
+          triggerLabel: shownName,
           sub: subParts.join(" · "),
         });
       }
@@ -858,6 +891,7 @@
     renderGlassMenu("gd-model", "gd-model-menu", "gd-model-label", modelItems, mSel.value, (mid) => {
       mSel.value = mid;
       updateThinkingSelector();
+      updateContextDisplay();
       const pid = pSel.value;
       if (pid) {
         apiJson(`/api/providers/${encodeURIComponent(pid)}/activate`, {
@@ -868,6 +902,7 @@
     });
 
     updateThinkingSelector(preferredThinking);
+    updateContextDisplay();
   }
 
   function updateThinkingSelector(preferredThinking = "") {
@@ -1228,14 +1263,20 @@
     if (state.editingMessageId === item.id) {
       wrap.innerHTML =
         `<div class="edit-box-wrap">` +
-          `<textarea class="edit-box-textarea" id="inline-edit-ta">${escHtml(item.content_text || "")}</textarea>` +
+          `<textarea class="edit-box-textarea" id="inline-edit-ta" rows="3">${escHtml(item.content_text || "")}</textarea>` +
           `<div class="edit-box-actions">` +
-            `<button class="btn-secondary sm" id="btn-cancel-edit">取消</button>` +
-            `<button class="btn-primary sm" id="btn-submit-edit">保存并重新发送（创建新分支）</button>` +
+            `<span class="muted-text" style="margin-right:auto;font-size:11.5px;">Enter / Shift+Enter / Ctrl+Enter 自由换行 · Esc 取消</span>` +
+            `<button type="button" class="btn-secondary sm" id="btn-cancel-edit">取消</button>` +
+            `<button type="button" class="btn-primary sm" id="btn-submit-edit">保存并重新发送（创建新分支）</button>` +
           `</div>` +
         `</div>`;
       const ta = wrap.querySelector("#inline-edit-ta");
-      setTimeout(() => { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }, 20);
+      setTimeout(() => {
+        autoResizeTextarea(ta, 76, 360);
+        ta.focus();
+        ta.setSelectionRange(ta.value.length, ta.value.length);
+      }, 20);
+      ta.addEventListener("input", () => autoResizeTextarea(ta, 76, 360));
       const cancelInlineEdit = () => {
         state.editingMessageId = null;
         renderConversation();
@@ -1247,10 +1288,12 @@
         sendEditResend(item.id, nextText);
       };
       ta.addEventListener("keydown", (ev) => {
-        if ((ev.ctrlKey || ev.metaKey) && ev.key === "Enter") {
+        if (ev.key === "Enter" && !ev.isComposing && (ev.ctrlKey || ev.altKey || ev.metaKey)) {
           ev.preventDefault();
-          submitInlineEdit();
-        } else if (ev.key === "Escape") {
+          insertNewlineAtTextarea(ta, () => autoResizeTextarea(ta, 76, 360));
+          return;
+        }
+        if (ev.key === "Escape") {
           ev.stopPropagation();
           cancelInlineEdit();
         }
@@ -2088,10 +2131,12 @@
         provider_name: msg.provider_name,
         engine: msg.engine,
         blocks: msg.blocks || [],
+        usage: msg.usage || null,
         error: null,
       });
       if (msg.session_id === state.activeSessionId) {
         renderLiveOnly();
+        updateContextDisplay();
       }
       return;
     }
@@ -4080,10 +4125,29 @@
       if (state.acOpen) {
         if (ev.key === "ArrowDown") { ev.preventDefault(); state.acIndex = (state.acIndex + 1) % state.acItems.length; return renderAutocomplete(); }
         if (ev.key === "ArrowUp") { ev.preventDefault(); state.acIndex = (state.acIndex - 1 + state.acItems.length) % state.acItems.length; return renderAutocomplete(); }
-        if (ev.key === "Enter" || ev.key === "Tab") { ev.preventDefault(); return applyAutocomplete(state.acIndex); }
+        if (ev.key === "Tab" || (ev.key === "Enter" && !ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey && !ev.isComposing)) {
+          ev.preventDefault();
+          return applyAutocomplete(state.acIndex);
+        }
         if (ev.key === "Escape") return closeAutocomplete();
+        if (ev.key === "Enter") closeAutocomplete();
       }
-      if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
+      if (ev.key === "Enter" && !ev.isComposing) {
+        if (ev.ctrlKey || ev.altKey || ev.metaKey) {
+          ev.preventDefault();
+          insertNewlineAtTextarea($("composer-input"), () => {
+            autoResizeComposer();
+            saveDraft();
+          });
+          return;
+        }
+        if (ev.shiftKey) {
+          setTimeout(() => {
+            autoResizeComposer();
+            saveDraft();
+          }, 0);
+          return;
+        }
         ev.preventDefault();
         sendCurrentMessage();
       }

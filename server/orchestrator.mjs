@@ -460,6 +460,7 @@ export class SessionOrchestrator {
       controller,
       reqId,
       liveBlocks: [],
+      liveUsage: {},
       model: effectiveModel,
       providerName: provider.name,
       stoppedByUser: false,
@@ -502,11 +503,17 @@ export class SessionOrchestrator {
             provider_name: provider.name,
             engine: useNativeClaudeCode ? "claude_code" : "api",
             blocks: runState.liveBlocks,
+            usage: runState.liveUsage,
           });
         };
 
         const onEvent = (ev) => {
-          if (ev.type === "delta") {
+          if (ev.usage && typeof ev.usage === "object") {
+            runState.liveUsage = { ...runState.liveUsage, ...ev.usage };
+          }
+          if (ev.type === "usage_update") {
+            pushLive(true);
+          } else if (ev.type === "delta") {
             if (ev.kind === "block_start" && ev.block) {
               if (!runState.liveBlocks.includes(ev.block)) {
                 runState.liveBlocks.push(ev.block);
@@ -527,7 +534,14 @@ export class SessionOrchestrator {
         let result;
         if (useNativeClaudeCode) {
           const prevAsst = [...historyItems].reverse().find((m) => m.role === "assistant");
-          const canResume = !forceNoCliResume && Boolean(meta.claude_cli_sid) && prevAsst?.engine === "claude_code";
+          // Only resume the ephemeral CLI session when continuing on the SAME model;
+          // when switching models (e.g. DeepSeek -> Gemini -> GPT), start a clean CLI turn while
+          // `api_proxy.mjs` losslessly hydrates ALL prior turns from SQLite!
+          const canResume =
+            !forceNoCliResume &&
+            Boolean(meta.claude_cli_sid) &&
+            prevAsst?.engine === "claude_code" &&
+            (!prevAsst?.model || prevAsst.model === effectiveModel);
 
           result = await runNativeClaudeCodeTurn({
             sessionId,

@@ -16,6 +16,7 @@ import fs from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { getPaths } from "./paths.mjs";
 import { logEvent, nowIso } from "./logger.mjs";
+import { estimateTextTokens } from "./model_registry.mjs";
 
 let _db = null;
 let _secretKey = null;
@@ -1256,6 +1257,8 @@ export function getSessionTimeline(sessionId) {
   let latestUsage = {};
   let userTurn = 0;
   let segment = 0;
+  let segmentFallbackTokens = 0;
+  let trailingTokensSinceUsage = 0;
 
   for (const r of activeRows) {
     const pk = r.parent_id || "__ROOT__";
@@ -1268,8 +1271,14 @@ export function getSessionTimeline(sessionId) {
 
     if (r.role === "compact") {
       segment += 1;
+      latestUsage = {};
+      segmentFallbackTokens = estimateTextTokens(r.content_text || "");
+      trailingTokensSinceUsage = 0;
     } else if (r.role === "user") {
       userTurn += 1;
+      const uTok = estimateTextTokens(r.content_text || "") + (images.length * 600);
+      segmentFallbackTokens += uTok;
+      trailingTokensSinceUsage += uTok;
       outline.push({
         message_id: r.id,
         turn_index: userTurn,
@@ -1279,8 +1288,22 @@ export function getSessionTimeline(sessionId) {
         has_images: images.length > 0,
       });
     } else if (r.role === "assistant") {
-      if (usage && (usage.input_tokens || usage.prompt_tokens)) {
+      const aText =
+        r.content_text ||
+        blocks
+          .map((b) => (b.type === "tool_use" ? `${b.name} ${JSON.stringify(b.input || {})} ${b.result || ""}` : b.text || ""))
+          .join("\n");
+      const aTok = estimateTextTokens(aText);
+      segmentFallbackTokens += aTok;
+      const reportedIn =
+        (usage?.input_tokens || usage?.prompt_tokens || 0) +
+        (usage?.cache_read_input_tokens || 0) +
+        (usage?.cache_creation_input_tokens || 0);
+      if (reportedIn > 0) {
         latestUsage = usage;
+        trailingTokensSinceUsage = 0;
+      } else {
+        trailingTokensSinceUsage += aTok;
       }
       for (const b of blocks) {
         if (b.type === "tool_use") {
@@ -1317,10 +1340,18 @@ export function getSessionTimeline(sessionId) {
     });
   }
 
-  const contextTokens =
+  const reportedContextTokens =
     (latestUsage.input_tokens || latestUsage.prompt_tokens || 0) +
     (latestUsage.cache_read_input_tokens || 0) +
-    (latestUsage.cache_creation_input_tokens || 0);
+    (latestUsage.cache_creation_input_tokens || 0) +
+    (latestUsage.output_tokens || latestUsage.completion_tokens || 0);
+  const sysOverhead = items.length ? estimateTextTokens(getSetting("system_prompt", DEFAULT_SYSTEM_PROMPT)) : 0;
+  const contextTokens =
+    reportedContextTokens > 0
+      ? reportedContextTokens + trailingTokensSinceUsage
+      : items.length
+        ? segmentFallbackTokens + sysOverhead
+        : 0;
 
   return {
     session: meta,

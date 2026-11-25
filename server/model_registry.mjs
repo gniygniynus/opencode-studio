@@ -22,6 +22,20 @@ export const THINKING_BUDGETS = {
   max: 56000,
 };
 
+const CJK_CHAR_RE = /[\u2E80-\u9FFF\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFFEF]/g;
+
+/**
+ * Fast, language-aware token estimator (~1.25 tokens per CJK character, ~3.8 chars per ASCII/code token).
+ */
+export function estimateTextTokens(text) {
+  const s = String(text || "");
+  if (!s) return 0;
+  const cjkMatches = s.match(CJK_CHAR_RE);
+  const cjkCount = cjkMatches ? cjkMatches.length : 0;
+  const otherLen = Math.max(0, s.length - cjkCount);
+  return Math.max(1, Math.ceil(cjkCount * 1.25 + otherLen / 3.8));
+}
+
 function parseExplicitContext(modelId) {
   const m = String(modelId || "").match(/\[(\d+(?:\.\d+)?)\s*([kKmM])\]/);
   if (!m) return null;
@@ -73,14 +87,14 @@ export function detectModelCapabilities(modelId, providerKind = "openai", remote
       cap.default_thinking = /thinking|opus/.test(low) ? "high" : "medium";
     }
   }
-  // --- OpenAI o-series / GPT-5 / Codex ---
-  else if (/\b(o1|o3|o4)\b|^o[134]-|\/o[134](?:-|$)|gpt-5|codex/.test(low)) {
+  // --- OpenAI o-series / GPT-5+ / Codex ---
+  else if (/\b(o1|o3|o4)\b|^o[134]-|\/o[134](?:-|$)|gpt-[5-9]|codex/.test(low)) {
     cap.family = "openai-reasoning";
     cap.vision = !/o3-mini|o1-mini/.test(low);
-    cap.context_window = explicitCtx || (/gpt-5|codex/.test(low) ? 400_000 : 200_000);
+    cap.context_window = explicitCtx || (/gpt-[5-9]|codex/.test(low) ? 400_000 : 200_000);
     cap.thinking_supported = true;
     cap.thinking_mode = "openai_effort";
-    if (/gpt-5\.[12345]|gpt-5-codex|codex/.test(low)) {
+    if (/gpt-[6-9]|gpt-5\.[12345]|gpt-5-codex|codex/.test(low)) {
       cap.thinking_levels = ["off", "low", "medium", "high", "xhigh"];
     } else if (/gpt-5/.test(low)) {
       cap.thinking_levels = ["low", "medium", "high", "xhigh"];
