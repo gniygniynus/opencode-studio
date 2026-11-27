@@ -163,6 +163,7 @@ export class SessionOrchestrator {
    */
   async sendMessage({
     sessionId = "",
+    title = "",
     text = "",
     images = [],
     cwd = "",
@@ -198,7 +199,8 @@ export class SessionOrchestrator {
         firstAtt?.kind === "text" || firstAtt?.kind === "file"
           ? `[文件: ${firstAtt.name || "附件"}]${images.length > 1 ? ` 等 ${images.length} 个` : ""}`
           : `[附件 × ${images.length}]`;
-      const titlePreview = (cleanText || attFallback).replace(/\s+/g, " ").slice(0, 60);
+      const customTitle = String(title || "").trim().slice(0, 80);
+      const titlePreview = customTitle || (cleanText || attFallback).replace(/\s+/g, " ").slice(0, 60);
       meta = createSession({
         title: titlePreview,
         cwd: cwd || "",

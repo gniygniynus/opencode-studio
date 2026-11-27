@@ -1218,5 +1218,30 @@ describe("OpenCode Studio Core Suite", () => {
     assert.equal(sk2.slug, "my-custom-skill-2", "distinct skill id with colliding name must auto-deduplicate slug");
     deleteInstalledSkill(sk1.id);
     deleteInstalledSkill(sk2.id);
+
+    // 11. Preset new-session title before first message send
+    const { getSessionMeta } = await import("../server/db.mjs");
+    const presetProv = saveProvider({
+      name: "Preset Title Relay",
+      kind: "openai",
+      base_url: mockLlmUrl,
+      api_key: "sk-preset",
+      default_model: "gpt-4o",
+      is_active: true,
+    });
+    const presetTurn = await studioServer.orchestrator.sendMessage({
+      title: "高数第三章答疑",
+      text: "请问定积分换元法怎么理解？",
+      cwd: tmpWorkdir,
+      providerId: presetProv.id,
+      model: "gpt-4o",
+    });
+    assert.equal(presetTurn.ok, true);
+    for (let i = 0; i < 60; i++) {
+      if (!studioServer.orchestrator.runningSessionIds().includes(presetTurn.session_id)) break;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    assert.equal(getSessionMeta(presetTurn.session_id).title, "高数第三章答疑");
+    deleteProvider(presetProv.id);
   });
 });

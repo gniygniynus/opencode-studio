@@ -1,6 +1,6 @@
 {
   "name": "opencode-studio",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "OpenCode Studio — 内置官方原生 Claude Code 的全平台独立原生桌面工作台（随包内置原生 Claude Code、进程级安全隔离、零代理直连内置多 API、官方完整 OAuth 登录、双引擎全网商店与高清/动态壁纸）",
   "type": "module",
   "main": "electron/main.mjs",

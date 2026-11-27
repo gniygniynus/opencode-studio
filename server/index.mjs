@@ -1906,6 +1906,7 @@ export async function startServer({
         } else if (msg.type === "send_message") {
           const r = await orchestrator.sendMessage({
             sessionId: msg.session_id || "",
+            title: msg.title || "",
             text: msg.text || "",
             images: msg.images || [],
             cwd: msg.cwd || "",

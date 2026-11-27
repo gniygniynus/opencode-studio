@@ -114,8 +114,17 @@
   function safeMediaHref(rawUrl) {
     const s = String(rawUrl || "").trim();
     if (!s) return "#";
-    if (s.startsWith("/api/uploads/") || s.startsWith("/api/bg-files/") || s.startsWith("/api/we/")) return s;
-    return safeExternalUrl(s) || "#";
+    if (
+      s.startsWith("/api/uploads/") ||
+      s.startsWith("/api/bg-files/") ||
+      s.startsWith("/api/we/") ||
+      s.startsWith("/api/wallpaper-proxy?")
+    ) {
+      return s;
+    }
+    const ext = safeExternalUrl(s);
+    if (ext) return `/api/wallpaper-proxy?url=${encodeURIComponent(ext)}`;
+    return "#";
   }
 
   function safeCssUrl(rawUrl) {
@@ -130,20 +139,24 @@
 
   // ==================== NATIVE DESKTOP GLASS DIALOGS (REPLACES BROKEN window.prompt / confirm) ====================
   let _activeUiDialogResolver = null;
+  let _activeUiDialogCancelVal = null;
 
   function _closeUiDialogWith(val) {
     const resolve = _activeUiDialogResolver;
+    const finalVal = val === undefined ? _activeUiDialogCancelVal : val;
     _activeUiDialogResolver = null;
+    _activeUiDialogCancelVal = null;
     closeModal("modal-ui-dialog");
-    if (resolve) resolve(val);
+    if (resolve) resolve(finalVal);
   }
 
   function showUiDialog({ title = "提示", description = "", fields = [], okText = "确定", danger = false } = {}) {
     if (_activeUiDialogResolver) {
-      _closeUiDialogWith(null);
+      _closeUiDialogWith();
     }
     return new Promise((resolve) => {
       _activeUiDialogResolver = resolve;
+      _activeUiDialogCancelVal = fields.length ? null : false;
       $("ui-dialog-title").textContent = title;
       const descEl = $("ui-dialog-desc");
       if (description) {
@@ -380,6 +393,7 @@
     if (!res.ok) {
       const errMsg = data?.error?.title || data?.error?.cause || data?.error || `HTTP ${res.status}`;
       const e = new Error(errMsg);
+      e.status = res.status;
       e.payload = data;
       throw e;
     }
@@ -1188,7 +1202,7 @@
     syncWelcomeResumePill();
 
     if (!list.length) {
-      el.innerHTML = `<div class="empty-hint">${q ? "没有找到匹配的对话" : "点击右上角 + 开启新会话"}</div>`;
+      el.innerHTML = `<div class="empty-hint">${q ? "没有找到匹配的对话" : "点击上方 + 开启新会话"}</div>`;
       return;
     }
 
@@ -1899,8 +1913,9 @@
     const btn = $("btn-scroll-bottom");
     if (!btn) return;
     const sc = $("messages-scroll");
+    const hasMessages = Boolean(state.activeSessionId && state.activeTimeline?.items?.length);
     const hasOverflow = sc && sc.scrollHeight - sc.clientHeight > 80;
-    const show = Boolean(hasOverflow && !isNearBottom());
+    const show = Boolean(hasMessages && hasOverflow && !isNearBottom());
     btn.classList.toggle("is-visible", show);
     btn.setAttribute("aria-hidden", show ? "false" : "true");
   }
@@ -1908,6 +1923,7 @@
   async function openSession(sid, opts = {}) {
     saveDraft();
     state.activeSessionId = sid;
+    state.pendingSessionTitle = "";
     state.editingMessageId = null;
     state.showAllMessages = Boolean(opts.jumpMessageId);
     renderSessionList();
@@ -1955,9 +1971,18 @@
     }
   }
 
-  function startNewSession() {
-    saveDraft();
+  function startNewSession(forceResetDraft = false) {
+    const alreadyNew = !state.activeSessionId;
+    if (alreadyNew || forceResetDraft) {
+      $("composer-input").value = "";
+      state.attachments = [];
+      state.draftAttachments.delete("new");
+      try { localStorage.removeItem(DRAFT_PREFIX + "new"); } catch {}
+    } else {
+      saveDraft();
+    }
     state.activeSessionId = null;
+    state.pendingSessionTitle = "";
     state.activeTimeline = null;
     state.editingMessageId = null;
     state.activeCwd = state.settings.default_cwd || state.activeCwd;
@@ -2221,6 +2246,7 @@
   // ==================== WEBSOCKET MULTIPLEXING ====================
 
   async function connectWs() {
+    if (state.authBlocked) return;
     const tok = await ensureDesktopAuthToken();
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = tok
@@ -2235,9 +2261,14 @@
     };
     ws.onclose = () => {
       state.wsConnected = false;
+      clearTimeout(state.reconnectTimer);
+      if (state.authBlocked) {
+        $("ws-pill").textContent = "● 待授权";
+        $("ws-pill").className = "meta-pill ws-err";
+        return;
+      }
       $("ws-pill").textContent = "● 重连中";
       $("ws-pill").className = "meta-pill ws-err";
-      clearTimeout(state.reconnectTimer);
       state.reconnectTimer = setTimeout(connectWs, 1800);
     };
     ws.onerror = () => ws.close();
@@ -2492,10 +2523,7 @@
     const images = state.attachments.slice();
     if (!text && !images.length) return;
     if (text === "/clear") {
-      $("composer-input").value = "";
-      autoResizeComposer();
-      saveDraft();
-      return startNewSession();
+      return startNewSession(true);
     }
     if (text === "/web") {
       $("composer-input").value = "";
@@ -2526,9 +2554,13 @@
     renderAttachments();
     closeAutocomplete();
 
+    const presetTitle = !state.activeSessionId ? (state.pendingSessionTitle || "") : "";
+    state.pendingSessionTitle = "";
+
     state.ws.send(JSON.stringify({
       type: "send_message",
       session_id: state.activeSessionId || "",
+      title: presetTitle,
       client_req_id: clientReqId,
       text,
       images,
@@ -4326,7 +4358,14 @@
     const data = await apiJson(`/api/memories?q=${encodeURIComponent(q)}`);
     state.memories = data.memories || [];
     renderMemoryList();
-    if (!state.selectedMemory && state.memories.length) fillMemoryForm(state.memories[0]);
+    if (state.selectedMemory) {
+      const fresh = state.memories.find((m) => m.id === state.selectedMemory.id) || state.selectedMemory;
+      fillMemoryForm(fresh);
+    } else if (state.memories.length) {
+      fillMemoryForm(state.memories[0]);
+    } else {
+      fillMemoryForm(null);
+    }
   }
 
   function renderMemoryList() {
@@ -4418,7 +4457,7 @@
   // ==================== EVENTS ====================
 
   function bindEvents() {
-    $("btn-new-session").addEventListener("click", startNewSession);
+    $("btn-new-session").addEventListener("click", () => startNewSession());
     $("btn-collapse-sidebar").addEventListener("click", () => {
       $("sidebar").classList.add("collapsed");
       $("btn-expand-sidebar").classList.remove("hidden");
@@ -4625,8 +4664,16 @@
     $("thread-find-input").addEventListener("input", runThreadFind);
 
     // Title & Simplified CWD Modal (Native Picker + Custom by Drive)
-    $("thread-title").addEventListener("click", () => {
-      if (state.activeSessionId) promptRename(state.activeSessionId, $("thread-title").textContent);
+    $("thread-title").addEventListener("click", async () => {
+      if (state.activeSessionId) {
+        promptRename(state.activeSessionId, $("thread-title").textContent);
+      } else {
+        const cur = state.pendingSessionTitle || "";
+        const next = await uiPrompt("预设新会话标题", cur, "输入新会话标题（发首条消息时生效）");
+        if (next === null) return;
+        state.pendingSessionTitle = next.trim();
+        $("thread-title").textContent = state.pendingSessionTitle || "新会话";
+      }
     });
     $("cwd-pill").addEventListener("click", openCwdModal);
     $("cwd-drive-select")?.addEventListener("change", updateCustomCwdPreview);
@@ -5168,7 +5215,7 @@
     document.querySelectorAll(".modal-backdrop").forEach((bd) =>
       bd.addEventListener("click", (e) => {
         if (e.target === bd && bd.id !== "modal-confirm") {
-          if (bd.id === "modal-ui-dialog") _closeUiDialogWith(null);
+          if (bd.id === "modal-ui-dialog") _closeUiDialogWith();
           else closeModal(bd);
         }
       }),
@@ -5203,7 +5250,7 @@
         toggleZenWallpaperMode();
       } else if (ev.key === "Escape") {
         if (_activeUiDialogResolver) {
-          _closeUiDialogWith(null);
+          _closeUiDialogWith();
           return;
         }
         if (state.zenMode) {
@@ -5264,5 +5311,32 @@
     $("composer-input").focus();
   }
 
-  init().catch((err) => toast("初始化失败: " + err.message, 5000));
+  function renderAuthBlockedNotice() {
+    state.authBlocked = true;
+    clearTimeout(state.reconnectTimer);
+    try { state.ws?.close(); } catch {}
+    $("ws-pill").textContent = "● 待授权";
+    $("ws-pill").className = "meta-pill ws-err";
+    const welcome = $("welcome-view");
+    if (welcome) {
+      welcome.classList.remove("hidden");
+      welcome.innerHTML =
+        `<div class="auth-lock-card glass-panel">` +
+          `<div class="welcome-badge">本地零信任安全隔离已启用</div>` +
+          `<h2 style="margin:10px 0 8px;">会话访问凭证已更新或未授权</h2>` +
+          `<p style="margin:0 0 14px;color:var(--text-secondary);line-height:1.7;">` +
+            `为防止外部恶意网页跨站窃取您的 API 密钥与项目文件，OpenCode Studio 要求携带本机会话令牌。<br/>` +
+            `您的对话记录与配置均安全保存在本地，请直接<b>打开独立桌面客户端</b>，或<b>重新双击桌面上的 <code>OpenCode Studio.bat</code> 启动器</b>即可自动完成安全握手恢复使用。` +
+          `</p>` +
+        `</div>`;
+    }
+  }
+
+  init().catch((err) => {
+    if (err?.status === 401) {
+      renderAuthBlockedNotice();
+      return;
+    }
+    toast("初始化失败: " + err.message, 5000);
+  });
 })();

@@ -903,7 +903,7 @@ body.is-desktop.platform-darwin .sidebar.collapsed + .main-pane .topbar {
   animation: chipPop 0.22s var(--ease-spring) both;
 }
 
-.topbar-left { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; overflow: hidden; }
+.topbar-left { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 145px; overflow: hidden; }
 .thread-title {
   margin: 0;
   font-size: 15px;
@@ -1373,12 +1373,14 @@ mark.search-hl { background: var(--mark-bg); color: var(--mark-text); padding: 0
 .scroll-bottom-btn {
   position: absolute;
   right: 26px;
-  bottom: 158px;
-  width: 36px;
-  height: 36px;
+  bottom: 182px;
+  width: 34px;
+  height: 34px;
   border-radius: 50%;
   border: 1px solid var(--border-strong);
-  background: var(--bg-surface);
+  background: rgba(var(--surface-rgb), 0.96);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
   color: var(--text-primary);
   box-shadow: var(--shadow-md);
   cursor: pointer;
@@ -1655,7 +1657,9 @@ mark.search-hl { background: var(--mark-bg); color: var(--mark-text); padding: 0
   bottom: calc(100% + 6px);
   max-height: 240px;
   overflow-y: auto;
-  background: var(--bg-surface);
+  background: rgba(var(--surface-rgb), 0.97);
+  backdrop-filter: blur(22px) saturate(150%);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
   border: 1px solid var(--border-strong);
   border-radius: 12px;
   box-shadow: var(--shadow-lg);
@@ -3067,6 +3071,68 @@ body.zen-wallpaper-mode .wallpaper-web {
 }
 .edit-att-rm:hover {
   color: var(--err);
+}
+
+#modal-confirm,
+#modal-ui-dialog {
+  z-index: 260;
+}
+
+.auth-lock-card {
+  max-width: 540px;
+  margin: 48px auto;
+  padding: 28px 30px;
+  border-radius: 18px;
+  border: 1px solid var(--border-strong);
+  background: rgba(var(--surface-rgb), 0.94);
+  box-shadow: var(--shadow-lg);
+  text-align: center;
+}
+
+/* Split-screen / medium viewport responsiveness for topbar */
+@media (max-width: 1100px) {
+  .topbar {
+    padding: 0 12px;
+    gap: 8px;
+  }
+  .topbar-right {
+    gap: 5px;
+    flex-shrink: 1;
+    min-width: 0;
+  }
+  #ctx-pill {
+    max-width: 128px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .seg-btn {
+    padding: 0 7px;
+    font-size: 12px;
+  }
+}
+
+@media (max-width: 860px) {
+  #ctx-pill {
+    display: none !important;
+  }
+  .cwd-pill {
+    max-width: 130px;
+  }
+}
+
+/* Contrast boost for unboxed helper captions over vivid photography wallpapers */
+body.has-wallpaper .welcome-sub,
+body.has-wallpaper .composer-hints,
+body.has-wallpaper .user-meta-bar {
+  text-shadow: 0 1px 8px rgba(var(--surface-rgb), 0.85), 0 0 2px rgba(var(--surface-rgb), 0.9);
+  color: var(--text-primary);
+}
+
+body.is-desktop .zen-exit-bar {
+  -webkit-app-region: drag;
+}
+body.is-desktop .zen-exit-bar button {
+  -webkit-app-region: no-drag;
 }
 
 /* Accessibility: respect OS Reduced Motion preference */
