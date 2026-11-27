@@ -13,6 +13,7 @@ import { getAllSettings, listInstalledSkills } from "./db.mjs";
 import { appendTurnLog, classifyError, logEvent } from "./logger.mjs";
 import { buildUnifiedMemoryContext } from "./memory_sync.mjs";
 import { buildApiEndpoint, detectModelCapabilities, THINKING_BUDGETS } from "./model_registry.mjs";
+import { fetchUpstreamWithSafeRedirects } from "./security.mjs";
 import { BUILTIN_TOOLS, executeBuiltinTool } from "./tools.mjs";
 
 const MAX_TOOL_STEPS = 25;
@@ -136,14 +137,19 @@ function buildAnthropicMessages(historyItems) {
     }
   }
 
-  // Guarantee alternating user/assistant roles for strict Anthropic API compliance
+  // Guarantee alternating user/assistant roles for strict Anthropic API compliance without stringifying binary images
+  const toContentBlocks = (c) =>
+    Array.isArray(c) ? c : [{ type: "text", text: String(c ?? "") }];
+
   const normalized = [];
   for (const m of out) {
     if (normalized.length && normalized[normalized.length - 1].role === m.role) {
       const prev = normalized[normalized.length - 1];
-      const prevStr = typeof prev.content === "string" ? prev.content : JSON.stringify(prev.content);
-      const curStr = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-      prev.content = `${prevStr}\n\n${curStr}`;
+      if (typeof prev.content === "string" && typeof m.content === "string") {
+        prev.content = `${prev.content}\n\n${m.content}`;
+      } else {
+        prev.content = [...toContentBlocks(prev.content), ...toContentBlocks(m.content)];
+      }
     } else {
       normalized.push(m);
     }
@@ -178,22 +184,36 @@ async function* parseSseStream(readableStream) {
   const reader = readableStream.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const events = buffer.split(/\r?\n\r?\n/);
-    buffer = events.pop() || "";
-    for (const rawEv of events) {
-      let eventName = "message";
-      const dataLines = [];
-      for (const line of rawEv.split(/\r?\n/)) {
-        if (line.startsWith("event:")) eventName = line.slice(6).trim();
-        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
-      }
-      if (!dataLines.length) continue;
-      yield { event: eventName, data: dataLines.join("\n") };
+  const parseEventBlock = (rawEv) => {
+    let eventName = "message";
+    const dataLines = [];
+    for (const line of rawEv.split(/\r?\n/)) {
+      if (line.startsWith("event:")) eventName = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
     }
+    return dataLines.length ? { event: eventName, data: dataLines.join("\n") } : null;
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop() || "";
+      for (const rawEv of events) {
+        const parsed = parseEventBlock(rawEv);
+        if (parsed) yield parsed;
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      const tail = parseEventBlock(buffer);
+      if (tail) yield tail;
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {}
   }
 }
 
@@ -235,7 +255,7 @@ async function callAnthropicStep({ provider, model, thinkingLevel, cap, systemPr
     }
   }
 
-  const res = await fetch(url, {
+  const res = await fetchUpstreamWithSafeRedirects(url, {
     method: "POST",
     headers,
     body: JSON.stringify(body),
@@ -272,7 +292,8 @@ async function callAnthropicStep({ provider, model, thinkingLevel, cap, systemPr
     } else if (payload.type === "content_block_start") {
       const cb = payload.content_block || {};
       let blk;
-      if (cb.type === "thinking") blk = { type: "thinking", text: "" };
+      if (cb.type === "thinking") blk = { type: "thinking", text: "", signature: cb.signature || "" };
+      else if (cb.type === "redacted_thinking") blk = { type: "redacted_thinking", data: cb.data || "" };
       else if (cb.type === "tool_use") {
         blk = { type: "tool_use", id: cb.id || `tu_${Date.now()}`, name: cb.name, input: {}, _raw: "" };
       } else {
@@ -280,7 +301,9 @@ async function callAnthropicStep({ provider, model, thinkingLevel, cap, systemPr
       }
       blocks.push(blk);
       blockByIndex.set(payload.index, blk);
-      onDelta({ kind: "block_start", block: blk });
+      if (blk.type !== "redacted_thinking") {
+        onDelta({ kind: "block_start", block: blk });
+      }
     } else if (payload.type === "content_block_delta") {
       const blk = blockByIndex.get(payload.index);
       if (!blk) continue;
@@ -291,6 +314,8 @@ async function callAnthropicStep({ provider, model, thinkingLevel, cap, systemPr
       } else if (d.type === "thinking_delta" && d.thinking) {
         blk.text += d.thinking;
         onDelta({ kind: "thinking_delta", text: d.thinking });
+      } else if (d.type === "signature_delta" && d.signature) {
+        blk.signature = (blk.signature || "") + d.signature;
       } else if (d.type === "input_json_delta" && d.partial_json) {
         blk._raw += d.partial_json;
       }
@@ -300,7 +325,8 @@ async function callAnthropicStep({ provider, model, thinkingLevel, cap, systemPr
         try {
           blk.input = blk._raw ? JSON.parse(blk._raw) : {};
         } catch {
-          blk.input = { raw: blk._raw };
+          blk.input = {};
+          blk._jsonParseError = true;
         }
         delete blk._raw;
       }
@@ -351,7 +377,7 @@ async function callOpenAiStep({ provider, model, thinkingLevel, cap, messages, t
     }
   }
 
-  const res = await fetch(url, {
+  const res = await fetchUpstreamWithSafeRedirects(url, {
     method: "POST",
     headers,
     body: JSON.stringify(body),
@@ -441,7 +467,8 @@ async function callOpenAiStep({ provider, model, thinkingLevel, cap, messages, t
     try {
       tc.input = tc._raw ? JSON.parse(tc._raw) : {};
     } catch {
-      tc.input = { raw: tc._raw };
+      tc.input = {};
+      tc._jsonParseError = true;
     }
     delete tc._raw;
     blocks.push(tc);
@@ -546,18 +573,23 @@ export async function runOpenCodeApiTurn({
     // No tool calls -> final answer reached
     if (!toolUses.length) break;
 
-    // Append assistant tool-call turn to loop buffer
+    // Append assistant tool-call turn to loop buffer (preserving Anthropic thinking signatures!)
     if (provider.kind === "anthropic") {
-      antMsgs.push({
-        role: "assistant",
-        content: stepResult.blocks.map((b) =>
-          b.type === "tool_use"
-            ? { type: "tool_use", id: b.id, name: b.name, input: b.input }
-            : b.type === "thinking"
-              ? { type: "thinking", thinking: b.text }
-              : { type: "text", text: b.text },
-        ),
-      });
+      const antContent = [];
+      for (const b of stepResult.blocks) {
+        if (b.type === "tool_use") {
+          antContent.push({ type: "tool_use", id: b.id, name: b.name, input: b.input || {} });
+        } else if (b.type === "thinking") {
+          if (b.signature) {
+            antContent.push({ type: "thinking", thinking: b.text || "", signature: b.signature });
+          }
+        } else if (b.type === "redacted_thinking" && b.data) {
+          antContent.push({ type: "redacted_thinking", data: b.data });
+        } else if (b.type === "text" && b.text) {
+          antContent.push({ type: "text", text: b.text });
+        }
+      }
+      antMsgs.push({ role: "assistant", content: antContent });
     } else {
       const assistantText = stepResult.blocks
         .filter((b) => b.type === "text")
@@ -579,10 +611,12 @@ export async function runOpenCodeApiTurn({
     for (const tu of toolUses) {
       if (signal.aborted) break;
       appendTurnLog(sessionId, `[tool-call] ${tu.name} ${JSON.stringify(tu.input || {}).slice(0, 300)}`);
-      const res = await executeBuiltinTool(tu.name, tu.input, {
-        cwd,
-        signal,
-        mcpManager,
+      const res = tu._jsonParseError
+        ? { ok: false, output: "工具调用 JSON 参数不完整或解析失败（可能因单次输出超长被截断），请精简或分段重试。" }
+        : await executeBuiltinTool(tu.name, tu.input, {
+            cwd,
+            signal,
+            mcpManager,
         confirmDangerous,
       });
       tu.result = res.output;

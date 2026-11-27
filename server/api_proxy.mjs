@@ -12,6 +12,7 @@
 import { getAllSettings, getProvider, getSessionTimeline } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
 import { buildApiEndpoint, detectModelCapabilities, estimateTextTokens } from "./model_registry.mjs";
+import { capMapSize, fetchUpstreamWithSafeRedirects, isValidInternalRequest } from "./security.mjs";
 
 function sendSse(res, eventName, dataObj) {
   res.write(`event: ${eventName}\ndata: ${JSON.stringify(dataObj)}\n\n`);
@@ -172,7 +173,8 @@ export function hydrateMissingSessionHistory(antBody, sessionId) {
   for (let i = segItems.length - 1; i >= 0; i--) {
     if (segItems[i].role !== "user") continue;
     const needle = String(segItems[i].content_text || "").trim().slice(0, 48);
-    if (!needle || lastCliUserText.includes(needle)) {
+    const matched = needle ? lastCliUserText.includes(needle) : !lastCliUserText.trim();
+    if (matched) {
       curUserIdx = i;
       break;
     }
@@ -469,7 +471,7 @@ async function handleAnthropicPassthrough(req, res, provider, rawBody, subpath, 
     headers["Authorization"] = `Bearer ${provider.api_key}`;
   }
 
-  let upstream = await fetch(url, {
+  let upstream = await fetchUpstreamWithSafeRedirects(url, {
     method: "POST",
     headers,
     body: rawBody,
@@ -482,15 +484,18 @@ async function handleAnthropicPassthrough(req, res, provider, rawBody, subpath, 
       const parsed = JSON.parse(rawBody);
       if (parsed && typeof parsed === "object" && parsed.thinking) {
         delete parsed.thinking;
-        const retryRes = await fetch(url, {
+        const retryRes = await fetchUpstreamWithSafeRedirects(url, {
           method: "POST",
           headers,
           body: JSON.stringify(parsed),
           signal,
         });
         if (retryRes.ok) {
+          try { await upstream.body?.cancel(); } catch {}
           logEvent("INFO", "proxy", "anthropic_thinking_fallback_ok", `上游「${provider.name}」拒绝 thinking 参数，已自动降级恢复成功`);
           upstream = retryRes;
+        } else {
+          try { await retryRes.body?.cancel(); } catch {}
         }
       }
     } catch {}
@@ -552,7 +557,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
   };
 
   let sendBody = cachedCompat ? applyCompat(oaiBody, cachedCompat) : oaiBody;
-  let upstream = await fetch(url, {
+  let upstream = await fetchUpstreamWithSafeRedirects(url, {
     method: "POST",
     headers,
     body: JSON.stringify(sendBody),
@@ -577,7 +582,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
 
     for (const mode of fallbacks) {
       const nextBody = applyCompat(oaiBody, mode);
-      const retryRes = await fetch(url, {
+      const retryRes = await fetchUpstreamWithSafeRedirects(url, {
         method: "POST",
         headers,
         body: JSON.stringify(nextBody),
@@ -585,6 +590,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
       });
       if (retryRes.ok) {
         _upstreamCompatMode.set(compatKey, mode);
+        capMapSize(_upstreamCompatMode, 200);
         logEvent(
           "INFO",
           "proxy",
@@ -714,7 +720,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
   let nextBlockIndex = 0;
   let thinkingIdx = null;
   let textIdx = null;
-  const toolIndexMap = new Map(); // openai tool_call index -> anthropic block index
+  const activeTools = new Map(); // openai tool_call index -> { id, name, args }
   let openBlockIdx = null;
   let finishReason = "end_turn";
   let usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 };
@@ -727,6 +733,33 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
       if (openBlockIdx === textIdx) textIdx = null;
       openBlockIdx = null;
     }
+  };
+
+  const flushPendingTools = () => {
+    if (!activeTools.size) return;
+    closeCurrentBlock();
+    for (const [oaiIdx, tc] of activeTools.entries()) {
+      const antIdx = nextBlockIndex++;
+      sendSse(res, "content_block_start", {
+        type: "content_block_start",
+        index: antIdx,
+        content_block: {
+          type: "tool_use",
+          id: tc.id || `toolu_${Date.now()}_${oaiIdx}`,
+          name: tc.name || "Tool",
+          input: {},
+        },
+      });
+      if (tc.args) {
+        sendSse(res, "content_block_delta", {
+          type: "content_block_delta",
+          index: antIdx,
+          delta: { type: "input_json_delta", partial_json: tc.args },
+        });
+      }
+      sendSse(res, "content_block_stop", { type: "content_block_stop", index: antIdx });
+    }
+    activeTools.clear();
   };
 
   const processSseLine = (rawLine) => {
@@ -761,6 +794,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
     // 1) Reasoning / Thinking stream
     const rText = delta.reasoning_content || delta.reasoning || "";
     if (rText) {
+      flushPendingTools();
       streamedOutChars += rText;
       if (thinkingIdx === null) {
         closeCurrentBlock();
@@ -781,6 +815,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
 
     // 2) Text stream
     if (delta.content) {
+      flushPendingTools();
       streamedOutChars += delta.content;
       if (textIdx === null) {
         closeCurrentBlock();
@@ -799,34 +834,21 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
       });
     }
 
-    // 3) Tool call stream
+    // 3) Tool call stream (buffered per index so split names & interleaved multi-tool chunks stay 100% valid!)
     if (Array.isArray(delta.tool_calls)) {
+      closeCurrentBlock();
       for (const tc of delta.tool_calls) {
         const oaiIdx = tc.index ?? 0;
-        let antIdx = toolIndexMap.get(oaiIdx);
-        if (antIdx === undefined) {
-          closeCurrentBlock();
-          antIdx = nextBlockIndex++;
-          toolIndexMap.set(oaiIdx, antIdx);
-          openBlockIdx = antIdx;
-          sendSse(res, "content_block_start", {
-            type: "content_block_start",
-            index: antIdx,
-            content_block: {
-              type: "tool_use",
-              id: tc.id || `toolu_${Date.now()}_${oaiIdx}`,
-              name: tc.function?.name || "Tool",
-              input: {},
-            },
-          });
+        let entry = activeTools.get(oaiIdx);
+        if (!entry) {
+          entry = { id: "", name: "", args: "" };
+          activeTools.set(oaiIdx, entry);
         }
+        if (tc.id) entry.id = tc.id;
+        if (tc.function?.name) entry.name += tc.function.name;
         if (tc.function?.arguments) {
           streamedOutChars += tc.function.arguments;
-          sendSse(res, "content_block_delta", {
-            type: "content_block_delta",
-            index: antIdx,
-            delta: { type: "input_json_delta", partial_json: tc.function.arguments },
-          });
+          entry.args += tc.function.arguments;
         }
       }
     }
@@ -854,6 +876,7 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
   } finally {
     closeCurrentBlock();
     if (!signal?.aborted) {
+      flushPendingTools();
       const finalInputTokens = usage.input_tokens > 0 ? usage.input_tokens : estimatedInputTokens;
       const finalOutputTokens =
         usage.output_tokens > 0 ? usage.output_tokens : Math.max(1, estimateTextTokens(streamedOutChars));
@@ -875,33 +898,58 @@ async function handleOpenAiTranslated(res, provider, antBody, thinkingHint = "",
 /**
  * Main HTTP handler for `/proxy/provider/:providerId[/:thinkingHint[/:sessionId]]/v1/...`
  */
-export async function handleProviderProxyRequest(req, res, providerId, subpath, thinkingHint = "", sessionId = "") {
+export async function handleProviderProxyRequest(
+  req,
+  res,
+  providerId,
+  subpath,
+  thinkingHint = "",
+  sessionId = "",
+  requireInternalToken = false,
+) {
+  if (requireInternalToken && !isValidInternalRequest(req)) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    return res.end(
+      JSON.stringify({ type: "error", error: { type: "authentication_error", message: "拒绝未授权访问本地内部代理" } }),
+    );
+  }
+
   const provider = getProvider(providerId, true);
   if (!provider) {
     res.writeHead(404, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ type: "error", error: { type: "not_found", message: `供应商不存在: ${providerId}` } }));
   }
 
-  const chunks = [];
-  for await (const c of req) chunks.push(c);
-  const rawBody = Buffer.concat(chunks).toString("utf8");
   const abortCtrl = attachClientAbortController(req, res);
 
-  // Handle count_tokens gracefully for OpenAI-compatible providers
-  if (subpath.includes("count_tokens")) {
-    if (provider.kind === "anthropic") {
-      try {
-        return await handleAnthropicPassthrough(req, res, provider, rawBody, "/messages/count_tokens", abortCtrl.signal);
-      } catch {
-        // fall through to fast local estimate
-      }
-    }
-    const approx = Math.max(10, Math.round(rawBody.length / 3.5));
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ input_tokens: approx }));
-  }
-
   try {
+    const chunks = [];
+    let totalBytes = 0;
+    const maxProxyBody = 50 * 1024 * 1024;
+    for await (const c of req) {
+      totalBytes += c.length;
+      if (totalBytes > maxProxyBody) {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "请求体超过 50MB 限制" } }));
+      }
+      chunks.push(c);
+    }
+    const rawBody = Buffer.concat(chunks).toString("utf8");
+
+    // Handle count_tokens gracefully for OpenAI-compatible providers
+    if (subpath.includes("count_tokens")) {
+      if (provider.kind === "anthropic") {
+        try {
+          return await handleAnthropicPassthrough(req, res, provider, rawBody, "/messages/count_tokens", abortCtrl.signal);
+        } catch {
+          // fall through to fast local estimate
+        }
+      }
+      const approx = Math.max(10, Math.round(rawBody.length / 3.5));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ input_tokens: approx }));
+    }
+
     if (provider.kind === "anthropic") {
       let bodyToSend = rawBody;
       if (rawBody) {

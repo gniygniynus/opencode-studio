@@ -86,13 +86,35 @@ function parseFrontmatterAndTitle(content, fallbackName) {
 }
 
 function inferProjectCwdFromSlug(slug) {
-  // Windows slug e.g. D--claude -> D:\claude
-  const winM = String(slug || "").match(/^([A-Za-z])--(.+)$/);
+  const s = String(slug || "");
+  // Greedy existence resolver so hyphenated folders like `D--gemini-opencode-studio` resolve to `D:\gemini\opencode-studio`!
+  const resolveParts = (baseRoot, rawRest) => {
+    const tokens = rawRest.split("-").filter(Boolean);
+    let cur = baseRoot;
+    let i = 0;
+    while (i < tokens.length) {
+      let matched = "";
+      for (let j = tokens.length; j > i; j--) {
+        const candidateName = tokens.slice(i, j).join("-");
+        const full = path.join(cur, candidateName);
+        if (fs.existsSync(full)) {
+          matched = full;
+          i = j;
+          break;
+        }
+      }
+      if (!matched) return "";
+      cur = matched;
+    }
+    return fs.existsSync(cur) ? cur : "";
+  };
+
+  const winM = s.match(/^([A-Za-z])--(.+)$/);
   if (winM) {
-    const drive = winM[1].toUpperCase();
-    const rest = winM[2].replace(/-/g, "\\");
-    const candidate = `${drive}:\\${rest}`;
-    if (fs.existsSync(candidate)) return candidate;
+    return resolveParts(`${winM[1].toUpperCase()}:\\`, winM[2]);
+  }
+  if (s.startsWith("-")) {
+    return resolveParts("/", s.slice(1));
   }
   return "";
 }
@@ -275,10 +297,12 @@ export function syncDiskMemoriesToDb({ force = false } = {}) {
 
   const existingAll = listMemories();
   const byId = new Map(existingAll.map((m) => [m.id, m]));
-  const byNormTitle = new Map();
+  // Only match non-disk-backed legacy rows by normalized title so two projects with same filename (`arch.md`) NEVER overwrite each other!
+  const legacyByNormTitle = new Map();
   for (const m of existingAll) {
+    if (String(m.id || "").startsWith("mem_disk_")) continue;
     const k = normalizeKey(m.title);
-    if (!byNormTitle.has(k)) byNormTitle.set(k, m);
+    if (!legacyByNormTitle.has(k)) legacyByNormTitle.set(k, m);
   }
 
   let synced = 0;
@@ -295,19 +319,21 @@ export function syncDiskMemoriesToDb({ force = false } = {}) {
 
     const stableId = `mem_disk_${crypto.createHash("sha1").update(item.relPath).digest("hex").slice(0, 16)}`;
 
-    // Match existing row without creating duplicates
+    // Match existing row cleanly by exact disk ID / path first, falling back to legacy title migration only for non-disk rows
     let existing =
       byId.get(stableId) ||
       (memIdByDiskPath.has(item.fullPath) ? byId.get(memIdByDiskPath.get(item.fullPath)) : null) ||
-      byNormTitle.get(normalizeKey(item.title)) ||
-      (item.canonicalAltTitle ? byNormTitle.get(normalizeKey(item.canonicalAltTitle)) : null) ||
-      (!item.isIndex && !item.isRootRule ? byNormTitle.get(normalizeKey(item.fileName)) : null) ||
+      legacyByNormTitle.get(normalizeKey(item.title)) ||
+      (item.canonicalAltTitle ? legacyByNormTitle.get(normalizeKey(item.canonicalAltTitle)) : null) ||
+      (!item.isIndex && !item.isRootRule ? legacyByNormTitle.get(normalizeKey(item.fileName)) : null) ||
       null;
 
     // Also match root rules even if slightly differently named in older imports
     if (!existing && item.isRootRule) {
       const baseNoExt = normalizeKey(item.fileName);
-      existing = existingAll.find((m) => normalizeKey(m.title).startsWith(baseNoExt)) || null;
+      existing =
+        existingAll.find((m) => !String(m.id || "").startsWith("mem_disk_") && normalizeKey(m.title).startsWith(baseNoExt)) ||
+        null;
     }
 
     if (existing) {
@@ -348,7 +374,6 @@ export function syncDiskMemoriesToDb({ force = false } = {}) {
         relPathByMemId.set(saved.id, item.relPath);
         memIdByDiskPath.set(item.fullPath, saved.id);
         byId.set(saved.id, saved);
-        byNormTitle.set(normalizeKey(saved.title), saved);
         synced += 1;
       } catch {}
     }
@@ -367,6 +392,9 @@ export function syncDiskMemoriesToDb({ force = false } = {}) {
  */
 export function recordDeletedDiskMemory(memId) {
   if (!memId) return;
+  if (!relPathByMemId.has(memId) && !diskPathByMemId.has(memId)) {
+    syncDiskMemoriesToDb({ force: true });
+  }
   const relPath = relPathByMemId.get(memId);
   const fullPath = diskPathByMemId.get(memId);
   if (relPath) {
@@ -378,7 +406,10 @@ export function recordDeletedDiskMemory(memId) {
     const isIsolated = getAllSettings().claude_isolation !== "shared";
     const base = path.basename(fullPath).toUpperCase();
     const isProtected = base === "CLAUDE.MD" || base === "GLOBAL_AGENT_RULES.MD" || base === "WORK_PRINCIPLES.MD" || base === "MEMORY.MD";
-    if (isIsolated && !isProtected && fullPath.startsWith(getPaths().claudeConfigDir)) {
+    const cfgDir = path.resolve(getPaths().claudeConfigDir);
+    const normFull = process.platform === "win32" ? path.resolve(fullPath).toLowerCase() : path.resolve(fullPath);
+    const normCfg = (process.platform === "win32" ? cfgDir.toLowerCase() : cfgDir) + path.sep;
+    if (isIsolated && !isProtected && normFull.startsWith(normCfg)) {
       try {
         if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
       } catch {}
@@ -405,7 +436,14 @@ export function syncMemoryToDisk(savedMemory) {
 
   try {
     fs.mkdirSync(path.dirname(fp), { recursive: true });
-    fs.writeFileSync(fp, String(savedMemory.content || ""), "utf8");
+    const tmpFp = `${fp}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpFp, String(savedMemory.content || ""), "utf8");
+    try {
+      fs.renameSync(tmpFp, fp);
+    } catch {
+      fs.writeFileSync(fp, String(savedMemory.content || ""), "utf8");
+      try { fs.unlinkSync(tmpFp); } catch {}
+    }
     const rel = relPathByMemId.get(savedMemory.id);
     if (rel) {
       const ignoredMap = getIgnoredDiskMemoryMap();

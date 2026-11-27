@@ -102,7 +102,7 @@ before(async () => {
 
   await new Promise((r) => mockLlmServer.listen(0, "127.0.0.1", r));
   mockLlmUrl = `http://127.0.0.1:${mockLlmServer.address().port}`;
-  studioServer = await startServer({ host: "127.0.0.1", port: 0 });
+  studioServer = await startServer({ host: "127.0.0.1", port: 0, requireAuth: false });
 });
 
 after(async () => {
@@ -1072,5 +1072,151 @@ describe("OpenCode Studio Core Suite", () => {
     } finally {
       await new Promise((r) => gptRelay.close(r));
     }
+  });
+
+  it("enforces v2.3.0 pure-desktop isolation, anti-CSRF/DNS-rebinding/CSWSH, SSRF guards, upload XSS sandbox & skill slug dedup", async () => {
+    const { WebSocket } = await import("ws");
+    const { isSafePublicUrl } = await import("../server/security.mjs");
+    const { saveInstalledSkill, deleteInstalledSkill } = await import("../server/db.mjs");
+
+    const secSrv = await startServer({ host: "127.0.0.1", port: 0, desktopMode: true, requireAuth: true });
+    const rawHttpGet = (reqPath, headers = {}) =>
+      new Promise((resolve, reject) => {
+        const req = http.request(
+          { host: "127.0.0.1", port: secSrv.port, path: reqPath, method: "GET", headers },
+          (res) => {
+            const chunks = [];
+            res.on("data", (c) => chunks.push(c));
+            res.on("end", () =>
+              resolve({
+                status: res.statusCode,
+                headers: res.headers,
+                body: Buffer.concat(chunks).toString("utf8"),
+              }),
+            );
+          },
+        );
+        req.on("error", reject);
+        req.end();
+      });
+
+    try {
+      // 1. Pure desktop mode blocks external unauthenticated browser navigation to /
+      const rootBlock = await fetch(`${secSrv.url}/`);
+      assert.equal(rootBlock.status, 403, "unauthenticated browser GET / must return 403 in desktopMode");
+
+      // 2. Unauthenticated API calls are rejected with 401
+      const unauthApi = await fetch(`${secSrv.url}/api/bootstrap`);
+      assert.equal(unauthApi.status, 401);
+
+      // 3. DNS Rebinding defense: forged Host header must return 403 even if token is supplied
+      const rebindRes = await rawHttpGet("/api/bootstrap", {
+        Host: "evil.rebind.example.com",
+        "X-OCS-Token": secSrv.authToken,
+      });
+      assert.equal(rebindRes.status, 403, "forged Host header must be rejected with 403");
+
+      // 4. Cross-Origin CSRF defense: forged Origin header must return 403 even with valid session token
+      const badOriginRes = await rawHttpGet("/api/bootstrap", {
+        Host: `127.0.0.1:${secSrv.port}`,
+        Origin: "https://evil.example.com",
+        "X-OCS-Token": secSrv.authToken,
+      });
+      assert.equal(badOriginRes.status, 403, "cross-origin request must be rejected with 403");
+
+      // 5. Simple-POST CSRF defense: POST with text/plain Content-Type must return 415
+      const textPlainCsrf = await fetch(`${secSrv.url}/api/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain",
+          "X-OCS-Token": secSrv.authToken,
+        },
+        body: '{"name":"evil","command":"calc"}',
+      });
+      assert.equal(textPlainCsrf.status, 415, "text/plain POST must be rejected with 415");
+
+      // 6. Internal proxy route requires per-process INTERNAL_PROXY_TOKEN when requireAuth is active
+      const unauthProxy = await fetch(`${secSrv.url}/proxy/provider/fake_id/v1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "OPENCODE_STUDIO_PROXY" },
+        body: "{}",
+      });
+      assert.equal(unauthProxy.status, 401, "hardcoded legacy proxy key must be rejected with 401");
+
+      // 7. One-time desktop bootstrap nonce issues HttpOnly; SameSite=Strict session cookie and cannot be replayed
+      const firstBootUrl = secSrv.desktopBootUrl;
+      const bootHandshake = await fetch(firstBootUrl, { redirect: "manual" });
+      assert.equal(bootHandshake.status, 302);
+      const setCookie = bootHandshake.headers.get("set-cookie") || "";
+      assert.ok(setCookie.includes("ocs_session="), "must set ocs_session cookie");
+      assert.ok(setCookie.includes("HttpOnly"), "cookie must be HttpOnly");
+      assert.ok(setCookie.includes("SameSite=Strict"), "cookie must be SameSite=Strict");
+      const cookiePair = setCookie.split(";")[0];
+
+      const replayBoot = await fetch(firstBootUrl, { redirect: "manual" });
+      assert.equal(replayBoot.status, 403, "one-time desktop boot nonce must reject replay");
+      assert.notEqual(secSrv.desktopBootUrl, firstBootUrl, "desktopBootUrl getter must rotate to a fresh nonce");
+
+      const authedBoot = await fetch(`${secSrv.url}/api/bootstrap`, {
+        headers: { Cookie: cookiePair },
+      });
+      assert.equal(authedBoot.status, 200, "valid session cookie must unlock /api/bootstrap");
+
+      // 8. Cross-Site WebSocket Hijacking (CSWSH) defense
+      await assert.rejects(
+        () =>
+          new Promise((resolve, reject) => {
+            const ws = new WebSocket(`ws://127.0.0.1:${secSrv.port}/ws`, {
+              headers: { Origin: "https://evil.example.com", Cookie: cookiePair },
+            });
+            ws.once("open", () => {
+              ws.close();
+              resolve("OPENED");
+            });
+            ws.once("error", reject);
+            ws.once("unexpected-response", (_req, res) => {
+              res.resume();
+              reject(new Error(`WS_HTTP_${res.statusCode}`));
+            });
+          }),
+        /WS_HTTP_403/,
+        "WebSocket from external Origin must be rejected with 403",
+      );
+
+      // 9. Stored XSS defense on /api/uploads/:fname (.html / .svg forced to text/plain + CSP sandbox)
+      const htmlB64 = Buffer.from("<script>alert('xss')</script>", "utf8").toString("base64");
+      const upRes = await fetch(`${secSrv.url}/api/upload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookiePair },
+        body: JSON.stringify({ name: "payload.html", media_type: "text/html", data: htmlB64 }),
+      }).then((r) => r.json());
+      assert.equal(upRes.ok, true);
+      const servedUp = await fetch(`${secSrv.url}${upRes.url}`, {
+        headers: { Cookie: cookiePair },
+      });
+      assert.equal(servedUp.status, 200);
+      assert.ok((servedUp.headers.get("content-type") || "").startsWith("text/plain"), "uploaded HTML must not render as text/html");
+      assert.ok((servedUp.headers.get("content-security-policy") || "").includes("sandbox"), "uploaded file must carry CSP sandbox");
+    } finally {
+      await secSrv.stop();
+    }
+
+    // 10. Expanded dangerous command detection, SSRF private IP guards, and duplicate skill slug auto-dedup
+    assert.equal(isDangerousCommand("rm -f -r ./important"), true);
+    assert.equal(isDangerousCommand("git push origin main -f"), true);
+    assert.equal(isDangerousCommand("ri -r -fo ./dir"), true);
+
+    assert.equal(isSafePublicUrl("http://127.0.0.1:17620/api/bootstrap"), false);
+    assert.equal(isSafePublicUrl("http://169.254.169.254/latest/meta-data/"), false);
+    assert.equal(isSafePublicUrl("http://[::ffff:127.0.0.1]:8080/"), false);
+    assert.equal(isSafePublicUrl("https://api.github.com/repos"), true);
+
+    const sk1 = saveInstalledSkill({ name: "My Custom Skill", content: "# v1" });
+    const sk1b = saveInstalledSkill({ name: "My Custom Skill", content: "# v1-updated" });
+    assert.equal(sk1b.id, sk1.id, "re-installing without id must idempotently update existing skill");
+    const sk2 = saveInstalledSkill({ id: "sk_distinct_2", name: "My Custom Skill", content: "# v2" });
+    assert.equal(sk2.slug, "my-custom-skill-2", "distinct skill id with colliding name must auto-deduplicate slug");
+    deleteInstalledSkill(sk1.id);
+    deleteInstalledSkill(sk2.id);
   });
 });

@@ -8,6 +8,7 @@
 import { getAllSettings } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
 import { proxyFetch } from "./runtime_utils.mjs";
+import { capMapSize, isSafePublicUrl } from "./security.mjs";
 
 const USER_AGENT = "OpenCodeStudio/2.1 (+https://github.com/gniygniynus/opencode-studio)";
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -919,7 +920,10 @@ export async function searchMcpStore(query = "", enginePref = "") {
     items: [...dedup.values()].slice(0, 36),
     online_error: errors.length && !onlineItems.length ? errors.join("；") : "",
   };
-  if (onlineItems.length > 0) _storeQueryCache.set(cacheKey, { at: Date.now(), data: result });
+  if (onlineItems.length > 0) {
+    _storeQueryCache.set(cacheKey, { at: Date.now(), data: result });
+    capMapSize(_storeQueryCache, 100);
+  }
   return result;
 }
 
@@ -1255,7 +1259,9 @@ export async function downloadRemoteSkillContent(item) {
 
 export async function importPublicSkillFromUrl(rawUrl) {
   const clean = String(rawUrl || "").trim();
-  if (!/^https?:\/\//i.test(clean)) throw new Error("请输入以 http:// 或 https:// 开头的公开 GitHub 仓库或 SKILL.md 链接");
+  if (!isSafePublicUrl(clean)) {
+    throw new Error("请输入以 http:// 或 https:// 开头的公开 GitHub 仓库或 SKILL.md 链接（已拒绝本地或内网地址）");
+  }
 
   let fetchUrls = [clean];
   let fallbackSlug = "imported-skill";
@@ -1288,17 +1294,13 @@ export async function importPublicSkillFromUrl(rawUrl) {
 
   let content = "";
   for (const u of fetchUrls) {
+    if (!isSafePublicUrl(u)) continue;
     try {
-      const c = new AbortController();
-      const t = setTimeout(() => c.abort(), 8000);
-      const r = await fetch(u, { headers: { "User-Agent": USER_AGENT }, signal: c.signal });
-      clearTimeout(t);
-      if (r.ok) {
-        const txt = await r.text();
-        if (txt.trim().length > 15) {
-          content = txt.slice(0, 24000);
-          break;
-        }
+      const r = await fetchWithTimeout(u, { timeoutMs: 8500 });
+      const txt = await r.text();
+      if (txt.trim().length > 15) {
+        content = txt.slice(0, 24000);
+        break;
       }
     } catch {}
   }

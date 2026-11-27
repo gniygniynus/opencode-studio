@@ -35,8 +35,10 @@
     activeSessionId: null,
     activeTimeline: null,
     activeCwd: "",
-    liveStream: new Map(), // sessionId -> { model, provider_name, engine, blocks, error }
+    liveStream: new Map(), // sessionId -> { model, provider_name, engine, blocks, usage, error }
     attachments: [],
+    draftAttachments: new Map(), // (sessionId || "new") -> attachment[]
+    pendingClientReqIds: new Set(),
 
     // Editing states
     editingMessageId: null,
@@ -97,6 +99,140 @@
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#39;");
+  }
+
+  function safeExternalUrl(rawUrl) {
+    const s = String(rawUrl || "").trim();
+    if (!s) return "";
+    try {
+      const u = new URL(s);
+      if (u.protocol === "https:" || u.protocol === "http:") return u.toString();
+    } catch {}
+    return "";
+  }
+
+  function safeMediaHref(rawUrl) {
+    const s = String(rawUrl || "").trim();
+    if (!s) return "#";
+    if (s.startsWith("/api/uploads/") || s.startsWith("/api/bg-files/") || s.startsWith("/api/we/")) return s;
+    return safeExternalUrl(s) || "#";
+  }
+
+  function safeCssUrl(rawUrl) {
+    const s = String(rawUrl || "").trim();
+    if (!s) return "none";
+    return `url("${s.replace(/[\\"'\r\n()]/g, "\\$&")}")`;
+  }
+
+  function isSafeGradientCss(cssVal) {
+    return /^(?:linear|radial)-gradient\([^;<>"{}\\]+\)$/i.test(String(cssVal || "").trim());
+  }
+
+  // ==================== NATIVE DESKTOP GLASS DIALOGS (REPLACES BROKEN window.prompt / confirm) ====================
+  let _activeUiDialogResolver = null;
+
+  function _closeUiDialogWith(val) {
+    const resolve = _activeUiDialogResolver;
+    _activeUiDialogResolver = null;
+    closeModal("modal-ui-dialog");
+    if (resolve) resolve(val);
+  }
+
+  function showUiDialog({ title = "提示", description = "", fields = [], okText = "确定", danger = false } = {}) {
+    if (_activeUiDialogResolver) {
+      _closeUiDialogWith(null);
+    }
+    return new Promise((resolve) => {
+      _activeUiDialogResolver = resolve;
+      $("ui-dialog-title").textContent = title;
+      const descEl = $("ui-dialog-desc");
+      if (description) {
+        descEl.textContent = description;
+        descEl.classList.remove("hidden");
+      } else {
+        descEl.textContent = "";
+        descEl.classList.add("hidden");
+      }
+
+      const fieldsBox = $("ui-dialog-fields");
+      fieldsBox.innerHTML = "";
+      const inputs = [];
+      for (const f of fields) {
+        const wrap = document.createElement("div");
+        wrap.className = "ui-dialog-field";
+        if (f.label) {
+          const lbl = document.createElement("label");
+          lbl.textContent = f.label;
+          wrap.appendChild(lbl);
+        }
+        const inp = document.createElement(f.multiline ? "textarea" : "input");
+        if (!f.multiline) inp.type = f.type || "text";
+        inp.value = f.defaultValue ?? "";
+        if (f.placeholder) inp.placeholder = f.placeholder;
+        inp.dataset.key = f.key || "value";
+        wrap.appendChild(inp);
+        fieldsBox.appendChild(wrap);
+        inputs.push(inp);
+      }
+
+      const okBtn = $("btn-ui-dialog-ok");
+      okBtn.textContent = okText;
+      okBtn.className = danger ? "btn-danger" : "btn-primary";
+
+      const submit = () => {
+        if (!fields.length) return _closeUiDialogWith(true);
+        if (fields.length === 1 && !fields[0].key) {
+          return _closeUiDialogWith(inputs[0].value);
+        }
+        const out = {};
+        for (const inp of inputs) out[inp.dataset.key] = inp.value;
+        _closeUiDialogWith(out);
+      };
+
+      okBtn.onclick = submit;
+      $("btn-ui-dialog-cancel").onclick = () => _closeUiDialogWith(fields.length ? null : false);
+      $("btn-ui-dialog-x").onclick = () => _closeUiDialogWith(fields.length ? null : false);
+
+      inputs.forEach((inp, idx) => {
+        if (inp.tagName === "INPUT") {
+          inp.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter" && !ev.isComposing) {
+              ev.preventDefault();
+              if (idx < inputs.length - 1) inputs[idx + 1].focus();
+              else submit();
+            }
+          });
+        }
+      });
+
+      openModal("modal-ui-dialog");
+      setTimeout(() => {
+        if (inputs[0]) {
+          inputs[0].focus();
+          if (inputs[0].tagName === "INPUT") inputs[0].select();
+        } else {
+          okBtn.focus();
+        }
+      }, 30);
+    });
+  }
+
+  function uiConfirm(message, title = "操作确认", danger = false) {
+    return showUiDialog({
+      title,
+      description: message,
+      fields: [],
+      okText: danger ? "确认删除" : "确认",
+      danger,
+    });
+  }
+
+  function uiPrompt(labelOrTitle, defaultValue = "", placeholder = "") {
+    return showUiDialog({
+      title: labelOrTitle,
+      fields: [{ defaultValue, placeholder }],
+      okText: "确定",
+    });
   }
 
   function fmtTokens(n) {
@@ -220,10 +356,25 @@
     }
   }
 
+  let _desktopAuthToken = "";
+
+  async function ensureDesktopAuthToken() {
+    if (_desktopAuthToken) return _desktopAuthToken;
+    if (window.opencodeDesktop?.getAuthToken) {
+      try {
+        _desktopAuthToken = (await window.opencodeDesktop.getAuthToken()) || "";
+      } catch {}
+    }
+    return _desktopAuthToken;
+  }
+
   async function apiJson(url, opts = {}) {
+    const tok = await ensureDesktopAuthToken();
+    const extraHeaders = { ...(opts.headers || {}) };
+    if (tok) extraHeaders["X-OCS-Token"] = tok;
     const res = await fetch(url, {
-      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
       ...opts,
+      headers: { "Content-Type": "application/json", ...extraHeaders },
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -266,8 +417,10 @@
   }
 
   function saveDraft() {
+    const sessKey = state.activeSessionId || "new";
+    state.draftAttachments.set(sessKey, state.attachments.slice());
     try {
-      const k = DRAFT_PREFIX + (state.activeSessionId || "new");
+      const k = DRAFT_PREFIX + sessKey;
       const v = $("composer-input").value;
       if (v) localStorage.setItem(k, v);
       else localStorage.removeItem(k);
@@ -275,8 +428,11 @@
   }
 
   function restoreDraft() {
+    const sessKey = state.activeSessionId || "new";
+    state.attachments = (state.draftAttachments.get(sessKey) || []).slice();
+    renderAttachments();
     try {
-      const k = DRAFT_PREFIX + (state.activeSessionId || "new");
+      const k = DRAFT_PREFIX + sessKey;
       $("composer-input").value = localStorage.getItem(k) || "";
       autoResizeComposer();
     } catch {}
@@ -347,6 +503,9 @@
 
     // 1. Update CSS tokens & body classes (instant, zero media disruption!)
     document.documentElement.setAttribute("data-theme", theme);
+    if (window.opencodeDesktop?.setTheme) {
+      window.opencodeDesktop.setTheme(theme).catch(() => {});
+    }
     document.documentElement.style.setProperty("--font-size-base", `${ap.fontSize || 14.5}px`);
     try {
       localStorage.setItem("ocs_ap_snap", JSON.stringify({ theme, fontSize: ap.fontSize || 14.5 }));
@@ -415,6 +574,8 @@
           setTimeout(() => {
             if (token === state._bgSwapToken && !videoEl.classList.contains("wp-visible")) {
               videoEl.pause();
+              videoEl.removeAttribute("src");
+              videoEl.load();
               videoEl.classList.add("hidden");
             }
           }, 360);
@@ -436,6 +597,10 @@
         stopNonTarget("live");
         state.liveBgEngine?.setMode(ap.liveBg);
       } else if (normKind === "web" && webEl) {
+        if (!String(ap.bgUrl || "").startsWith("/api/we/web/")) {
+          stopNonTarget("");
+          return;
+        }
         stopNonTarget("web");
         webEl.classList.remove("hidden", "wp-visible");
         const revealWeb = () => {
@@ -464,11 +629,11 @@
         setTimeout(revealVideo, 450);
       } else if (normKind === "gradient") {
         stopNonTarget("static");
-        _crossfadeStaticBg(ap.bgUrl, token);
+        if (isSafeGradientCss(ap.bgUrl)) _crossfadeStaticBg(ap.bgUrl, token);
       } else if (normKind === "image") {
         stopNonTarget("static");
         const targetUrl = ap.bgUrl;
-        const cssUrl = `url("${targetUrl.replace(/"/g, '\\"')}")`;
+        const cssUrl = safeCssUrl(targetUrl);
         const preloader = new Image();
         let done = false;
         const commit = () => {
@@ -639,13 +804,16 @@
         const lineCount = codeLines.length;
         const skipSyntax = isStreaming && !closed && rawCode.length > 6000;
         const codeHtml = highlightCodeSyntax(rawCode, lang, skipSyntax);
-        const dotColor = LANG_DOT_COLORS[lang.toLowerCase()] || "var(--brand)";
+        const langKey = lang.toLowerCase();
+        const dotColor = Object.prototype.hasOwnProperty.call(LANG_DOT_COLORS, langKey)
+          ? LANG_DOT_COLORS[langKey]
+          : "var(--brand)";
         const collapsible = !isStreaming && lineCount > 32;
         out.push(
           `<div class="md-code-block${collapsible ? " is-collapsed" : ""}">` +
             `<div class="md-code-head">` +
               `<span class="md-code-lang"><span class="md-code-dot" style="background:${dotColor};"></span><span>${escHtml(lang)}</span><span class="md-code-lines">${lineCount} 行</span></span>` +
-              `<span class="md-code-actions"><button type="button" class="md-code-copy" data-code="${encodeURIComponent(rawCode)}">复制代码</button></span>` +
+              `<span class="md-code-actions"><button type="button" class="md-code-copy">复制代码</button></span>` +
             `</div>` +
             `<pre><code>${codeHtml}</code></pre>` +
             (collapsible
@@ -718,10 +886,24 @@
   }
 
   function highlightHtml(text, query) {
-    const safe = escHtml(text);
-    if (!query) return safe;
-    const esc = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return safe.replace(new RegExp(`(${esc})`, "gi"), '<mark class="search-hl">$1</mark>');
+    const raw = String(text ?? "");
+    const q = String(query || "");
+    if (!q) return escHtml(raw);
+    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    let out = "";
+    let lastIdx = 0;
+    let m;
+    while ((m = rx.exec(raw)) !== null) {
+      if (m[0].length === 0) {
+        rx.lastIndex += 1;
+        continue;
+      }
+      out += escHtml(raw.slice(lastIdx, m.index));
+      out += `<mark class="search-hl">${escHtml(m[0])}</mark>`;
+      lastIdx = m.index + m[0].length;
+    }
+    out += escHtml(raw.slice(lastIdx));
+    return out;
   }
 
   // ==================== PROVIDER & MODEL SELECTORS (ADAPTIVE THINKING) ====================
@@ -1065,13 +1247,16 @@
     el.appendChild(frag);
   }
 
+  let _sessionsReqSeq = 0;
   async function refreshSessions() {
+    const seq = ++_sessionsReqSeq;
     const q = $("global-search-input").value.trim();
     const cwd = $("cwd-filter-select").value;
     const params = new URLSearchParams();
     if (q) params.set("q", q);
     if (cwd) params.set("cwd", cwd);
     const data = await apiJson(`/api/sessions?${params.toString()}`);
+    if (seq !== _sessionsReqSeq) return;
     state.sessions = data.sessions || [];
     state.cwds = data.cwds || [];
     state.runningIds = new Set(data.running_sessions || []);
@@ -1206,7 +1391,8 @@
 
   function createToolCardEl(tool, openByDefault = false) {
     const det = document.createElement("details");
-    const status = tool.status || (tool.is_error ? "error" : "done");
+    const rawStatus = tool.status || (tool.is_error ? "error" : "done");
+    const status = ["running", "error", "done"].includes(rawStatus) ? rawStatus : "done";
     det.className = "tool-card" + (tool.is_error ? " is-error" : "");
     det.dataset.toolId = tool.id || "";
     const icon = status === "running" ? "◌" : status === "error" || tool.is_error ? "✕" : "✓";
@@ -1259,10 +1445,12 @@
     wrap.className = "msg-user";
     wrap.id = item.id;
 
-    // Inline edit mode for Edit & Resend
+    // Inline edit mode for Edit & Resend (preserves & allows removing existing attachments)
     if (state.editingMessageId === item.id) {
+      let editImages = Array.isArray(item.images) ? item.images.slice() : [];
       wrap.innerHTML =
         `<div class="edit-box-wrap">` +
+          `<div class="edit-att-strip hidden" id="inline-edit-atts"></div>` +
           `<textarea class="edit-box-textarea" id="inline-edit-ta" rows="3">${escHtml(item.content_text || "")}</textarea>` +
           `<div class="edit-box-actions">` +
             `<span class="muted-text" style="margin-right:auto;font-size:11.5px;">Enter / Shift+Enter / Ctrl+Enter 自由换行 · Esc 取消</span>` +
@@ -1270,6 +1458,28 @@
             `<button type="button" class="btn-primary sm" id="btn-submit-edit">保存并重新发送（创建新分支）</button>` +
           `</div>` +
         `</div>`;
+      const attBox = wrap.querySelector("#inline-edit-atts");
+      const renderEditAtts = () => {
+        if (!editImages.length) {
+          attBox.classList.add("hidden");
+          attBox.innerHTML = "";
+          return;
+        }
+        attBox.classList.remove("hidden");
+        attBox.innerHTML = "";
+        editImages.forEach((im, idx) => {
+          const chip = document.createElement("span");
+          chip.className = "edit-att-chip";
+          chip.innerHTML = `<span>📎 ${escHtml(im.name || "附件")}</span><button type="button" class="edit-att-rm" title="移除此附件">×</button>`;
+          chip.querySelector(".edit-att-rm").addEventListener("click", () => {
+            editImages.splice(idx, 1);
+            renderEditAtts();
+          });
+          attBox.appendChild(chip);
+        });
+      };
+      renderEditAtts();
+
       const ta = wrap.querySelector("#inline-edit-ta");
       setTimeout(() => {
         autoResizeTextarea(ta, 76, 360);
@@ -1282,10 +1492,13 @@
         renderConversation();
       };
       const submitInlineEdit = () => {
+        if (state.activeSessionId && state.runningIds.has(state.activeSessionId)) {
+          return toast("当前会话正在生成回复，请先停止后再提交编辑");
+        }
         const nextText = ta.value.trim();
-        if (!nextText) return toast("消息内容不能为空");
+        if (!nextText && !editImages.length) return toast("消息内容或附件不能为空");
         state.editingMessageId = null;
-        sendEditResend(item.id, nextText);
+        sendEditResend(item.id, nextText, editImages);
       };
       ta.addEventListener("keydown", (ev) => {
         if (ev.key === "Enter" && !ev.isComposing && (ev.ctrlKey || ev.altKey || ev.metaKey)) {
@@ -1317,14 +1530,14 @@
     const fileAtts = (item.images || []).filter((im) => !isAttImg(im));
 
     const imgsHtml = imgAtts.length
-      ? `<div class="msg-images">${imgAtts.map((im) => `<img src="${escHtml(im.url)}" alt="${escHtml(im.name || "图片")}" />`).join("")}</div>`
+      ? `<div class="msg-images">${imgAtts.map((im) => `<img src="${escHtml(safeMediaHref(im.url))}" alt="${escHtml(im.name || "图片")}" />`).join("")}</div>`
       : "";
     const filesHtml = fileAtts.length
       ? `<div class="msg-files">${fileAtts
           .map((f) => {
             const ico = f.kind === "text" ? "📄" : "📎";
             const sz = f.size >= 1024 * 1024 ? `${(f.size / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round((f.size || 0) / 1024))} KB`;
-            return `<a class="msg-file-chip" href="${escHtml(f.url || "#")}" target="_blank" rel="noopener noreferrer" title="${escHtml(f.path || f.name || "")}">` +
+            return `<a class="msg-file-chip" href="${escHtml(safeMediaHref(f.url))}" target="_blank" rel="noopener noreferrer" title="${escHtml(f.path || f.name || "")}">` +
               `<span>${ico}</span><span>${escHtml(f.name || "附件")}</span><span class="mf-size">${sz}</span></a>`;
           })
           .join("")}</div>`
@@ -1709,7 +1922,17 @@
       $("thread-title").textContent = data.session.title || "新会话";
       $("cwd-pill-text").textContent = state.activeCwd;
 
-      if (data.live) state.liveStream.set(sid, data.live);
+      if (data.live) {
+        state.liveStream.set(sid, data.live);
+        if (data.live.pending_confirm) {
+          state.activeConfirmId = data.live.pending_confirm.confirm_id;
+          $("confirm-reason").textContent = data.live.pending_confirm.reason || "请确认是否允许执行以下命令：";
+          $("confirm-cmd").textContent = data.live.pending_confirm.command || "";
+          openModal("modal-confirm");
+        }
+      } else {
+        state.liveStream.delete(sid);
+      }
       if (data.session.provider_id) {
         renderComposerSelectors(data.session.provider_id, data.session.model, data.session.thinking_level);
       }
@@ -1740,8 +1963,6 @@
     state.activeCwd = state.settings.default_cwd || state.activeCwd;
     $("thread-title").textContent = "新会话";
     $("cwd-pill-text").textContent = state.activeCwd || "默认目录";
-    state.attachments = [];
-    renderAttachments();
     renderSessionList();
     renderConversation();
     triggerViewFade($("welcome-view"));
@@ -1751,7 +1972,7 @@
     $("composer-input").focus();
   }
 
-  function exportCurrentSessionMarkdown() {
+  async function exportCurrentSessionMarkdown() {
     const tl = state.activeTimeline;
     if (!tl?.items?.length) {
       return toast("当前会话暂无内容可导出");
@@ -1800,6 +2021,19 @@
     const safeName = String(sess.title || "conversation")
       .replace(/[\\/:*?"<>|]+/g, "_")
       .slice(0, 48) || "conversation";
+
+    if (window.opencodeDesktop?.saveMarkdownFile) {
+      try {
+        const saved = await window.opencodeDesktop.saveMarkdownFile(`${safeName}.md`, mdContent);
+        if (saved?.ok && saved.filePath) {
+          toast(`已保存 Markdown 至：${saved.filePath}`, 3800);
+        }
+        return;
+      } catch (err) {
+        return toast("保存文件失败: " + err.message, 3800);
+      }
+    }
+
     const blob = new Blob([mdContent], { type: "text/markdown;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1813,12 +2047,17 @@
   }
 
   async function switchToBranch(targetMessageId) {
-    if (!state.activeSessionId) return;
+    const sid = state.activeSessionId;
+    if (!sid) return;
+    if (state.runningIds.has(sid)) {
+      return toast("当前会话正在生成回复，请等待完成或先点击停止");
+    }
     try {
-      const res = await apiJson(`/api/sessions/${encodeURIComponent(state.activeSessionId)}/switch-branch`, {
+      const res = await apiJson(`/api/sessions/${encodeURIComponent(sid)}/switch-branch`, {
         method: "POST",
         body: JSON.stringify({ message_id: targetMessageId }),
       });
+      if (state.activeSessionId !== sid) return;
       state.activeTimeline = res.timeline;
       renderConversation();
       jumpToElement(targetMessageId);
@@ -1981,9 +2220,13 @@
 
   // ==================== WEBSOCKET MULTIPLEXING ====================
 
-  function connectWs() {
+  async function connectWs() {
+    const tok = await ensureDesktopAuthToken();
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${proto}//${location.host}/ws`);
+    const wsUrl = tok
+      ? `${proto}//${location.host}/ws?token=${encodeURIComponent(tok)}`
+      : `${proto}//${location.host}/ws`;
+    const ws = new WebSocket(wsUrl);
     state.ws = ws;
     ws.onopen = () => {
       state.wsConnected = true;
@@ -2015,12 +2258,47 @@
     const t = msg.type;
     if (t === "hello") {
       state.runningIds = new Set(msg.running_sessions || []);
+      for (const sid of [...state.liveStream.keys()]) {
+        if (!state.runningIds.has(sid)) {
+          state.liveStream.delete(sid);
+        }
+      }
       if (msg.providers) {
         state.providers = msg.providers;
         state.activeProvider = msg.active_provider;
         renderComposerSelectors();
       }
       updateRunningButtons();
+      refreshSessions().catch(() => {});
+      if (state.activeSessionId) {
+        const curSid = state.activeSessionId;
+        apiJson(`/api/sessions/${encodeURIComponent(curSid)}`)
+          .then((fresh) => {
+            if (state.activeSessionId !== curSid) return;
+            state.activeTimeline = fresh;
+            if (fresh.live) {
+              state.liveStream.set(curSid, fresh.live);
+              if (fresh.live.pending_confirm) {
+                state.activeConfirmId = fresh.live.pending_confirm.confirm_id;
+                $("confirm-reason").textContent = fresh.live.pending_confirm.reason || "请确认是否允许执行以下命令：";
+                $("confirm-cmd").textContent = fresh.live.pending_confirm.command || "";
+                openModal("modal-confirm");
+              }
+            } else {
+              state.liveStream.delete(curSid);
+              if (state.activeConfirmId) {
+                state.activeConfirmId = null;
+                closeModal("modal-confirm");
+              }
+            }
+            renderConversation();
+          })
+          .catch(() => {});
+      }
+      return;
+    }
+    if (t === "busy_notice") {
+      toast(msg.message || "该会话正在生成回复，请等待或先点击停止");
       return;
     }
     if (t === "settings_updated" && msg.settings) {
@@ -2049,9 +2327,12 @@
       if (box) {
         box.classList.remove("hidden");
         if (msg.stage === "oauth_url" && msg.url) {
+          const safeOAuth = safeExternalUrl(msg.url);
           box.innerHTML =
             `<div style="margin-bottom:6px;"><b>已生成官方授权链接（系统浏览器已自动尝试打开）：</b></div>` +
-            `<a class="btn-primary sm" style="text-decoration:none;margin-bottom:6px;" href="${escHtml(msg.url)}" target="_blank" rel="noopener noreferrer">在浏览器中打开官方授权页 ↗</a>` +
+            (safeOAuth
+              ? `<a class="btn-primary sm" style="text-decoration:none;margin-bottom:6px;" href="${escHtml(safeOAuth)}" target="_blank" rel="noopener noreferrer">在浏览器中打开官方授权页 ↗</a>`
+              : "") +
             `<div class="muted-text" style="word-break:break-all;font-size:11px;">${escHtml(msg.url)}</div>` +
             `<div class="muted-text" style="margin-top:4px;">完成网页授权后，如页面给出授权码 (Code)，请粘贴至下方提交；如已自动回调成功，点击上方「刷新状态」即可。</div>`;
           codeRow?.classList.remove("hidden");
@@ -2099,7 +2380,9 @@
     }
     if (t === "session_created" && msg.session) {
       refreshSessions();
-      if (!state.activeSessionId) {
+      const isMine = msg.client_req_id && state.pendingClientReqIds.has(msg.client_req_id);
+      if (isMine) state.pendingClientReqIds.delete(msg.client_req_id);
+      if (!state.activeSessionId && (isMine || !msg.client_req_id)) {
         state.activeSessionId = msg.session.id;
         $("thread-title").textContent = msg.session.title;
         $("cwd-pill-text").textContent = msg.session.cwd;
@@ -2202,6 +2485,9 @@
 
   function sendCurrentMessage() {
     if (!state.wsConnected) return toast("正在重连后端服务…");
+    if (state.activeSessionId && state.runningIds.has(state.activeSessionId)) {
+      return toast("当前会话正在生成回复，请等待或点击停止");
+    }
     let text = $("composer-input").value.trim();
     const images = state.attachments.slice();
     if (!text && !images.length) return;
@@ -2230,17 +2516,20 @@
     const prov = getSelectedProvider();
     const model = $("model-select").value;
     const thinking = $("gd-thinking")?.classList.contains("hidden") ? "off" : $("thinking-select").value;
+    const clientReqId = `creq_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    if (!state.activeSessionId) state.pendingClientReqIds.add(clientReqId);
 
     $("composer-input").value = "";
     autoResizeComposer();
-    saveDraft();
     state.attachments = [];
+    saveDraft();
     renderAttachments();
     closeAutocomplete();
 
     state.ws.send(JSON.stringify({
       type: "send_message",
       session_id: state.activeSessionId || "",
+      client_req_id: clientReqId,
       text,
       images,
       cwd: state.activeCwd || state.settings.default_cwd || "",
@@ -2251,8 +2540,11 @@
     }));
   }
 
-  function sendEditResend(messageId, newText) {
+  function sendEditResend(messageId, newText, images = null) {
     if (!state.wsConnected || !state.activeSessionId) return;
+    if (state.runningIds.has(state.activeSessionId)) {
+      return toast("当前会话正在运行，请先停止后再编辑重发");
+    }
     const prov = getSelectedProvider();
     const model = $("model-select").value;
     const thinking = $("gd-thinking")?.classList.contains("hidden") ? "off" : $("thinking-select").value;
@@ -2261,6 +2553,7 @@
       session_id: state.activeSessionId,
       message_id: messageId,
       new_text: newText,
+      images,
       provider_id: prov?.id || "",
       model,
       thinking_level: thinking,
@@ -2309,6 +2602,7 @@
         }),
       });
       state.attachments.push(data);
+      saveDraft();
       renderAttachments();
       if (data.kind !== "image") {
         toast(`已附加文件：${data.name} (${fmtFileSize(data.size)})`, 2200);
@@ -2354,6 +2648,7 @@
       }
       el.querySelector(".att-remove").addEventListener("click", () => {
         state.attachments.splice(idx, 1);
+        saveDraft();
         renderAttachments();
       });
       strip.appendChild(el);
@@ -2612,16 +2907,23 @@
         return toast(res.error || "登录失败", 4000);
       }
       if (res.oauth_url) {
+        const safeOAuth = safeExternalUrl(res.oauth_url);
         if (out) {
           out.innerHTML =
             `<div style="margin-bottom:6px;"><b>已为您打开官方授权页面：</b></div>` +
-            `<a class="btn-primary sm" style="text-decoration:none;margin-bottom:6px;" href="${escHtml(res.oauth_url)}" target="_blank" rel="noopener noreferrer">在浏览器中打开官方授权页 ↗</a>` +
+            (safeOAuth
+              ? `<a class="btn-primary sm" style="text-decoration:none;margin-bottom:6px;" href="${escHtml(safeOAuth)}" target="_blank" rel="noopener noreferrer">在浏览器中打开官方授权页 ↗</a>`
+              : "") +
             `<div class="muted-text" style="word-break:break-all;font-size:11px;">${escHtml(res.oauth_url)}</div>` +
             `<div class="muted-text" style="margin-top:4px;">${escHtml(res.message || "")}</div>`;
         }
         codeRow?.classList.remove("hidden");
         $("claude-auth-code-input")?.focus();
-        window.open(res.oauth_url, "_blank", "noopener,noreferrer");
+        // Avoid opening duplicate browser tabs when backend already opened it on host
+        if (!res.browser_opened && safeOAuth) {
+          if (window.opencodeDesktop?.openExternal) window.opencodeDesktop.openExternal(safeOAuth);
+          else window.open(safeOAuth, "_blank", "noopener,noreferrer");
+        }
         toast("已弹出官方授权页，如页面给出授权码请粘贴回填", 4500);
       } else {
         if (out) out.textContent = res.message || res.output || "登录流程已结束";
@@ -2880,6 +3182,7 @@
         const descText =
           (m.description && m.description.trim()) ||
           `公开 MCP 扩展工具服务（${m.command === "http" || m.command === "sse" ? "远程直连" : m.command}），一键安装后即可供 Claude Code 调用。`;
+        const safeRepo = safeExternalUrl(m.repo_url);
         card.innerHTML =
           `<div class="store-card-head">` +
             `<span class="store-card-title" title="${escHtml(m.title || m.name)}">${escHtml(m.title || m.name)}</span>` +
@@ -2887,15 +3190,28 @@
           `</div>` +
           `<div class="store-card-desc" title="${escHtml(descText)}">${escHtml(descText)}</div>` +
           `<div class="store-card-foot">` +
-            (m.repo_url ? `<a class="link-btn" href="${escHtml(m.repo_url)}" target="_blank">源码仓库 ↗</a>` : `<span></span>`) +
+            (safeRepo ? `<a class="link-btn" href="${escHtml(safeRepo)}" target="_blank" rel="noopener noreferrer">源码仓库 ↗</a>` : `<span></span>`) +
             `<button class="${isInstalled ? "btn-secondary" : "btn-primary"} sm btn-install">${isInstalled ? "重新配置/更新" : "一键安装启用"}</button>` +
           `</div>`;
         card.querySelector(".btn-install").addEventListener("click", async () => {
           const args = (m.args || []).map((a) => a.replace("${WORKSPACE_DIR}", state.activeCwd || state.settings.default_cwd || "."));
           const env = {};
-          for (const k of m.env_hints || []) {
-            const v = window.prompt(`MCP「${m.name}」需要环境变量 ${k}（可先留空稍后配置）：`, "");
-            if (v) env[k] = v;
+          if (Array.isArray(m.env_hints) && m.env_hints.length) {
+            const fields = m.env_hints.map((k) => ({
+              key: k,
+              label: `环境变量 ${k}（可留空稍后配置）`,
+              defaultValue: "",
+              placeholder: `输入 ${k}`,
+            }));
+            const filled = await showUiDialog({
+              title: `配置 MCP「${m.name}」参数`,
+              fields,
+              okText: "安装并启用",
+            });
+            if (!filled) return;
+            for (const [k, v] of Object.entries(filled)) {
+              if (String(v || "").trim()) env[k] = String(v).trim();
+            }
           }
           toast(`正在安装并连接 MCP：${m.name}…`);
           await apiJson("/api/mcp", {
@@ -2928,7 +3244,7 @@
       card.innerHTML =
         `<div class="store-card-head"><span class="store-card-title" title="/${escHtml(s.slug)} · ${escHtml(s.name)}">/${escHtml(s.slug)} · ${escHtml(s.name)}</span>` +
         `<span class="store-badge ${s.enabled ? "is-remote" : ""}">${s.enabled ? "已启用" : "已停用"}</span></div>` +
-        `<div class="store-card-desc">${escHtml(s.description || s.content.slice(0, 90))}</div>` +
+        `<div class="store-card-desc">${escHtml(s.description || String(s.content || "").slice(0, 90))}</div>` +
         `<div class="store-card-foot">` +
           `<button class="btn-secondary sm btn-toggle">${s.enabled ? "停用" : "启用"}</button>` +
           `<button class="btn-danger sm btn-rm">卸载</button>` +
@@ -2970,6 +3286,7 @@
         const descText =
           (s.description && s.description.trim()) ||
           `公开 Agent 扩展技能（安装后支持 /${s.slug || "skill"} 调用），点击自动拉取 SKILL.md 并启用。`;
+        const safeSrcUrl = safeExternalUrl(s.source_url);
         card.innerHTML =
           `<div class="store-card-head">` +
             `<span class="store-card-title" title="${escHtml(s.name)}">${escHtml(s.name)}</span>` +
@@ -2977,7 +3294,7 @@
           `</div>` +
           `<div class="store-card-desc" title="${escHtml(descText)}">${escHtml(descText)}</div>` +
           `<div class="store-card-foot">` +
-            (s.source_url ? `<a class="link-btn" href="${escHtml(s.source_url)}" target="_blank">开源仓库 ↗</a>` : `<span></span>`) +
+            (safeSrcUrl ? `<a class="link-btn" href="${escHtml(safeSrcUrl)}" target="_blank" rel="noopener noreferrer">开源仓库 ↗</a>` : `<span></span>`) +
             `<button class="${isInstalled ? "btn-secondary" : "btn-primary"} sm btn-dl">${isInstalled ? "更新重装" : "下载并启用"}</button>` +
           `</div>`;
         card.querySelector(".btn-dl").addEventListener("click", async () => {
@@ -3013,7 +3330,7 @@
             } else if (entry.isIntersecting) {
               const bgSrc = el.dataset.bgSrc;
               if (bgSrc) {
-                el.style.backgroundImage = `url("${bgSrc.replace(/"/g, '\\"')}")`;
+                el.style.backgroundImage = safeCssUrl(bgSrc);
                 delete el.dataset.bgSrc;
               }
               el.classList.remove("is-lazy");
@@ -3025,10 +3342,26 @@
       )
     : null;
 
+  function clearObservedMedia(container) {
+    if (!container) return;
+    container.querySelectorAll("[data-bg-src], video").forEach((el) => {
+      try {
+        _wpThumbObserver?.unobserve(el);
+      } catch {}
+      if (el.tagName === "VIDEO") {
+        try {
+          el.pause();
+          el.removeAttribute("src");
+          el.load();
+        } catch {}
+      }
+    });
+  }
+
   function observeLazyThumb(thumbEl, imgUrl, eager = false) {
     if (!thumbEl || !imgUrl) return;
     if (eager || !_wpThumbObserver) {
-      thumbEl.style.backgroundImage = `url("${imgUrl.replace(/"/g, '\\"')}")`;
+      thumbEl.style.backgroundImage = safeCssUrl(imgUrl);
       return;
     }
     thumbEl.classList.add("is-lazy");
@@ -3320,6 +3653,7 @@
       return;
     }
     sec.classList.remove("hidden");
+    clearObservedMedia(grid);
     grid.innerHTML = "";
     const curUrl = state.settings.appearance?.bgUrl || "";
     for (const bg of state.customBackgrounds) {
@@ -3328,10 +3662,15 @@
       card.className = "wp-card" + (curUrl === bg.url ? " active" : "");
       card.innerHTML =
         (isVideo
-          ? `<div class="wp-thumb"><video class="wp-thumb-vid" src="${escHtml(bg.url)}" muted loop playsinline autoplay></video><span class="wp-live-badge">🎬 动态视频</span></div>`
-          : `<div class="wp-thumb" style="background-image:url('${escHtml(bg.url)}')"></div>`) +
+          ? `<div class="wp-thumb"><video class="wp-thumb-vid" muted loop playsinline></video><span class="wp-live-badge">🎬 动态视频</span></div>`
+          : `<div class="wp-thumb"></div>`) +
         `<div class="wp-meta"><div class="wp-name">${escHtml(bg.name)}</div>` +
         `<div class="wp-sub" style="display:flex;justify-content:space-between;"><span>${isVideo ? "动态视频壁纸" : "本地图片"}</span><button class="link-btn btn-rm-bg" style="padding:0;color:var(--err);">删除</button></div></div>`;
+      if (isVideo) {
+        observeLazyVideo(card.querySelector("video"), safeMediaHref(bg.url));
+      } else {
+        observeLazyThumb(card.querySelector(".wp-thumb"), safeMediaHref(bg.url), true);
+      }
       card.addEventListener("click", (e) => {
         if (e.target.closest(".btn-rm-bg")) return;
         updateAppearance({ bgType: isVideo ? "video" : "upload", bgUrl: bg.url, liveBg: "", bgName: bg.name });
@@ -3359,7 +3698,6 @@
       ((w.url || w.stream_url) && (ap.bgUrl === (w.url || w.stream_url) || ap.sourceUrl === w.url));
     const card = document.createElement("div");
     card.className = "wp-card" + (isActive ? " active" : "");
-    const inlineCss = w.preview_css ? `background:${w.preview_css}` : "";
     const favable = w.type !== "none";
     const isFav = favable && isWallpaperFavorited(w);
     const favHtml = favable
@@ -3381,11 +3719,14 @@
       ? `${w.description}`
       : `${w.license || "Open"} · ${w.author || ""}`;
     card.innerHTML =
-      `<div class="wp-thumb"${inlineCss ? ` style="${inlineCss}"` : ""}>${favHtml}${badgeHtml}</div>` +
+      `<div class="wp-thumb">${favHtml}${badgeHtml}</div>` +
       `<div class="wp-meta"><div class="wp-name">${escHtml(w.name || w.title || "壁纸")}</div><div class="wp-sub" title="${escHtml(subText)}">${escHtml(subText)}</div></div>`;
 
-    if (!w.preview_css && (w.thumb || w.url)) {
-      observeLazyThumb(card.querySelector(".wp-thumb"), w.thumb || w.url, idx < 12);
+    const thumbEl = card.querySelector(".wp-thumb");
+    if (w.preview_css && isSafeGradientCss(w.preview_css)) {
+      thumbEl.style.background = w.preview_css;
+    } else if (!w.preview_css && (w.thumb || w.url)) {
+      observeLazyThumb(thumbEl, w.thumb || w.url, idx < 12);
     }
 
     card.querySelector(".wp-fav-btn")?.addEventListener("click", (ev) => {
@@ -3420,6 +3761,7 @@
       state.wpHasMore = false;
       moreBtn?.classList.add("hidden");
       const favs = getFavoriteWallpapers();
+      clearObservedMedia(grid);
       grid.innerHTML = "";
       if (!favs.length) {
         grid.innerHTML = `<div class="muted-text" style="grid-column:1/-1;white-space:normal;">尚未收藏任何壁纸。悬停任意壁纸卡片左上角点击「♡」即可加入我的收藏（离线快速切换）！</div>`;
@@ -3433,6 +3775,7 @@
 
     if (!append) {
       state.wpPage = 1;
+      clearObservedMedia(grid);
       const loadingHint = q
         ? `正在实时联网搜索「${escHtml(q)}」${cat === "live" ? "动态壁纸与循环视频" : "海量 4K 壁纸"}…`
         : cat === "bing_uhd"
@@ -3598,9 +3941,11 @@
   async function runDatabaseMaintenance(purgeArchived = false) {
     if (
       purgeArchived &&
-      !window.confirm(
+      !(await uiConfirm(
         `确定彻底清除 ${state.dbStats?.sessions_archived || 0} 个已删除归档的旧会话并压缩回收数据库空间？\n（不会影响任何当前正常展示的活跃会话与记忆）`,
-      )
+        "数据库深度清理确认",
+        true,
+      ))
     ) {
       return;
     }
@@ -3722,12 +4067,13 @@
     const curHint = state.claudeNative?.version ? `当前内核：${state.claudeNative.version}` : "当前尚未检测到内核";
 
     if (
-      !window.confirm(
+      !(await uiConfirm(
         `确认在线下载原生 Claude Code「${label}${targetVerHint}」？\n\n` +
           `${curHint}\n` +
           `• 提示：本软件安装包已自带经过完整适配验证的内核，日常无需升级\n` +
           `• 下载的新内核仅存放在工作台私有目录，随时可点击「恢复软件内置适配版内核」一键回退`,
-      )
+        "切换 Claude Code 内核版本",
+      ))
     ) {
       return;
     }
@@ -3791,23 +4137,71 @@
     $("updater-result").textContent = "正在联网检测 GitHub 上的项目最新版本…";
     try {
       const res = await apiJson("/api/updater/check?channel=latest");
+      const safeRepoUrl = safeExternalUrl(res.repo_url);
       if (!res.ok) {
-        $("updater-result").innerHTML = `${escHtml(res.message || "检测失败")} <a class="link-btn" href="${escHtml(res.repo_url)}" target="_blank">打开 GitHub Releases ↗</a>`;
+        $("updater-result").innerHTML =
+          `${escHtml(res.message || "检测失败")} ` +
+          (safeRepoUrl ? `<a class="link-btn" href="${escHtml(safeRepoUrl)}" target="_blank" rel="noopener noreferrer">打开 GitHub Releases ↗</a>` : "");
         return;
       }
       if (!res.target_version) {
-        $("updater-result").innerHTML = `${escHtml(res.message)} <a class="link-btn" href="${escHtml(res.repo_url)}" target="_blank">查看 Releases ↗</a>`;
+        $("updater-result").innerHTML =
+          `${escHtml(res.message)} ` +
+          (safeRepoUrl ? `<a class="link-btn" href="${escHtml(safeRepoUrl)}" target="_blank" rel="noopener noreferrer">查看 Releases ↗</a>` : "");
         return;
       }
       const statusLine = res.has_update
         ? `<b style="color:var(--brand);">发现新版本 ${escHtml(res.tag_name)}</b>（本机当前 v${escHtml(res.current_version)}）`
         : `<b style="color:var(--ok);">● 当前 v${escHtml(res.current_version)} 已是项目最新版本 (${escHtml(res.tag_name)})</b>`;
-      const dlBtn = res.recommended_asset
-        ? `<a class="btn-primary sm" style="text-decoration:none;margin-right:8px;" href="${escHtml(res.recommended_asset.download_url)}" target="_blank">下载最新版安装包 (${escHtml(res.recommended_asset.name)})</a>`
-        : "";
+      const safeDlUrl = safeExternalUrl(res.recommended_asset?.download_url);
+      const safeRelUrl = safeExternalUrl(res.release_url);
+      const assetName = res.recommended_asset?.name || "";
+      const canNativeDownload = Boolean(window.opencodeDesktop?.downloadAndInstallUpdate && safeDlUrl);
+      const dlActionHtml = canNativeDownload
+        ? `<button type="button" class="btn-primary sm" id="btn-desktop-dl-update">⬇ 软件内一键下载并启动安装 (${escHtml(assetName)})</button>`
+        : safeDlUrl
+          ? `<a class="btn-primary sm" style="text-decoration:none;margin-right:8px;" href="${escHtml(safeDlUrl)}" target="_blank" rel="noopener noreferrer">下载最新版安装包 (${escHtml(assetName)})</a>`
+          : "";
       $("updater-result").innerHTML =
         `<div style="margin-bottom:8px;">${statusLine}</div>` +
-        `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">${dlBtn}<a class="link-btn" href="${escHtml(res.release_url)}" target="_blank">打开发布页 (${escHtml(res.tag_name)}) ↗</a></div>`;
+        `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">` +
+          dlActionHtml +
+          (safeRelUrl ? `<a class="link-btn" href="${escHtml(safeRelUrl)}" target="_blank" rel="noopener noreferrer">查看更新说明 (${escHtml(res.tag_name)}) ↗</a>` : "") +
+        `</div>` +
+        `<div id="desktop-update-prog" class="install-progress-wrap hidden" style="margin-top:10px;">` +
+          `<div class="install-progress-head"><span id="dup-lbl">正在下载更新包…</span><span id="dup-meta">0%</span></div>` +
+          `<div class="install-progress-track"><div id="dup-bar" class="install-progress-bar" style="width:0%"></div></div>` +
+        `</div>`;
+
+      $("btn-desktop-dl-update")?.addEventListener("click", async (ev) => {
+        const dlBtn = ev.currentTarget;
+        dlBtn.disabled = true;
+        const progBox = $("desktop-update-prog");
+        progBox?.classList.remove("hidden");
+        const onProg = (e) => {
+          const d = e.detail || {};
+          const pct = Math.max(0, Math.min(100, Number(d.percent) || 0));
+          if ($("dup-bar")) $("dup-bar").style.width = `${pct}%`;
+          if ($("dup-meta")) {
+            $("dup-meta").textContent =
+              d.downloaded_mb && d.total_mb
+                ? `${d.downloaded_mb}/${d.total_mb} MB · ${d.speed_mbps || 0} MB/s (${pct}%)`
+                : `${pct}%`;
+          }
+        };
+        window.addEventListener("ocs-updater-progress", onProg);
+        try {
+          const dlRes = await window.opencodeDesktop.downloadAndInstallUpdate(safeDlUrl, assetName);
+          if (dlRes?.ok) {
+            toast("更新安装包已下载完毕并为您打开安装程序！", 5000);
+          } else {
+            toast("软件内下载失败: " + (dlRes?.error || "请点击右侧链接前往 GitHub 下载"), 4500);
+          }
+        } finally {
+          window.removeEventListener("ocs-updater-progress", onProg);
+          dlBtn.disabled = false;
+        }
+      });
     } catch (err) {
       $("updater-result").textContent = "检查更新失败: " + err.message;
     } finally {
@@ -3946,8 +4340,8 @@
       const el = document.createElement("div");
       el.className = "stack-item" + (state.selectedMemory?.id === m.id ? " active" : "");
       el.innerHTML =
-        `<div class="stack-item-head"><span>${m.pinned ? "📌 " : ""}${escHtml(m.title)}</span><span class="mini-tag">${m.scope}</span></div>` +
-        `<div class="stack-item-sub">${escHtml(m.content.slice(0, 60))}</div>`;
+        `<div class="stack-item-head"><span>${m.pinned ? "📌 " : ""}${escHtml(m.title)}</span><span class="mini-tag">${escHtml(m.scope)}</span></div>` +
+        `<div class="stack-item-sub">${escHtml(String(m.content || "").slice(0, 60))}</div>`;
       el.addEventListener("click", () => fillMemoryForm(m));
       box.appendChild(el);
     }
@@ -4007,7 +4401,7 @@
   }
 
   async function promptRename(sid, cur) {
-    const next = window.prompt("重命名会话标题：", cur);
+    const next = await uiPrompt("重命名会话标题", cur || "", "输入新的会话标题");
     if (!next || !next.trim()) return;
     await apiJson(`/api/sessions/${encodeURIComponent(sid)}`, { method: "PATCH", body: JSON.stringify({ title: next.trim() }) });
     if (sid === state.activeSessionId) $("thread-title").textContent = next.trim();
@@ -4015,7 +4409,7 @@
   }
 
   async function confirmDeleteSession(sid, title) {
-    if (!window.confirm(`确定删除会话「${title}」？`)) return;
+    if (!(await uiConfirm(`确定删除会话「${title}」？`, "删除会话", true))) return;
     await apiJson(`/api/sessions/${encodeURIComponent(sid)}`, { method: "DELETE" });
     if (sid === state.activeSessionId) startNewSession();
     refreshSessions();
@@ -4188,11 +4582,12 @@
       if (state.activeSessionId && state.wsConnected) state.ws.send(JSON.stringify({ type: "stop_turn", session_id: state.activeSessionId }));
     });
 
-    // Code copy & collapsible long code blocks delegation
+    // Code copy & collapsible long code blocks delegation (reads raw text directly from <pre><code>, zero URIError!)
     $("messages-container").addEventListener("click", (ev) => {
       const btn = ev.target.closest(".md-code-copy");
       if (btn) {
-        copyText(decodeURIComponent(btn.dataset.code || ""), "已复制代码");
+        const codeText = btn.closest(".md-code-block")?.querySelector("pre > code")?.textContent || "";
+        copyText(codeText, "已复制代码");
         return;
       }
       const toggleBtn = ev.target.closest(".md-code-toggle");
@@ -4264,7 +4659,7 @@
         let nonInteractive = false;
         let reason = "";
         if (window.opencodeDesktop?.pickDirectory) {
-          picked = await window.opencodeDesktop.pickDirectory();
+          picked = await window.opencodeDesktop.pickDirectory(state.activeCwd || state.settings.default_cwd || "");
         } else {
           const res = await apiJson("/api/dirs/pick-native", {
             method: "POST",
@@ -4320,7 +4715,7 @@
     $("btn-test-provider")?.addEventListener("click", testSelectedProviderConnection);
     $("btn-fetch-models").addEventListener("click", fetchModelsForSelected);
     $("btn-delete-provider").addEventListener("click", async () => {
-      if (!state.selectedProviderId || !window.confirm("确定删除该供应商？")) return;
+      if (!state.selectedProviderId || !(await uiConfirm("确定删除该供应商配置？", "删除供应商", true))) return;
       await apiJson(`/api/providers/${encodeURIComponent(state.selectedProviderId)}`, { method: "DELETE" });
       state.selectedProviderId = null;
       openProvidersModal();
@@ -4337,8 +4732,8 @@
     $("btn-claude-auth-submit-code")?.addEventListener("click", submitClaudeAuthCodeInput);
     $("claude-auth-code-input")?.addEventListener("keydown", (e) => { if (e.key === "Enter") submitClaudeAuthCodeInput(); });
     $("btn-claude-auth-logout")?.addEventListener("click", async () => {
-      if (!window.confirm("确定退出本机原生 Claude Code 官方账号登录？")) return;
-      const res = await apiJson("/api/claude/auth/logout", { method: "POST" });
+      if (!(await uiConfirm("确定退出本机原生 Claude Code 官方账号登录？", "退出官方账号", true))) return;
+      const res = await apiJson("/api/claude/auth/logout", { method: "POST", body: JSON.stringify({}) });
       if (res.runtime) state.claudeNative = res.runtime;
       renderClaudeStatusViews();
       toast(res.ok ? "已退出原生 Claude 账号" : (res.error || "退出失败"));
@@ -4353,11 +4748,16 @@
       state.mcpSearchTimer = setTimeout(() => searchMcp($("mcp-search-input").value.trim()), 450);
     });
     $("btn-import-mcp")?.addEventListener("click", async () => {
-      const raw = window.prompt("粘贴任意公开 MCP（支持远程 HTTP/SSE URL、npm 包名、GitHub 仓库链接或 mcpServers JSON）：");
-      if (!raw || !raw.trim()) return;
+      const raw = await showUiDialog({
+        title: "导入公开 MCP 服务",
+        description: "支持粘贴远程 HTTP/SSE URL、npm 包名、GitHub 仓库链接或 mcpServers JSON 配置：",
+        fields: [{ multiline: true, defaultValue: "", placeholder: "例如：@modelcontextprotocol/server-memory 或 {\"mcpServers\": ...}" }],
+        okText: "导入并启用",
+      });
+      if (!raw || !String(raw).trim()) return;
       toast("正在解析并安装公开 MCP…");
       try {
-        const res = await apiJson("/api/mcp/import", { method: "POST", body: JSON.stringify({ input: raw.trim() }) });
+        const res = await apiJson("/api/mcp/import", { method: "POST", body: JSON.stringify({ input: String(raw).trim() }) });
         loadInstalledMcps();
         toast(`已成功导入并适配 MCP「${res.item?.name || ""}」！`, 3500);
       } catch (err) {
@@ -4365,11 +4765,22 @@
       }
     });
     $("btn-custom-mcp").addEventListener("click", async () => {
-      const name = window.prompt("MCP 名称（如 my-mcp）：");
-      if (!name) return;
-      const cmdLine = window.prompt("启动命令或远程 URL（如 npx -y @modelcontextprotocol/server-memory 或 https://...）：");
-      if (!cmdLine) return;
-      const trimmed = cmdLine.trim();
+      const form = await showUiDialog({
+        title: "手动添加自定义 MCP",
+        fields: [
+          { key: "name", label: "MCP 名称", defaultValue: "", placeholder: "例如：my-mcp" },
+          {
+            key: "cmdLine",
+            label: "启动命令或远程 URL",
+            defaultValue: "",
+            placeholder: "例如：npx -y @modelcontextprotocol/server-memory 或 https://...",
+          },
+        ],
+        okText: "添加并启动",
+      });
+      if (!form || !form.name?.trim() || !form.cmdLine?.trim()) return;
+      const name = form.name.trim();
+      const trimmed = form.cmdLine.trim();
       const body = /^https?:\/\//i.test(trimmed)
         ? { name, command: /sse/i.test(trimmed) ? "sse" : "http", args: [trimmed], enabled: true }
         : { name, command: trimmed.split(/\s+/)[0], args: trimmed.split(/\s+/).slice(1), enabled: true };
@@ -4385,7 +4796,7 @@
       state.skillSearchTimer = setTimeout(() => searchSkills($("skills-search-input").value.trim()), 450);
     });
     $("btn-import-skill")?.addEventListener("click", async () => {
-      const url = window.prompt("粘贴任意公开 GitHub Skill 仓库链接或 SKILL.md 文件链接：");
+      const url = await uiPrompt("链接导入公开 Skill", "", "粘贴 GitHub Skill 仓库链接或 SKILL.md 文件链接");
       if (!url || !url.trim()) return;
       toast("正在拉取并解析公开 Skill…");
       try {
@@ -4397,13 +4808,27 @@
       }
     });
     $("btn-custom-skill").addEventListener("click", async () => {
-      const name = window.prompt("新建 Skill 名称（如 算法刷题教练）：");
-      if (!name) return;
-      const slug = window.prompt("调用代号 slug（英文，如 algo-coach）：", "custom-skill");
-      if (!slug) return;
-      const content = window.prompt("输入 Skill 指导指令：", `# ${name}\n\n请按专业规范协助用户完成任务。`);
-      if (!content) return;
-      await apiJson("/api/skills", { method: "POST", body: JSON.stringify({ name, slug, description: name, content, enabled: true }) });
+      const form = await showUiDialog({
+        title: "新建本地 Skill",
+        fields: [
+          { key: "name", label: "Skill 名称", defaultValue: "", placeholder: "例如：算法刷题教练" },
+          { key: "slug", label: "调用代号 (slug)", defaultValue: "custom-skill", placeholder: "例如：algo-coach" },
+          {
+            key: "content",
+            label: "Skill 指导指令 (Markdown)",
+            multiline: true,
+            defaultValue: "# 自定义技能\n\n请按专业规范协助用户完成任务。",
+          },
+        ],
+        okText: "创建并启用",
+      });
+      if (!form || !form.name?.trim() || !form.content?.trim()) return;
+      const name = form.name.trim();
+      const slug = (form.slug || "custom-skill").trim();
+      await apiJson("/api/skills", {
+        method: "POST",
+        body: JSON.stringify({ name, slug, description: name, content: form.content, enabled: true }),
+      });
       loadInstalledSkills();
       toast(`已创建 Skill /${slug}`);
     });
@@ -4456,12 +4881,13 @@
     });
     $("btn-we-authorize-steam")?.addEventListener("click", async () => {
       if (
-        !window.confirm(
+        !(await uiConfirm(
           "只读授权 OpenCode Studio 扫描本机 Steam Wallpaper Engine (431960) 壁纸目录？\n\n" +
-            "• 完全独立于您的 Windows 桌面壁纸：绝不改动、绝不同步、绝不干扰您当前桌面壁纸\n" +
-            "• 4K/8K 原版视频（支持几百 MB ~ 数 GB 长动画）与 Web 互动壁纸采用零拷贝流式直出，0 压缩 0 额外占用\n" +
+            "• 完全独立于您的系统桌面壁纸：绝不改动、绝不同步、绝不干扰桌面\n" +
+            "• 4K/8K 原版视频与 Web 互动壁纸采用零拷贝流式直出，0 压缩 0 额外占用\n" +
             "• 您随时可以一键撤销授权",
-        )
+          "授权独立读取本地壁纸库",
+        ))
       ) {
         return;
       }
@@ -4485,10 +4911,10 @@
           if (pick.ok && pick.path) dir = pick.path;
         }
       } catch {}
-      if (!dir) {
-        dir = window.prompt("请输入要授权的本地 4K 壁纸/视频目录或 Steam 431960 目录路径（零拷贝流式直连，不复制文件）：", "") || "";
+      if (!dir && !window.opencodeDesktop?.pickDirectory) {
+        dir = (await uiPrompt("添加本地 4K 壁纸或视频文件夹路径", "", "例如：D:\\Wallpapers")) || "";
       }
-      if (!dir.trim()) return;
+      if (!dir || !dir.trim()) return;
       try {
         const res = await apiJson("/api/we/authorize", { method: "POST", body: JSON.stringify({ add_dir: dir.trim() }) });
         state.weLibrary = res;
@@ -4516,7 +4942,7 @@
       toast(nextMuted ? "视频壁纸已静音" : "已开启视频壁纸音频");
     });
     $("btn-we-revoke")?.addEventListener("click", async () => {
-      if (!window.confirm("确定撤销所有 Wallpaper Engine / 本地壁纸目录授权？\n撤销后 OpenCode Studio 将不再读取这些目录。")) return;
+      if (!(await uiConfirm("确定撤销所有 Wallpaper Engine / 本地壁纸目录授权？\n撤销后 OpenCode Studio 将不再读取这些目录。", "撤销目录授权", true))) return;
       const res = await apiJson("/api/we/revoke", { method: "POST", body: JSON.stringify({}) });
       state.weLibrary = res;
       renderWallpaperEngineSection(res);
@@ -4524,7 +4950,7 @@
     });
     $("btn-wp-clear-cache")?.addEventListener("click", async () => {
       try {
-        const res = await apiJson("/api/backgrounds/clear-cache", { method: "POST" });
+        const res = await apiJson("/api/backgrounds/clear-cache", { method: "POST", body: JSON.stringify({}) });
         if (res.storage) renderWallpaperStorage(res.storage);
         toast(`已清理 ${res.removed || 0} 个预览缓存，释放 ${res.freed_mb || 0} MB（当前生效壁纸与上传壁纸完好保留）`, 3500);
       } catch (err) {
@@ -4701,7 +5127,7 @@
       }
     });
     $("btn-delete-memory").addEventListener("click", async () => {
-      if (!state.selectedMemory || !window.confirm("确定删除该条记忆？")) return;
+      if (!state.selectedMemory || !(await uiConfirm("确定删除该条记忆？", "删除记忆", true))) return;
       await apiJson(`/api/memories/${encodeURIComponent(state.selectedMemory.id)}`, { method: "DELETE" });
       state.selectedMemory = null;
       openMemoryModal();
@@ -4740,9 +5166,22 @@
       }
     });
     document.querySelectorAll(".modal-backdrop").forEach((bd) =>
-      bd.addEventListener("click", (e) => { if (e.target === bd && bd.id !== "modal-confirm") closeModal(bd); }),
+      bd.addEventListener("click", (e) => {
+        if (e.target === bd && bd.id !== "modal-confirm") {
+          if (bd.id === "modal-ui-dialog") _closeUiDialogWith(null);
+          else closeModal(bd);
+        }
+      }),
     );
     $("lightbox").addEventListener("click", () => closeModal("lightbox"));
+
+    // Pause heavy 4K video wallpaper when window is minimized/hidden to save GPU & battery
+    document.addEventListener("visibilitychange", () => {
+      const vid = $("wallpaper-video");
+      if (!vid || vid.classList.contains("hidden")) return;
+      if (document.hidden) vid.pause();
+      else vid.play().catch(() => {});
+    });
 
     // Shortcuts
     window.addEventListener("keydown", (ev) => {
@@ -4763,6 +5202,10 @@
         ev.preventDefault();
         toggleZenWallpaperMode();
       } else if (ev.key === "Escape") {
+        if (_activeUiDialogResolver) {
+          _closeUiDialogWith(null);
+          return;
+        }
         if (state.zenMode) {
           toggleZenWallpaperMode(false);
           return;
@@ -4776,7 +5219,8 @@
       }
     });
     window.addEventListener("message", (ev) => {
-      if (ev.origin === location.origin && ev.data?.type === "ocs_zen_exit") {
+      const webIframe = $("wallpaper-web");
+      if (webIframe && ev.source === webIframe.contentWindow && ev.data?.type === "ocs_zen_exit") {
         toggleZenWallpaperMode(false);
       }
     });
@@ -4785,6 +5229,9 @@
   // ==================== BOOTSTRAP (PARALLEL ZERO-WAIT INIT) ====================
 
   async function init() {
+    if (window.opencodeDesktop?.isDesktop) {
+      document.body.classList.add("is-desktop", `platform-${window.opencodeDesktop.platform || "win32"}`);
+    }
     bindEvents();
     connectWs();
 

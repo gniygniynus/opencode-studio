@@ -19,6 +19,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import zlib from "node:zlib";
 import { getAllSettings, listInstalledMcps, listInstalledSkills } from "./db.mjs";
 import { appendTurnLog, classifyError, logEvent } from "./logger.mjs";
@@ -26,6 +27,7 @@ import { buildUnifiedMemoryContext, syncDiskMemoriesToDb } from "./memory_sync.m
 import { detectModelCapabilities } from "./model_registry.mjs";
 import { getPaths, PROJECT_ROOT } from "./paths.mjs";
 import { killProcessTree, proxyFetch } from "./runtime_utils.mjs";
+import { capMapSize, INTERNAL_PROXY_TOKEN } from "./security.mjs";
 
 const RUNTIME_CACHE_TTL_MS = 5 * 60 * 1000;
 const AUTH_CACHE_TTL_MS = 90 * 1000;
@@ -47,10 +49,14 @@ export function clearRuntimeCache() {
   _cachedStatusSnapshot = null;
   _cachedStatusAt = 0;
   _cachedStatusIsoMode = "";
+  _lastSessionMemHash.clear();
 }
 
 export function winPathToWsl(winPath) {
   const norm = String(winPath || "").replace(/\\/g, "/");
+  // Handle `\\wsl.localhost\<distro>\...` or `\\wsl$\<distro>\...`
+  const wslUnc = norm.match(/^\/\/(?:wsl\.localhost|wsl\$)\/[^/]+(\/.*)?$/i);
+  if (wslUnc) return wslUnc[1] || "/";
   const m = norm.match(/^([A-Za-z]):\/(.*)$/);
   if (m) return `/mnt/${m[1].toLowerCase()}/${m[2]}`;
   return norm;
@@ -349,10 +355,10 @@ function spawnClaudeProcess(rt, args, { cwd, env, stdio = ["pipe", "pipe", "pipe
 
   if (rt.mode === "wsl") {
     const wslCwd = winPathToWsl(cwd || os.homedir());
-    // Pass isolated env vars safely into WSL
+    // Pass isolated env vars safely into WSL (strict identifier check prevents env name injection)
     const envLines = [];
     for (const [k, v] of Object.entries(mergedEnv)) {
-      if (v === undefined) continue;
+      if (v === undefined || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue;
       if (v === null) {
         envLines.push(`unset ${k}`);
       } else {
@@ -362,11 +368,17 @@ function spawnClaudeProcess(rt, args, { cwd, env, stdio = ["pipe", "pipe", "pipe
     }
     const quotedArgs = args.map((a) => `'${String(a).replace(/'/g, "'\\''")}'`).join(" ");
     const bashScript = [
-      `cd '${wslCwd.replace(/'/g, "'\\''")}' 2>/dev/null || cd /`,
+      `cd '${wslCwd.replace(/'/g, "'\\''")}' || exit 1`,
       ...envLines,
       `exec '${rt.binary.replace(/'/g, "'\\''")}' ${quotedArgs}`,
     ].join("\n");
-    return spawn("wsl.exe", wslScriptArgs(bashScript), { stdio, windowsHide: true });
+    const wslEnv = {
+      ...process.env,
+      WSLENV: [process.env.WSLENV, "ELECTRON_RUN_AS_NODE", "OPENCODE_DATA_DIR", "NO_PROXY"].filter(Boolean).join(":"),
+    };
+    const proc = spawn("wsl.exe", wslScriptArgs(bashScript), { stdio, env: wslEnv, windowsHide: true });
+    proc.stdin?.on("error", () => {});
+    return proc;
   }
 
   const finalEnv = { ...process.env };
@@ -376,9 +388,40 @@ function spawnClaudeProcess(rt, args, { cwd, env, stdio = ["pipe", "pipe", "pipe
   }
 
   if (rt.isCmd) {
-    return spawn("cmd.exe", ["/c", rt.binary, ...args], { cwd, env: finalEnv, stdio, windowsHide: true });
+    // Prefer direct shell-free execution of the underlying npm cli.js when available (avoids cmd.exe quote/space hazards!)
+    const siblingCliJs = path.join(path.dirname(rt.binary), "node_modules", "@anthropic-ai", "claude-code", "cli.js");
+    if (fs.existsSync(siblingCliJs)) {
+      const proc = spawn(process.execPath, [siblingCliJs, ...args], {
+        cwd,
+        env: { ...finalEnv, ELECTRON_RUN_AS_NODE: "1" },
+        stdio,
+        windowsHide: true,
+      });
+      proc.stdin?.on("error", () => {});
+      return proc;
+    }
+    // Safe cmd.exe verbatim quoting (`cmd.exe /d /s /c ""bin" "arg1" ..."` with interior quotes escaped)
+    const quoteCmdArg = (val) => `"${String(val).replace(/"/g, '""').replace(/%/g, "%%")}"`;
+    const cmdLine = `"${[quoteCmdArg(rt.binary), ...args.map(quoteCmdArg)].join(" ")}"`;
+    const proc = spawn("cmd.exe", ["/d", "/s", "/c", cmdLine], {
+      cwd,
+      env: finalEnv,
+      stdio,
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+    });
+    proc.stdin?.on("error", () => {});
+    return proc;
   }
-  return spawn(rt.binary, args, { cwd, env: finalEnv, stdio, windowsHide: true });
+  const proc = spawn(rt.binary, args, {
+    cwd,
+    env: finalEnv,
+    stdio,
+    windowsHide: true,
+    detached: process.platform !== "win32",
+  });
+  proc.stdin?.on("error", () => {});
+  return proc;
 }
 
 function runClaudeSync(rt, args, timeoutMs = 8000) {
@@ -863,7 +906,7 @@ export async function runClaudeAuthLogin({ mode = "claudeai", email = "", onProg
   if (_activeAuthSession?.proc) {
     try {
       clearTimeout(_activeAuthSession.timer);
-      _activeAuthSession.proc.kill();
+      killProcessTree(_activeAuthSession.proc);
     } catch {}
     _activeAuthSession = null;
   }
@@ -934,17 +977,20 @@ PY`;
 
     const expireTimer = setTimeout(() => {
       if (_activeAuthSession?.proc === proc) {
-        try { proc.kill(); } catch {}
+        try { killProcessTree(proc); } catch {}
         _activeAuthSession = null;
       }
     }, 10 * 60 * 1000);
 
     _activeAuthSession = { proc, oauthUrl: "", timer: expireTimer, combined: "" };
+    proc.stdin?.on("error", () => {});
 
     let combined = "";
     let oauthUrl = "";
     let resolved = false;
     let browserOpened = false;
+    const outDecoder = new StringDecoder("utf8");
+    const errDecoder = new StringDecoder("utf8");
 
     const finishEarlyWithUrl = () => {
       if (resolved || !oauthUrl) return;
@@ -952,6 +998,7 @@ PY`;
       resolve({
         ok: true,
         pending_browser: true,
+        browser_opened: browserOpened,
         needs_code_input: true,
         oauth_url: oauthUrl,
         output: combined.trim(),
@@ -959,8 +1006,8 @@ PY`;
       });
     };
 
-    const inspectChunk = (chunk) => {
-      const txt = stripAnsi(chunk.toString("utf8"));
+    const inspectText = (rawTxt) => {
+      const txt = stripAnsi(rawTxt);
       combined += txt;
       if (_activeAuthSession?.proc === proc) _activeAuthSession.combined = combined;
 
@@ -975,15 +1022,15 @@ PY`;
           browserOpened = true;
           openExternalUrlInHost(oauthUrl);
         }
-        onProgress?.({ stage: "oauth_url", url: oauthUrl, needs_code_input: true, text: txt });
+        onProgress?.({ stage: "oauth_url", url: oauthUrl, browser_opened: true, needs_code_input: true, text: txt });
         setTimeout(finishEarlyWithUrl, 350);
       } else {
         onProgress?.({ stage: "output", text: txt });
       }
     };
 
-    proc.stdout?.on("data", inspectChunk);
-    proc.stderr?.on("data", inspectChunk);
+    proc.stdout?.on("data", (c) => inspectText(outDecoder.write(c)));
+    proc.stderr?.on("data", (c) => inspectText(errDecoder.write(c)));
 
     // Safety timeout so HTTP endpoint NEVER hangs indefinitely even if CLI stalls
     const urlTimer = setTimeout(() => {
@@ -1062,7 +1109,7 @@ export async function submitClaudeAuthCode(codeText) {
 
 export function runClaudeAuthLogout() {
   if (_activeAuthSession?.proc) {
-    try { _activeAuthSession.proc.kill(); } catch {}
+    try { killProcessTree(_activeAuthSession.proc); } catch {}
     _activeAuthSession = null;
   }
   const rt = detectClaudeRuntime(true);
@@ -1533,9 +1580,11 @@ export async function installOrSwitchClaudeVersion({ channel = "stable", onProgr
         };
         try {
           const res = await proxyFetch(tarballUrl, {
-            headers: { "User-Agent": "OpenCodeStudio/2.1" },
+            headers: { "User-Agent": "OpenCodeStudio/2.3" },
             signal: controller.signal,
             proxyUrl: effectiveProxy,
+            maxBytes: 220 * 1024 * 1024,
+            streamBody: true,
           });
           if (!res.ok) throw new Error(`下载返回 HTTP ${res.status}`);
           if (!res.body) throw new Error("响应体为空");
@@ -1709,12 +1758,18 @@ export async function installOrSwitchClaudeVersion({ channel = "stable", onProgr
     }
 
     const finalBinPath = path.join(destDir, binName);
+    const oldBackupPath = `${finalBinPath}.old`;
     try {
       if (process.platform !== "win32" && fs.existsSync(finalBinPath)) {
         fs.chmodSync(finalBinPath, 0o755);
       }
+      if (process.platform === "win32" && fs.existsSync(finalBinPath)) {
+        try { fs.unlinkSync(oldBackupPath); } catch {}
+        try { fs.renameSync(finalBinPath, oldBackupPath); } catch {}
+      }
     } catch {}
     fs.renameSync(tmpBinPath, finalBinPath);
+    try { if (fs.existsSync(oldBackupPath)) fs.unlinkSync(oldBackupPath); } catch {}
     tmpBinPath = "";
     if (process.platform !== "win32") {
       try {
@@ -1790,7 +1845,7 @@ export async function installOrSwitchClaudeVersion({ channel = "stable", onProgr
   }
 }
 
-export function buildCustomPromptAndMcp(cwd, rtMode, { webSearchEnabled = null } = {}) {
+export function buildCustomPromptAndMcp(cwd, rtMode, { webSearchEnabled = null, reqId = "" } = {}) {
   const settings = getAllSettings();
   const basePrompt = String(settings.system_prompt || "").trim();
   const mode = settings.prompt_mode || "replace"; // replace | append | native
@@ -1848,14 +1903,19 @@ export function buildCustomPromptAndMcp(cwd, rtMode, { webSearchEnabled = null }
     } catch {}
   }
 
-  // Materialize enabled installed MCPs + built-in live web search MCP into active_mcp_config.json
+  // Materialize enabled installed MCPs + built-in live web search MCP into isolated per-turn or active config
   const mcps = listInstalledMcps().filter((m) => m.enabled);
   let mcpConfigPath = null;
+  let tempMcpFile = null;
   if (mcps.length || useWebSearch) {
     const mcpObj = { mcpServers: {} };
     if (useWebSearch) {
       let webMcpScript = path.join(PROJECT_ROOT, "server", "websearch_mcp_stdio.mjs");
-      if (webMcpScript.includes("app.asar") && !webMcpScript.includes("app.asar.unpacked") && fs.existsSync(webMcpScript.replace("app.asar", "app.asar.unpacked"))) {
+      if (
+        webMcpScript.includes("app.asar") &&
+        !webMcpScript.includes("app.asar.unpacked") &&
+        fs.existsSync(webMcpScript.replace("app.asar", "app.asar.unpacked"))
+      ) {
         webMcpScript = webMcpScript.replace("app.asar", "app.asar.unpacked");
       }
       const nodeCmd = rtMode === "wsl" ? winPathToWsl(process.execPath) : process.execPath;
@@ -1866,6 +1926,7 @@ export function buildCustomPromptAndMcp(cwd, rtMode, { webSearchEnabled = null }
           ELECTRON_RUN_AS_NODE: "1",
           OPENCODE_DATA_DIR: getPaths().dataRoot,
           NO_PROXY: "127.0.0.1,localhost,::1",
+          WSLENV: "ELECTRON_RUN_AS_NODE:OPENCODE_DATA_DIR:NO_PROXY",
         },
       };
     }
@@ -1884,8 +1945,12 @@ export function buildCustomPromptAndMcp(cwd, rtMode, { webSearchEnabled = null }
         };
       }
     }
-    const fp = path.join(getPaths().mcpDir, "active_mcp_config.json");
+    const cfgFileName = reqId
+      ? `mcp_cfg_${String(reqId).replace(/[^a-z0-9_-]/gi, "_")}.json`
+      : "active_mcp_config.json";
+    const fp = path.join(getPaths().mcpDir, cfgFileName);
     fs.writeFileSync(fp, JSON.stringify(mcpObj, null, 2), "utf8");
+    if (reqId) tempMcpFile = fp;
     mcpConfigPath = rtMode === "wsl" ? winPathToWsl(fp) : fp;
   }
 
@@ -1897,6 +1962,7 @@ export function buildCustomPromptAndMcp(cwd, rtMode, { webSearchEnabled = null }
     promptFlag: effectiveFlag,
     promptText: effectivePromptText,
     mcpConfigPath,
+    tempMcpFile,
   };
 }
 
@@ -1960,11 +2026,10 @@ export async function runNativeClaudeCodeTurn({
   );
   const effectiveThinking =
     thinkingLevel && thinkingLevel !== "auto" ? thinkingLevel : (cap.thinking_supported ? cap.default_thinking : "off");
-  const { promptMode, basePrompt, memoryBlock, promptFlag, promptText, mcpConfigPath } = buildCustomPromptAndMcp(
-    cwd,
-    rt.mode,
-    { webSearchEnabled },
-  );
+  const { promptMode, basePrompt, memoryBlock, promptFlag, promptText, mcpConfigPath, tempMcpFile } =
+    buildCustomPromptAndMcp(cwd, rt.mode, { webSearchEnabled, reqId });
+  const settings = getAllSettings();
+  const isConfirmDangerous = settings.permission_mode === "confirm_dangerous";
 
   // Build strictly isolated environment so native auth & API providers NEVER collide
   const env = {
@@ -1978,6 +2043,15 @@ export async function runNativeClaudeCodeTurn({
     CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: "120000",
     CLAUDE_CODE_MAX_RETRIES: "3",
   };
+
+  if (isConfirmDangerous && localServerPort > 0) {
+    env.ELECTRON_RUN_AS_NODE = "1";
+    env.OPENCODE_DATA_DIR = getPaths().dataRoot;
+    env.OPENCODE_GUARD_PORT = String(localServerPort);
+    env.OPENCODE_GUARD_SESSION = String(sessionId || "");
+    env.OPENCODE_GUARD_CWD = String(cwd || "");
+    env.OPENCODE_INTERNAL_TOKEN = INTERNAL_PROXY_TOKEN;
+  }
 
   if (provider.kind === "claude_native") {
     // True official Claude Auth login: strip any API overrides, preserve system proxy for official access!
@@ -1996,7 +2070,7 @@ export async function runNativeClaudeCodeTurn({
     const proxySid = encodeURIComponent(sessionId || "stateless");
     const proxyBase = `http://127.0.0.1:${localServerPort}/proxy/provider/${provider.id}/${encodeURIComponent(effectiveThinking || "auto")}/${proxySid}`;
     env.ANTHROPIC_BASE_URL = proxyBase;
-    env.ANTHROPIC_AUTH_TOKEN = "OPENCODE_STUDIO_PROXY";
+    env.ANTHROPIC_AUTH_TOKEN = INTERNAL_PROXY_TOKEN;
     env.ANTHROPIC_API_KEY = null;
     env.ANTHROPIC_MODEL = model;
     if (cap.context_window && !String(model).toLowerCase().startsWith("claude-")) {
@@ -2017,7 +2091,7 @@ export async function runNativeClaudeCodeTurn({
     "--setting-sources", "",
   ];
 
-  // Build isolated per-turn settings JSON so Claude Code uses OUR built-in provider & privacy settings cleanly
+  // Build isolated per-turn settings JSON (+ PreToolUse safety guard hook when `confirm_dangerous` is enabled!)
   const inlineSettingsEnv = {
     DISABLE_TELEMETRY: "1",
     DISABLE_ERROR_REPORTING: "1",
@@ -2029,7 +2103,7 @@ export async function runNativeClaudeCodeTurn({
   if (provider.kind !== "claude_native") {
     const proxySid = encodeURIComponent(sessionId || "stateless");
     inlineSettingsEnv.ANTHROPIC_BASE_URL = `http://127.0.0.1:${localServerPort}/proxy/provider/${provider.id}/${encodeURIComponent(effectiveThinking || "auto")}/${proxySid}`;
-    inlineSettingsEnv.ANTHROPIC_AUTH_TOKEN = "OPENCODE_STUDIO_PROXY";
+    inlineSettingsEnv.ANTHROPIC_AUTH_TOKEN = INTERNAL_PROXY_TOKEN;
     if (model) {
       inlineSettingsEnv.ANTHROPIC_MODEL = model;
       inlineSettingsEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = model;
@@ -2041,7 +2115,34 @@ export async function runNativeClaudeCodeTurn({
       inlineSettingsEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(cap.context_window);
     }
   }
-  args.push("--settings", JSON.stringify({ env: inlineSettingsEnv }));
+
+  const inlineSettingsObj = { env: inlineSettingsEnv };
+  if (isConfirmDangerous && localServerPort > 0 && rt.mode !== "wsl") {
+    let guardScript = path.join(PROJECT_ROOT, "server", "permission_guard_hook.mjs");
+    if (
+      guardScript.includes("app.asar") &&
+      !guardScript.includes("app.asar.unpacked") &&
+      fs.existsSync(guardScript.replace("app.asar", "app.asar.unpacked"))
+    ) {
+      guardScript = guardScript.replace("app.asar", "app.asar.unpacked");
+    }
+    const q = (s) => `"${String(s).replace(/"/g, '\\"')}"`;
+    inlineSettingsObj.hooks = {
+      PreToolUse: [
+        {
+          matcher: "Bash|PowerShell|Write|Edit|MultiEdit|NotebookEdit",
+          hooks: [
+            {
+              type: "command",
+              command: `${q(process.execPath)} ${q(guardScript)}`,
+              timeout: 130,
+            },
+          ],
+        },
+      ],
+    };
+  }
+  args.push("--settings", JSON.stringify(inlineSettingsObj));
 
   if (resumeCliSid) {
     args.push("--resume", resumeCliSid);
@@ -2070,12 +2171,16 @@ export async function runNativeClaudeCodeTurn({
       tempPromptFile = null;
     }
   }
+  let tempMcpPath = tempMcpFile;
   const cleanupTempPrompt = () => {
-    if (!tempPromptFile) return;
-    try {
-      fs.unlinkSync(tempPromptFile);
-    } catch {}
-    tempPromptFile = null;
+    if (tempPromptFile) {
+      try { fs.unlinkSync(tempPromptFile); } catch {}
+      tempPromptFile = null;
+    }
+    if (tempMcpPath) {
+      try { fs.unlinkSync(tempMcpPath); } catch {}
+      tempMcpPath = null;
+    }
   };
   if (mcpConfigPath) {
     args.push("--mcp-config", mcpConfigPath);
@@ -2111,6 +2216,7 @@ export async function runNativeClaudeCodeTurn({
       memoryReminderPrefix = `<system-reminder>\n${reminderBody}\n</system-reminder>\n\n`;
       _lastSessionMemHash.set(sessionKey, injectedMemHash);
       if (sessionId) _lastSessionMemHash.set(sessionId, injectedMemHash);
+      capMapSize(_lastSessionMemHash, 500);
     }
   }
 
@@ -2193,8 +2299,11 @@ export async function runNativeClaudeCodeTurn({
     let usage = {};
     let resultErrorText = "";
 
+    const outDecoder = new StringDecoder("utf8");
+    const errDecoder = new StringDecoder("utf8");
+
     proc.stderr?.on("data", (chunk) => {
-      const s = chunk.toString("utf8");
+      const s = errDecoder.write(chunk);
       stderr += s;
       appendTurnLog(sessionId, `[claude-stderr] ${s.trim()}`);
     });
@@ -2307,13 +2416,14 @@ export async function runNativeClaudeCodeTurn({
     };
 
     proc.stdout?.on("data", (chunk) => {
-      buf += chunk.toString("utf8");
+      buf += outDecoder.write(chunk);
       const lines = buf.split(/\r?\n/);
       buf = lines.pop() || "";
       for (const raw of lines) processStreamLine(raw);
     });
 
     proc.on("error", (err) => {
+      if (signal) signal.removeEventListener("abort", killProc);
       cleanupTempPrompt();
       reject(
         classifyError({
@@ -2329,6 +2439,9 @@ export async function runNativeClaudeCodeTurn({
     });
 
     proc.on("close", (code) => {
+      if (signal) signal.removeEventListener("abort", killProc);
+      buf += outDecoder.end();
+      stderr += errDecoder.end();
       if (buf.trim()) {
         processStreamLine(buf);
         buf = "";
@@ -2336,6 +2449,7 @@ export async function runNativeClaudeCodeTurn({
       cleanupTempPrompt();
       if (cliSessionId && injectedMemHash) {
         _lastSessionMemHash.set(cliSessionId, injectedMemHash);
+        capMapSize(_lastSessionMemHash, 500);
       }
       try {
         // Keep SQLite memory library automatically in sync if Claude created/updated disk .md memories during this turn

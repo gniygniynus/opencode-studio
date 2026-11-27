@@ -75,7 +75,24 @@ function stmt(db, sql) {
 }
 
 function withTransaction(db, fn) {
-  if (_txDepth > 0) return fn();
+  if (_txDepth > 0) {
+    const sp = `sp_${_txDepth}`;
+    db.exec(`SAVEPOINT ${sp}`);
+    _txDepth += 1;
+    try {
+      const res = fn();
+      db.exec(`RELEASE SAVEPOINT ${sp}`);
+      return res;
+    } catch (err) {
+      try {
+        db.exec(`ROLLBACK TO SAVEPOINT ${sp}`);
+        db.exec(`RELEASE SAVEPOINT ${sp}`);
+      } catch {}
+      throw err;
+    } finally {
+      _txDepth -= 1;
+    }
+  }
   db.exec("BEGIN IMMEDIATE");
   _txDepth += 1;
   try {
@@ -97,10 +114,15 @@ function getLocalKey() {
   const p = getPaths();
   if (fs.existsSync(p.secretFile)) {
     const raw = fs.readFileSync(p.secretFile, "utf8").trim();
-    if (raw.length === 64) {
+    if (/^[0-9a-fA-F]{64}$/.test(raw)) {
       _secretKey = Buffer.from(raw, "hex");
       return _secretKey;
     }
+    try {
+      const backupPath = `${p.secretFile}.corrupt.${Date.now()}`;
+      fs.copyFileSync(p.secretFile, backupPath);
+      logEvent("ERROR", "db", "corrupt_local_key", `检测到异常密钥文件格式，已备份至 ${backupPath} 并重新生成新密钥`);
+    } catch {}
   }
   _secretKey = crypto.randomBytes(32);
   fs.writeFileSync(p.secretFile, _secretKey.toString("hex"), { mode: 0o600 });
@@ -126,7 +148,8 @@ export function decryptSecret(stored) {
     const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivHex, "hex"));
     decipher.setAuthTag(Buffer.from(tagHex, "hex"));
     return Buffer.concat([decipher.update(Buffer.from(encHex, "hex")), decipher.final()]).toString("utf8");
-  } catch {
+  } catch (err) {
+    logEvent("WARN", "db", "decrypt_failed", `解密本地已保存密钥失败（可能更换了机器或密钥文件）: ${err.message}`);
     return "";
   }
 }
@@ -486,14 +509,32 @@ const RAW_STRING_SETTING_KEYS = new Set([
   "default_cwd",
 ]);
 
+let _lastSettingsDataVersion = -1;
+let _lastSettingsVersionCheckAt = 0;
+
 function ensureSettingsCache() {
   const db = getDb();
+  const now = Date.now();
+  if (_settingsCache && now - _lastSettingsVersionCheckAt > 1200) {
+    _lastSettingsVersionCheckAt = now;
+    try {
+      const dv = stmt(db, "PRAGMA data_version").get()?.data_version ?? -1;
+      if (_lastSettingsDataVersion !== -1 && dv !== _lastSettingsDataVersion) {
+        _settingsCache = null;
+      }
+      _lastSettingsDataVersion = dv;
+    } catch {}
+  }
   if (_settingsCache) return _settingsCache;
   _settingsCache = new Map();
   const rows = stmt(db, "SELECT key, value FROM kv_settings").all();
   for (const r of rows) {
     _settingsCache.set(r.key, r.value);
   }
+  try {
+    _lastSettingsDataVersion = stmt(db, "PRAGMA data_version").get()?.data_version ?? -1;
+    _lastSettingsVersionCheckAt = now;
+  } catch {}
   return _settingsCache;
 }
 
@@ -709,11 +750,13 @@ export function saveProvider(input) {
     const kind = ["anthropic", "openai", "claude_native"].includes(input.kind) ? input.kind : "openai";
     const baseUrl = String(input.base_url || "").trim().replace(/\/+$/, "");
     const apiKeyEnc =
-      input.api_key !== undefined && input.api_key !== ""
-        ? encryptSecret(String(input.api_key).trim())
-        : existing
-          ? existing.api_key_enc
-          : "";
+      input.clear_api_key === true || input.api_key === null
+        ? ""
+        : input.api_key !== undefined && input.api_key !== ""
+          ? encryptSecret(String(input.api_key).trim())
+          : existing
+            ? existing.api_key_enc
+            : "";
     const models = Array.isArray(input.models)
       ? [...new Set(input.models.map((m) => String(m).trim()).filter(Boolean))]
       : existing
@@ -947,21 +990,34 @@ export function listSessions({ query = "", cwd = "", limit = 200 } = {}) {
   }
 
   const qlc = q.toLowerCase();
-  const codepointLen = [...q].length;
+  const cleanQ = q.replace(/\0/g, "");
+  const codepointLen = [...cleanQ].length;
 
   // Fast FTS5 trigram path for queries with >= 3 Unicode codepoints
   if (_ftsEnabled && codepointLen >= 3) {
-    const ftsPhrase = `"${q.replace(/"/g, '""')}"`;
+    const ftsPhrase = `"${cleanQ.replace(/"/g, '""')}"`;
     try {
-      const ftsHits = stmt(
-        db,
-        `SELECT m.session_id, m.id AS message_id, m.content_text, m.created_at
-         FROM messages_fts f
-         JOIN messages m ON m.id = f.message_id
-         WHERE messages_fts MATCH ? AND m.is_active = 1
-         ORDER BY m.created_at DESC
-         LIMIT 600`,
-      ).all(ftsPhrase);
+      const ftsHits = cwdFilter
+        ? stmt(
+            db,
+            `SELECT m.session_id, m.id AS message_id, m.content_text, m.created_at
+             FROM messages_fts f
+             JOIN messages m ON m.id = f.message_id
+             JOIN sessions s ON s.id = m.session_id
+             WHERE messages_fts MATCH ? AND m.is_active = 1 AND s.archived = 0 AND s.cwd = ?
+             ORDER BY m.created_at DESC
+             LIMIT 600`,
+          ).all(ftsPhrase, cwdFilter)
+        : stmt(
+            db,
+            `SELECT m.session_id, m.id AS message_id, m.content_text, m.created_at
+             FROM messages_fts f
+             JOIN messages m ON m.id = f.message_id
+             JOIN sessions s ON s.id = m.session_id
+             WHERE messages_fts MATCH ? AND m.is_active = 1 AND s.archived = 0
+             ORDER BY m.created_at DESC
+             LIMIT 600`,
+          ).all(ftsPhrase);
 
       const hitBySess = new Map();
       for (const h of ftsHits) {
@@ -1073,7 +1129,7 @@ function setSubtreeActive(db, sessionId, rootId, activeVal) {
     db,
     `WITH RECURSIVE subtree(id) AS (
        VALUES(?)
-       UNION ALL
+       UNION
        SELECT m.id FROM messages m
        JOIN subtree st ON m.parent_id = st.id
        WHERE m.session_id = ?
@@ -1104,6 +1160,13 @@ export function addMessage({
   const now = nowIso();
 
   withTransaction(db, () => {
+    if (parentId !== null && parentId !== undefined) {
+      const parentRow = stmt(db, "SELECT id FROM messages WHERE id=? AND session_id=?").get(parentId, sessionId);
+      if (!parentRow) {
+        throw new Error(`父级消息 (${parentId}) 在当前会话中不存在`);
+      }
+    }
+
     const siblings = parentId
       ? stmt(db, "SELECT id FROM messages WHERE session_id=? AND parent_id=? AND is_active=1").all(sessionId, parentId)
       : stmt(db, "SELECT id FROM messages WHERE session_id=? AND parent_id IS NULL AND is_active=1").all(sessionId);
@@ -1168,14 +1231,16 @@ export function switchBranch(sessionId, targetMessageId) {
       setSubtreeActive(db, sessionId, sib.id, 0);
     }
 
-    // Walk down from target activating the most recently created child at each hop
+    // Walk down from target activating the most recently created child at each hop (with cycle guard)
     let curId = targetMessageId;
+    const seen = new Set();
     const stmtActivate = stmt(db, "UPDATE messages SET is_active=1 WHERE id=?");
     const stmtNext = stmt(
       db,
       "SELECT id FROM messages WHERE session_id=? AND parent_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
     );
-    while (curId) {
+    while (curId && !seen.has(curId) && seen.size < 10000) {
+      seen.add(curId);
       stmtActivate.run(curId);
       const next = stmtNext.get(sessionId, curId);
       curId = next ? next.id : null;
@@ -1502,32 +1567,48 @@ export function listInstalledSkills() {
 export function saveInstalledSkill(input) {
   const db = getDb();
   const now = nowIso();
-  const slug =
+  const baseSlug =
     String(input.slug || input.name || "skill")
       .toLowerCase()
       .replace(/[^a-z0-9_-]+/g, "-")
       .replace(/^-|-$/g, "") || `skill-${Date.now()}`;
-  const existing = stmt(db, "SELECT * FROM installed_skills WHERE slug=? OR id=?").get(slug, input.id || "");
-  const id = existing?.id || input.id || `sk_${crypto.randomBytes(5).toString("hex")}`;
-  const name = String(input.name || slug).trim();
-  const description = String(input.description || "");
-  const content = String(input.content || "");
-  const sourceUrl = String(input.source_url || "");
-  const enabled = input.enabled === false ? 0 : 1;
 
-  if (existing) {
-    stmt(
-      db,
-      `UPDATE installed_skills SET name=?, slug=?, description=?, content=?, source_url=?, enabled=? WHERE id=?`,
-    ).run(name, slug, description, content, sourceUrl, enabled, id);
-  } else {
-    stmt(
-      db,
-      `INSERT INTO installed_skills (id, name, source_url, slug, description, content, enabled, installed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, name, sourceUrl, slug, description, content, enabled, now);
-  }
-  return listInstalledSkills().find((s) => s.id === id);
+  let finalId = "";
+  withTransaction(db, () => {
+    const existing = input.id
+      ? stmt(db, "SELECT * FROM installed_skills WHERE id=?").get(input.id)
+      : stmt(db, "SELECT * FROM installed_skills WHERE slug=?").get(baseSlug);
+    const id = existing?.id || input.id || `sk_${crypto.randomBytes(5).toString("hex")}`;
+    finalId = id;
+
+    let slug = baseSlug;
+    let suffix = 2;
+    while (true) {
+      const conflict = stmt(db, "SELECT id FROM installed_skills WHERE slug=? AND id!=?").get(slug, id);
+      if (!conflict) break;
+      slug = `${baseSlug}-${suffix++}`;
+    }
+
+    const name = String(input.name || slug).trim();
+    const description = String(input.description || "");
+    const content = String(input.content || "");
+    const sourceUrl = String(input.source_url || "");
+    const enabled = input.enabled === false ? 0 : 1;
+
+    if (existing) {
+      stmt(
+        db,
+        `UPDATE installed_skills SET name=?, slug=?, description=?, content=?, source_url=?, enabled=? WHERE id=?`,
+      ).run(name, slug, description, content, sourceUrl, enabled, id);
+    } else {
+      stmt(
+        db,
+        `INSERT INTO installed_skills (id, name, source_url, slug, description, content, enabled, installed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(id, name, sourceUrl, slug, description, content, enabled, now);
+    }
+  });
+  return listInstalledSkills().find((s) => s.id === finalId);
 }
 
 export function deleteInstalledSkill(id) {

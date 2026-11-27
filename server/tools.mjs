@@ -10,9 +10,12 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { getAllSettings, listMemories, saveMemory } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
+import { getPaths } from "./paths.mjs";
 import { killProcessTree } from "./runtime_utils.mjs";
+import { isRealPathInsideDir } from "./security.mjs";
 import { fetchWebPageClean, formatSearchResultsForLlm, searchWebLive } from "./web_search.mjs";
 
 const IGNORE_DIRS = new Set([
@@ -29,11 +32,41 @@ const IGNORE_DIRS = new Set([
   "System Volume Information",
 ]);
 
-const DANGEROUS_CMD_RE =
-  /(\brm\s+-[^\n]*r[^\n]*f|\bremove-item\b[^\n]*-recurse|\bdel\s+\/[sfq]|\brmdir\s+\/s|\bformat\s+[a-z]:|\bshutdown\b|\bmkfs\b|\bdd\s+if=|git\s+push\s+[^\n]*--force|git\s+reset\s+--hard)/i;
+const DANGEROUS_PATTERNS = [
+  // Unix rm with both recursive & force or targeting root / parent traversal
+  /\brm\b(?=[^\n;&|]*(?:\s-[a-zA-Z]*[rR]|\s--recursive))(?=[^\n;&|]*(?:\s-[a-zA-Z]*f|\s--force|\s\/(?:\s|$)|\s\.\.))/i,
+  /\brm\s+(?:-[a-zA-Z]+\s+)*(?:\/|\*|~|\$HOME)\b/i,
+  /\bfind\b[^\n;&|]*\s-delete\b/i,
+  // Windows CMD & PowerShell destructive deletions
+  /\b(?:remove-item|ri|rd|rmdir|del|erase)\b[^\n;&|]*(?:-recurse|-r\b|-force|-fo\b|\/s\b|\/q\b)/i,
+  // Disk / partition / boot / system power operations
+  /\b(?:format\s+[a-z]:|diskpart|mkfs(?:\.[a-z0-9]+)?|fdisk|sfdisk|dd\s+if=|shutdown\b|reboot\b|poweroff\b|stop-computer|restart-computer|bcdedit|reg\s+delete|sc\s+delete)\b/i,
+  // Destructive Git history / worktree / force-push operations
+  /\bgit\s+push\b[^\n;&|]*(?:\s--force\b|\s--force-with-lease\b|\s-[a-zA-Z]*f\b|\s\+[^\s]+)/i,
+  /\bgit\s+reset\s+--hard\b/i,
+  /\bgit\s+clean\b[^\n;&|]*-[a-zA-Z]*f/i,
+  /\bgit\s+branch\s+-D\b/i,
+];
 
 export function isDangerousCommand(command) {
-  return DANGEROUS_CMD_RE.test(String(command || ""));
+  const s = String(command || "");
+  if (!s.trim()) return false;
+  return DANGEROUS_PATTERNS.some((rx) => rx.test(s));
+}
+
+export function isSensitiveWriteTarget(resolvedPath, cwd, dataRootOverride = "") {
+  const dataRoot = dataRootOverride || getPaths().dataRoot;
+  if (dataRoot && isRealPathInsideDir(resolvedPath, dataRoot)) {
+    return { sensitive: true, reason: "目标路径位于 OpenCode Studio 核心配置/数据库目录内，请确认是否允许修改：" };
+  }
+  const normSlash = resolvedPath.replace(/\\/g, "/").toLowerCase();
+  if (/\/\.git\/(?:hooks\/|config$)/.test(normSlash)) {
+    return { sensitive: true, reason: "目标路径涉及 Git Hooks 或核心仓库配置 (.git/hooks 或 .git/config)，请确认是否允许写入：" };
+  }
+  if (cwd && !isRealPathInsideDir(resolvedPath, cwd)) {
+    return { sensitive: true, reason: `目标文件超出当前会话工作目录 (${cwd})，请确认是否允许跨目录写入：` };
+  }
+  return { sensitive: false, reason: "" };
 }
 
 export const BUILTIN_TOOLS = [
@@ -180,7 +213,8 @@ function resolveSafePath(cwd, target) {
 }
 
 function globToRegex(glob) {
-  const escaped = String(glob || "*")
+  const normalized = String(glob || "*").replace(/(\*\*\/?)+/g, "**");
+  const escaped = normalized
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*\*/g, "___DOUBLE___")
     .replace(/\*/g, "[^/\\\\]*")
@@ -205,18 +239,52 @@ function execShell(command, cwd, timeoutMs = 60000, signal = null) {
     let stdout = "";
     let stderr = "";
     let killed = false;
+    let settled = false;
+    let forceCloseTimer = null;
     const maxBuf = 256 * 1024;
+    const outDecoder = new StringDecoder("utf8");
+    const errDecoder = new StringDecoder("utf8");
 
     const proc = spawn(bin, args, {
       cwd,
       env: process.env,
       windowsHide: true,
+      detached: !isWin,
     });
+
+    const finalize = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (forceCloseTimer) clearTimeout(forceCloseTimer);
+      if (signal) signal.removeEventListener("abort", killProc);
+      stdout += outDecoder.end();
+      stderr += errDecoder.end();
+      let combined = "";
+      if (stdout.trim()) combined += stdout.trimEnd();
+      if (stderr.trim()) combined += (combined ? "\n\n[stderr]\n" : "") + stderr.trimEnd();
+      if (!combined) combined = `(命令执行完毕，退出码 ${code ?? 0}，无输出)`;
+      if (combined.length > 24000) {
+        combined = combined.slice(0, 24000) + `\n... [输出已截断，总长 ${combined.length} 字符]`;
+      }
+      resolve({
+        ok: code === 0 && !killed,
+        output: `exit_code: ${code ?? -1}\n${combined}`,
+        exitCode: code ?? -1,
+      });
+    };
 
     const killProc = () => {
       if (killed) return;
       killed = true;
       killProcessTree(proc, "SIGTERM", 1200);
+      // Guarantee resolution even if an inherited background child holds stdio pipes open
+      forceCloseTimer = setTimeout(() => {
+        try { proc.stdout?.destroy(); } catch {}
+        try { proc.stderr?.destroy(); } catch {}
+        finalize(-1);
+      }, 2200);
+      forceCloseTimer.unref?.();
     };
 
     const timer = setTimeout(() => {
@@ -230,32 +298,24 @@ function execShell(command, cwd, timeoutMs = 60000, signal = null) {
     }
 
     proc.stdout?.on("data", (chunk) => {
-      if (stdout.length < maxBuf) stdout += chunk.toString("utf8");
+      const text = outDecoder.write(chunk);
+      if (stdout.length < maxBuf) stdout += text;
     });
     proc.stderr?.on("data", (chunk) => {
-      if (stderr.length < maxBuf) stderr += chunk.toString("utf8");
+      const text = errDecoder.write(chunk);
+      if (stderr.length < maxBuf) stderr += text;
     });
 
     proc.on("error", (err) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      if (forceCloseTimer) clearTimeout(forceCloseTimer);
+      if (signal) signal.removeEventListener("abort", killProc);
       resolve({ ok: false, output: `启动终端进程失败: ${err.message}`, exitCode: -1 });
     });
 
-    proc.on("close", (code) => {
-      clearTimeout(timer);
-      let combined = "";
-      if (stdout.trim()) combined += stdout.trimEnd();
-      if (stderr.trim()) combined += (combined ? "\n\n[stderr]\n" : "") + stderr.trimEnd();
-      if (!combined) combined = `(命令执行完毕，退出码 ${code ?? 0}，无输出)`;
-      if (combined.length > 24000) {
-        combined = combined.slice(0, 24000) + `\n... [输出已截断，总长 ${combined.length} 字符]`;
-      }
-      resolve({
-        ok: code === 0,
-        output: `exit_code: ${code ?? 0}\n${combined}`,
-        exitCode: code ?? 0,
-      });
-    });
+    proc.on("close", (code) => finalize(code));
   });
 }
 
@@ -264,7 +324,7 @@ export async function executeBuiltinTool(name, input, ctx) {
 
   // Dispatch dynamic MCP tools (mcp__<server>__<tool>)
   if (name.startsWith("mcp__") && mcpManager) {
-    return await mcpManager.callTool(name, input || {});
+    return await mcpManager.callTool(name, input || {}, signal);
   }
 
   try {
@@ -286,6 +346,9 @@ export async function executeBuiltinTool(name, input, ctx) {
 
     if (name === "read_file") {
       const fp = resolveSafePath(cwd, input?.file_path);
+      if (isRealPathInsideDir(fp, getPaths().dataRoot)) {
+        return { ok: false, output: "拒绝读取 OpenCode Studio 内部加密数据库或凭证文件。" };
+      }
       if (!fs.existsSync(fp)) return { ok: false, output: `文件不存在: ${fp}` };
       const stat = fs.statSync(fp);
       if (stat.isDirectory()) return { ok: false, output: `路径是目录而非文件: ${fp}` };
@@ -304,6 +367,17 @@ export async function executeBuiltinTool(name, input, ctx) {
 
     if (name === "edit_file") {
       const fp = resolveSafePath(cwd, input?.file_path);
+      const sens = isSensitiveWriteTarget(fp, cwd);
+      if (sens.sensitive) {
+        if (!confirmDangerous) {
+          if (isRealPathInsideDir(fp, getPaths().dataRoot)) {
+            return { ok: false, output: "拒绝修改 OpenCode Studio 核心配置目录。" };
+          }
+        } else {
+          const ok = await confirmDangerous({ tool: "edit_file", command: `edit_file -> ${fp}`, reason: sens.reason });
+          if (!ok) return { ok: false, output: "用户拒绝了该跨目录/敏感文件的修改操作。" };
+        }
+      }
       if (!fs.existsSync(fp)) return { ok: false, output: `文件不存在: ${fp}` };
       const oldStr = String(input?.old_string ?? "");
       const newStr = String(input?.new_string ?? "");
@@ -332,6 +406,17 @@ export async function executeBuiltinTool(name, input, ctx) {
 
     if (name === "write_file") {
       const fp = resolveSafePath(cwd, input?.file_path);
+      const sens = isSensitiveWriteTarget(fp, cwd);
+      if (sens.sensitive) {
+        if (!confirmDangerous) {
+          if (isRealPathInsideDir(fp, getPaths().dataRoot)) {
+            return { ok: false, output: "拒绝写入 OpenCode Studio 核心配置目录。" };
+          }
+        } else {
+          const ok = await confirmDangerous({ tool: "write_file", command: `write_file -> ${fp}`, reason: sens.reason });
+          if (!ok) return { ok: false, output: "用户拒绝了该跨目录/敏感文件的写入操作。" };
+        }
+      }
       fs.mkdirSync(path.dirname(fp), { recursive: true });
       const content = String(input?.content ?? "");
       fs.writeFileSync(fp, content, "utf8");
@@ -385,12 +470,17 @@ export async function executeBuiltinTool(name, input, ctx) {
       const root = resolveSafePath(cwd, input?.dir_path || ".");
       const pat = String(input?.pattern || "");
       if (!pat) return { ok: false, output: "pattern 不能为空" };
-      let rx;
-      try {
-        rx = new RegExp(pat, "i");
-      } catch {
-        rx = new RegExp(pat.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      let rx = null;
+      // Guard against catastrophic nested-quantifier ReDoS patterns; fallback to fast case-insensitive substring match
+      const hasNestedQuantifiers = /\([^)]*[+*][^)]*\)[+*?{]/.test(pat) || pat.length > 256;
+      if (!hasNestedQuantifiers) {
+        try {
+          rx = new RegExp(pat, "i");
+        } catch {
+          rx = null;
+        }
       }
+      const patLower = pat.toLowerCase();
       const ext = input?.file_ext ? String(input.file_ext).toLowerCase() : "";
       const hits = [];
       const deadline = Date.now() + 3000;
@@ -419,7 +509,9 @@ export async function executeBuiltinTool(name, input, ctx) {
               const lines = txt.split(/\r?\n/);
               const rel = path.relative(root, full).replace(/\\/g, "/");
               for (let i = 0; i < lines.length; i++) {
-                if (rx.test(lines[i])) {
+                const probeLine = lines[i].length > 4000 ? lines[i].slice(0, 4000) : lines[i];
+                const matched = rx ? rx.test(probeLine) : probeLine.toLowerCase().includes(patLower);
+                if (matched) {
                   hits.push(`${rel}:${i + 1}: ${lines[i].trim().slice(0, 180)}`);
                   if (hits.length >= 80) break;
                 }

@@ -36,32 +36,17 @@
 
 ---
 
-## 快速开始（学生开箱即用）
+## 快速开始（独立原生桌面客户端 · 学生开箱即用）
 
-### 方式一：下载桌面安装包（最简单，推荐学生）
-前往本仓库的 [Releases 页面](https://github.com/gniygniynus/opencode-studio/releases) 下载对应系统安装包：
-- **Windows**：下载 `OpenCode Studio Setup ...exe` 双击安装，或下载便携版直接运行。
-- **macOS**：下载对应芯片的 `.dmg`（Apple Silicon 选 `arm64`，Intel 选 `x64`）拖入「应用程序」。
-  > **macOS 首次打开提示说明**：个人开源免费版未购买 Apple 付费商业签名，若首次打开提示“无法验证开发者/已损坏”，在终端运行一行命令即可放行：
+### 下载对应系统桌面安装包（非网页版独立桌面应用）
+前往本仓库的 [Releases 页面](https://github.com/gniygniynus/opencode-studio/releases/latest) 下载最新版本桌面客户端：
+- **Windows (`x64`)**：下载 `OpenCode Studio Setup ...exe` 双击向导安装（推荐，支持覆盖升级保留数据），或下载免安装便携版直接运行。
+- **macOS (`arm64` Apple Silicon / `x64` Intel)**：下载对应芯片的 `.dmg` 拖入「应用程序」。
+  > **macOS 首次打开提示说明**：个人开源免费版未购买 Apple 商业签名，若首次打开提示“无法验证开发者/已损坏”，在终端运行一行命令即可放行：
   > ```bash
   > xattr -cr "/Applications/OpenCode Studio.app"
   > ```
-- **Linux**：下载 `.AppImage`（`chmod +x` 后双击）或 `.deb` 安装。
-
-### 方式二：源码直接运行（网页版 / 开发模式，需要 Node.js ≥ 22.12）
-```bash
-git clone https://github.com/gniygniynus/opencode-studio.git
-cd opencode-studio
-npm install --omit=dev
-npm start
-# 打开浏览器访问 http://127.0.0.1:17620
-```
-
-启动桌面窗口开发模式：
-```bash
-npm install
-npm run desktop
-```
+- **Linux (`x64`)**：下载 `.AppImage`（`chmod +x` 后双击，已内置 Ubuntu 24.04+ 沙盒兼容）或 `.deb` 安装。
 
 ---
 

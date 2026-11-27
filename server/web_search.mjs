@@ -9,6 +9,7 @@
 
 import { getAllSettings } from "./db.mjs";
 import { proxyFetch } from "./runtime_utils.mjs";
+import { assertSafePublicUrlResolved, isSafePublicUrl } from "./security.mjs";
 
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -96,21 +97,66 @@ export function parseDuckDuckGoHtmlItems(htmlText) {
   return out;
 }
 
-async function fetchTextSafe(url, { timeoutMs = 6500, proxyUrl = "", headers = {} } = {}) {
+async function fetchTextSafe(url, { timeoutMs = 6500, proxyUrl = "", headers = {}, maxBytes = 2 * 1024 * 1024 } = {}) {
+  await assertSafePublicUrlResolved(url, Boolean(proxyUrl));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await proxyFetch(url, {
-      headers: {
-        "User-Agent": BROWSER_UA,
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        ...headers,
-      },
-      signal: controller.signal,
-      proxyUrl,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.text();
+    let curUrl = url;
+    for (let hop = 0; hop <= 4; hop++) {
+      const res = await proxyFetch(curUrl, {
+        headers: {
+          "User-Agent": BROWSER_UA,
+          "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          ...headers,
+        },
+        signal: controller.signal,
+        proxyUrl,
+        maxBytes,
+      });
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        const loc = res.headers.get("location");
+        try { await res.body?.cancel?.(); } catch {}
+        if (!loc || hop === 4) throw new Error(`HTTP ${res.status}`);
+        curUrl = new URL(loc, curUrl).toString();
+        await assertSafePublicUrlResolved(curUrl, Boolean(proxyUrl));
+        continue;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const ctype = String(res.headers.get("content-type") || "").toLowerCase();
+      if (
+        ctype &&
+        !ctype.includes("text/") &&
+        !ctype.includes("xml") &&
+        !ctype.includes("json") &&
+        !ctype.includes("html") &&
+        !ctype.includes("javascript")
+      ) {
+        try { await res.body?.cancel?.(); } catch {}
+        throw new Error(`目标响应不是可读网页文本 (${ctype.split(";")[0]})`);
+      }
+      if (res.body?.getReader) {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let total = 0;
+        let out = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          out += decoder.decode(value, { stream: true });
+          if (total >= maxBytes) {
+            try { await reader.cancel(); } catch {}
+            break;
+          }
+        }
+        out += decoder.decode();
+        return out;
+      }
+      const txt = await res.text();
+      return txt.slice(0, maxBytes);
+    }
+    throw new Error("重定向次数过多");
   } finally {
     clearTimeout(timer);
   }
@@ -216,8 +262,8 @@ export async function searchWebLive(query, { maxResults = 8, mode = "" } = {}) {
  */
 export async function fetchWebPageClean(rawUrl, { maxChars = 18000 } = {}) {
   const url = String(rawUrl || "").trim();
-  if (!/^https?:\/\//i.test(url)) {
-    return { ok: false, url, error: "仅支持 http:// 或 https:// 链接", content: "" };
+  if (!isSafePublicUrl(url)) {
+    return { ok: false, url, error: "仅支持访问公开 http(s) 网页链接（已阻止本地或内网地址）", content: "" };
   }
   const proxyUrl = String(getAllSettings().search_engine?.proxy_url || "").trim();
   try {

@@ -4,9 +4,13 @@
  */
 
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { listInstalledMcps } from "./db.mjs";
 import { logEvent } from "./logger.mjs";
 import { killProcessTree } from "./runtime_utils.mjs";
+
+const MAX_MCP_STDOUT_BUF = 16 * 1024 * 1024;
+const CMD_UNSAFE_ARG_RE = /[&|<>^%\r\n]/;
 
 class StdioMcpConnection {
   constructor(config) {
@@ -16,12 +20,26 @@ class StdioMcpConnection {
     this.pending = new Map();
     this.buffer = "";
     this.tools = [];
-    this.status = "stopped"; // stopped | starting | ready | error
+    this.status = "stopped"; // stopped | starting | ready | remote_ready | error
     this.lastError = "";
+    this._startingPromise = null;
   }
 
   async start() {
     if (this.status === "ready" && this.proc) return;
+    if (this.status === "starting" && this._startingPromise) {
+      return await this._startingPromise;
+    }
+
+    this._startingPromise = this._doStart();
+    try {
+      await this._startingPromise;
+    } finally {
+      this._startingPromise = null;
+    }
+  }
+
+  async _doStart() {
     this.stop();
     if (["http", "sse", "streamable-http"].includes(String(this.config.command || "").toLowerCase())) {
       this.status = "remote_ready";
@@ -34,28 +52,45 @@ class StdioMcpConnection {
 
     try {
       const isWin = process.platform === "win32";
-      const cmd = isWin && ["npx", "npm", "uvx"].includes(this.config.command)
-        ? `${this.config.command}.cmd`
-        : this.config.command;
+      const rawCmd = String(this.config.command || "").trim();
+      const useWinCmdShim = isWin && (["npx", "npm", "uvx"].includes(rawCmd) || /\.(cmd|bat)$/i.test(rawCmd));
+      const cmd = isWin && ["npx", "npm", "uvx"].includes(rawCmd) ? `${rawCmd}.cmd` : rawCmd;
+      const rawArgs = Array.isArray(this.config.args) ? this.config.args.map((a) => String(a)) : [];
 
-      this.proc = spawn(cmd, this.config.args || [], {
+      if (useWinCmdShim && rawArgs.some((a) => CMD_UNSAFE_ARG_RE.test(a))) {
+        throw new Error("MCP 启动参数包含不安全的命令行控制字符，已拒绝执行");
+      }
+
+      const proc = spawn(cmd, rawArgs, {
         env: { ...process.env, ...(this.config.env || {}) },
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
-        shell: isWin && cmd.endsWith(".cmd"),
+        detached: !isWin,
+        shell: useWinCmdShim,
       });
+      this.proc = proc;
 
-      this.proc.stdout.on("data", (chunk) => this._onStdout(chunk.toString("utf8")));
-      this.proc.stderr.on("data", (chunk) => {
-        const msg = chunk.toString("utf8").trim();
+      proc.stdin?.on("error", () => {});
+      const outDecoder = new StringDecoder("utf8");
+      const errDecoder = new StringDecoder("utf8");
+
+      proc.stdout.on("data", (chunk) => {
+        if (this.proc !== proc) return;
+        this._onStdout(outDecoder.write(chunk));
+      });
+      proc.stderr.on("data", (chunk) => {
+        if (this.proc !== proc) return;
+        const msg = errDecoder.write(chunk).trim();
         if (msg) logEvent("INFO", "mcp", "stderr", `[${this.config.name}] ${msg.slice(0, 300)}`);
       });
-      this.proc.on("error", (err) => {
+      proc.on("error", (err) => {
+        if (this.proc !== proc) return;
         this.status = "error";
         this.lastError = err.message;
         this._rejectAll(err);
       });
-      this.proc.on("close", (code) => {
+      proc.on("close", (code) => {
+        if (this.proc !== proc) return;
         if (this.status !== "stopped") {
           this.status = code === 0 ? "stopped" : "error";
           if (code !== 0) this.lastError = `进程退出 (code=${code})`;
@@ -68,7 +103,7 @@ class StdioMcpConnection {
       await this.request("initialize", {
         protocolVersion: "2024-11-05",
         capabilities: {},
-        clientInfo: { name: "OpenCode Studio", version: "1.0.0" },
+        clientInfo: { name: "OpenCode Studio", version: "2.3.0" },
       });
       this.notify("notifications/initialized", {});
 
@@ -86,6 +121,11 @@ class StdioMcpConnection {
 
   _onStdout(text) {
     this.buffer += text;
+    if (this.buffer.length > MAX_MCP_STDOUT_BUF) {
+      logEvent("WARN", "mcp", "buffer_overflow", `MCP [${this.config.name}] 输出行超过 16MB，已重置缓冲区`);
+      this.buffer = "";
+      return;
+    }
     const lines = this.buffer.split(/\r?\n/);
     this.buffer = lines.pop() || "";
     for (const line of lines) {
@@ -98,8 +138,9 @@ class StdioMcpConnection {
         continue;
       }
       if (msg.id !== undefined && this.pending.has(msg.id)) {
-        const { resolve, reject, timer } = this.pending.get(msg.id);
+        const { resolve, reject, timer, cleanupAbort } = this.pending.get(msg.id);
         clearTimeout(timer);
+        cleanupAbort?.();
         this.pending.delete(msg.id);
         if (msg.error) reject(new Error(msg.error.message || JSON.stringify(msg.error)));
         else resolve(msg.result);
@@ -107,34 +148,62 @@ class StdioMcpConnection {
     }
   }
 
-  request(method, params = {}, timeoutMs = 20000) {
+  request(method, params = {}, timeoutMs = 20000, signal = null) {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        return reject(new Error("MCP 请求已取消"));
+      }
       if (!this.proc?.stdin?.writable) {
         return reject(new Error("MCP stdin 不可写"));
       }
       const id = this.nextId++;
-      const timer = setTimeout(() => {
+      const onAbort = () => {
+        clearTimeout(timer);
         this.pending.delete(id);
+        this.notify("notifications/cancelled", { requestId: id, reason: "User stopped turn" });
+        reject(new Error("MCP 请求已由用户取消"));
+      };
+      const cleanupAbort = () => {
+        if (signal) signal.removeEventListener("abort", onAbort);
+      };
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+
+      const timer = setTimeout(() => {
+        cleanupAbort();
+        this.pending.delete(id);
+        // Reset wedged child process so subsequent calls start fresh instead of hanging repeatedly
+        this.lastError = `MCP 请求超时: ${method}`;
+        this.stop(true);
         reject(new Error(`MCP 请求超时: ${method}`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+
+      this.pending.set(id, { resolve, reject, timer, cleanupAbort });
       const payload = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
-      this.proc.stdin.write(payload);
+      try {
+        this.proc.stdin.write(payload);
+      } catch (err) {
+        clearTimeout(timer);
+        cleanupAbort();
+        this.pending.delete(id);
+        reject(err);
+      }
     });
   }
 
   notify(method, params = {}) {
     if (!this.proc?.stdin?.writable) return;
-    this.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
+    try {
+      this.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
+    } catch {}
   }
 
-  async callTool(toolName, args) {
+  async callTool(toolName, args, signal = null) {
     if (this.status !== "ready") await this.start();
     if (this.status !== "ready") {
       return { ok: false, output: `MCP [${this.config.name}] 未就绪: ${this.lastError}` };
     }
     try {
-      const res = await this.request("tools/call", { name: toolName, arguments: args || {} }, 45000);
+      const res = await this.request("tools/call", { name: toolName, arguments: args || {} }, 45000, signal);
       const parts = Array.isArray(res?.content)
         ? res.content.map((c) => (c.type === "text" ? c.text : JSON.stringify(c)))
         : [JSON.stringify(res)];
@@ -145,8 +214,9 @@ class StdioMcpConnection {
   }
 
   _rejectAll(err) {
-    for (const { reject, timer } of this.pending.values()) {
+    for (const { reject, timer, cleanupAbort } of this.pending.values()) {
       clearTimeout(timer);
+      cleanupAbort?.();
       reject(err);
     }
     this.pending.clear();
@@ -164,6 +234,7 @@ class StdioMcpConnection {
 export class McpManager {
   constructor() {
     this.conns = new Map();
+    this.toolRouteMap = new Map();
   }
 
   async syncFromDb() {
@@ -213,14 +284,27 @@ export class McpManager {
     });
   }
 
+  _buildSafeNamespace(conn) {
+    const asciiBase = String(conn.config.name || "")
+      .replace(/[^A-Za-z0-9_]/g, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_|_$/g, "")
+      .slice(0, 18);
+    const idTail = String(conn.config.id || "").replace(/[^A-Za-z0-9]/g, "").slice(-5) || "srv";
+    return asciiBase ? `${asciiBase}_${idTail}` : `mcp_${idTail}`;
+  }
+
   getToolDefinitions() {
     const defs = [];
+    this.toolRouteMap.clear();
     for (const [id, conn] of this.conns.entries()) {
       if (conn.status !== "ready") continue;
-      const safeServer = conn.config.name.replace(/[^A-Za-z0-9_]/g, "_").slice(0, 24);
+      const ns = this._buildSafeNamespace(conn);
       for (const t of conn.tools) {
+        const fullToolName = `mcp__${ns}__${t.name}`;
+        this.toolRouteMap.set(fullToolName, { conn, rawToolName: t.name });
         defs.push({
-          name: `mcp__${safeServer}__${t.name}`,
+          name: fullToolName,
           description: `[MCP:${conn.config.name}] ${t.description || t.name}`,
           input_schema: t.inputSchema || { type: "object", properties: {} },
           _mcpId: id,
@@ -231,13 +315,20 @@ export class McpManager {
     return defs;
   }
 
-  async callTool(namespacedName, args) {
+  async callTool(namespacedName, args, signal = null) {
+    if (!this.toolRouteMap.has(namespacedName)) {
+      this.getToolDefinitions();
+    }
+    const route = this.toolRouteMap.get(namespacedName);
+    if (route) {
+      return await route.conn.callTool(route.rawToolName, args, signal);
+    }
+    // Backwards-compatible fallback prefix match
     for (const conn of this.conns.values()) {
-      const safeServer = conn.config.name.replace(/[^A-Za-z0-9_]/g, "_").slice(0, 24);
-      const prefix = `mcp__${safeServer}__`;
+      const legacyServer = String(conn.config.name || "").replace(/[^A-Za-z0-9_]/g, "_").slice(0, 24);
+      const prefix = `mcp__${legacyServer}__`;
       if (namespacedName.startsWith(prefix)) {
-        const rawTool = namespacedName.slice(prefix.length);
-        return await conn.callTool(rawTool, args);
+        return await conn.callTool(namespacedName.slice(prefix.length), args, signal);
       }
     }
     return { ok: false, output: `未找到对应的 MCP 工具: ${namespacedName}` };
@@ -246,5 +337,6 @@ export class McpManager {
   stopAll() {
     for (const conn of this.conns.values()) conn.stop();
     this.conns.clear();
+    this.toolRouteMap.clear();
   }
 }

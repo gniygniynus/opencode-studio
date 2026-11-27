@@ -34,8 +34,8 @@
 
     resize() {
       const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-      const w = window.innerWidth;
-      const h = window.innerHeight;
+      const w = Math.max(1, window.innerWidth || 1);
+      const h = Math.max(1, window.innerHeight || 1);
       this.canvas.width = Math.floor(w * dpr);
       this.canvas.height = Math.floor(h * dpr);
       this.canvas.style.width = `${w}px`;

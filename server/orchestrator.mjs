@@ -1,11 +1,11 @@
 /**
  * Unified Session Orchestrator:
  *  - Per-session concurrency lock (different sessions run truly in parallel;
- *    same session across multiple open browser/Electron windows stays strictly in sync).
+ *    same session across multiple open windows stays strictly in sync).
  *  - Non-destructive Edit & Resend branching (creates sibling branch under same parent_id).
- *  - Seamless dual-engine dispatch (OpenCode Open-Source API Engine <-> Claude Native OAuth Adapter)
+ *  - Seamless dual-engine dispatch (Native Claude Code <-> OpenCode Open-Source API Engine)
  *    sharing one unified SQLite timeline.
- *  - Interactive dangerous-command confirmation workflow when student-safe guard is enabled.
+ *  - Interactive dangerous-command confirmation workflow across BOTH engines when student-safe guard is enabled.
  */
 
 import crypto from "node:crypto";
@@ -44,12 +44,26 @@ export class SessionOrchestrator {
   getLiveState(sessionId) {
     const run = this.activeRuns.get(sessionId);
     if (!run) return null;
+    let pendingConfirm = null;
+    for (const [confirmId, entry] of this.pendingConfirms.entries()) {
+      if (entry.sessionId === sessionId) {
+        pendingConfirm = {
+          confirm_id: confirmId,
+          session_id: sessionId,
+          ...entry.payload,
+        };
+        break;
+      }
+    }
     return {
       running: true,
       req_id: run.reqId,
       model: run.model,
       provider_name: run.providerName,
+      engine: run.engine || "claude_code",
       blocks: run.liveBlocks,
+      usage: run.liveUsage || null,
+      pending_confirm: pendingConfirm,
     };
   }
 
@@ -57,6 +71,7 @@ export class SessionOrchestrator {
     const entry = this.pendingConfirms.get(confirmId);
     if (!entry) return false;
     clearTimeout(entry.timer);
+    entry.cleanupAbort?.();
     this.pendingConfirms.delete(confirmId);
     entry.resolve(Boolean(approved));
     return true;
@@ -64,24 +79,66 @@ export class SessionOrchestrator {
 
   stopTurn(sessionId) {
     const run = this.activeRuns.get(sessionId);
-    if (!run) return false;
-    run.stoppedByUser = true;
-    run.controller.abort();
-    logEvent("INFO", "orchestrator", "stop_requested", `用户停止会话 ${sessionId.slice(0, 8)}`, {
-      reqId: run.reqId,
-      sessionId,
-    });
-    return true;
+    let stopped = false;
+    if (run) {
+      run.stoppedByUser = true;
+      run.controller.abort();
+      stopped = true;
+      logEvent("INFO", "orchestrator", "stop_requested", `用户停止会话 ${sessionId.slice(0, 8)}`, {
+        reqId: run.reqId,
+        sessionId,
+      });
+    }
+    // Immediately release any pending dangerous-command confirmations for this session so UI never hangs 120s!
+    for (const [cid, entry] of this.pendingConfirms.entries()) {
+      if (entry.sessionId === sessionId) {
+        clearTimeout(entry.timer);
+        entry.cleanupAbort?.();
+        this.pendingConfirms.delete(cid);
+        entry.resolve(false);
+      }
+    }
+    return stopped;
   }
 
-  async _requestConfirm(sessionId, payload) {
+  stopAll() {
+    for (const sid of [...this.activeRuns.keys()]) {
+      this.stopTurn(sid);
+    }
+    for (const [cid, entry] of this.pendingConfirms.entries()) {
+      clearTimeout(entry.timer);
+      entry.cleanupAbort?.();
+      this.pendingConfirms.delete(cid);
+      entry.resolve(false);
+    }
+  }
+
+  async requestExternalConfirm(sessionId, payload) {
+    const run = sessionId ? this.activeRuns.get(sessionId) : null;
+    return await this._requestConfirm(sessionId, payload, run?.controller?.signal || null);
+  }
+
+  async _requestConfirm(sessionId, payload, signal = null) {
+    if (signal?.aborted) return false;
     const confirmId = `cfm_${crypto.randomBytes(5).toString("hex")}`;
     return await new Promise((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        this.pendingConfirms.delete(confirmId);
+        resolve(false);
+      };
+      const cleanupAbort = () => {
+        if (signal) signal.removeEventListener("abort", onAbort);
+      };
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+
       const timer = setTimeout(() => {
+        cleanupAbort();
         this.pendingConfirms.delete(confirmId);
         resolve(false);
       }, 120_000);
-      this.pendingConfirms.set(confirmId, { resolve, timer });
+
+      this.pendingConfirms.set(confirmId, { resolve, timer, cleanupAbort, sessionId, payload });
       this.broadcast({
         type: "confirm_request",
         session_id: sessionId,
@@ -89,6 +146,16 @@ export class SessionOrchestrator {
         ...payload,
       });
     });
+  }
+
+  _validateProviderReady(providerId, sessionId, reqId) {
+    const provider = (providerId ? getProvider(providerId, true) : null) || getActiveProvider(true);
+    if (!provider || (provider.kind !== "claude_native" && !provider.api_key && !provider.base_url)) {
+      const err = classifyError({ codeHint: "ERR_NO_PROVIDER", sessionId, reqId });
+      this.lastError = err;
+      return { ok: false, error: err, provider: null };
+    }
+    return { ok: true, provider };
   }
 
   /**
@@ -103,25 +170,39 @@ export class SessionOrchestrator {
     model = "",
     thinkingLevel = "auto",
     webSearchEnabled = null,
+    clientReqId = "",
   }) {
     const cleanText = String(text || "").trim();
     if (!cleanText && (!images || !images.length)) {
       return { ok: false, error: "消息不能为空" };
     }
 
+    if (sessionId && this.activeRuns.has(sessionId)) {
+      return { ok: false, busy: true, error: "该会话正在生成回复，请等待或点击停止。" };
+    }
+
+    const reqId = newReqId();
+    const existingMeta = sessionId ? getSessionMeta(sessionId) : null;
+    const preCheck = this._validateProviderReady(providerId || existingMeta?.provider_id || "", sessionId, reqId);
+    if (!preCheck.ok) {
+      this.broadcast({ type: "turn_error", session_id: sessionId || "", error: preCheck.error });
+      return { ok: false, error: preCheck.error };
+    }
+
     let sid = sessionId;
-    let meta = sid ? getSessionMeta(sid) : null;
+    let meta = existingMeta;
     let createdNewSession = false;
     if (!meta) {
       const firstAtt = images?.[0];
-      const attFallback = firstAtt?.kind === "text" || firstAtt?.kind === "file"
-        ? `[文件: ${firstAtt.name || "附件"}]${images.length > 1 ? ` 等 ${images.length} 个` : ""}`
-        : `[附件 × ${images.length}]`;
+      const attFallback =
+        firstAtt?.kind === "text" || firstAtt?.kind === "file"
+          ? `[文件: ${firstAtt.name || "附件"}]${images.length > 1 ? ` 等 ${images.length} 个` : ""}`
+          : `[附件 × ${images.length}]`;
       const titlePreview = (cleanText || attFallback).replace(/\s+/g, " ").slice(0, 60);
       meta = createSession({
         title: titlePreview,
         cwd: cwd || "",
-        providerId,
+        providerId: preCheck.provider.id,
         model,
         thinkingLevel,
       });
@@ -131,20 +212,9 @@ export class SessionOrchestrator {
       meta = updateSessionMeta(sid, { cwd });
     }
 
-    if (this.activeRuns.has(sid)) {
-      const err = classifyError({
-        message: "该会话正在生成回复，请等待或点击停止。",
-        sessionId: sid,
-        codeHint: "ERR_SESSION_BUSY",
-      });
-      this.lastError = err;
-      this.broadcast({ type: "turn_error", session_id: sid, error: err });
-      return { ok: false, error: err };
-    }
-
     // Handle /compact slash command cleanly across engines
     if (cleanText === "/compact" || cleanText.startsWith("/compact ")) {
-      if (createdNewSession) this.broadcast({ type: "session_created", session: meta });
+      if (createdNewSession) this.broadcast({ type: "session_created", session: meta, client_req_id: clientReqId });
       return await this._handleCompact(sid, providerId, model);
     }
 
@@ -154,7 +224,6 @@ export class SessionOrchestrator {
       const prevTimeline = getSessionTimeline(sid);
       const parentId = prevTimeline?.last_message_id || null;
 
-      // Auto-title if still default
       if (meta.title === "新会话" && cleanText) {
         meta = updateSessionMeta(sid, { title: cleanText.replace(/\s+/g, " ").slice(0, 64) });
       }
@@ -185,7 +254,7 @@ export class SessionOrchestrator {
     }
 
     if (createdNewSession) {
-      this.broadcast({ type: "session_created", session: meta });
+      this.broadcast({ type: "session_created", session: meta, client_req_id: clientReqId });
     }
     this.broadcast({
       type: "message_added",
@@ -222,24 +291,27 @@ export class SessionOrchestrator {
     webSearchEnabled = null,
   }) {
     const cleanText = String(newText || "").trim();
-    if (!cleanText) return { ok: false, error: "编辑后的内容不能为空" };
-
     const meta = getSessionMeta(sessionId);
     if (!meta) return { ok: false, error: "会话不存在" };
 
     if (this.activeRuns.has(sessionId)) {
-      const err = classifyError({
-        message: "该会话正在运行，请先停止后再编辑历史消息。",
-        sessionId,
-        codeHint: "ERR_SESSION_BUSY",
-      });
-      this.broadcast({ type: "turn_error", session_id: sessionId, error: err });
-      return { ok: false, error: err };
+      return { ok: false, busy: true, error: "该会话正在运行，请先停止后再编辑历史消息。" };
     }
 
     const orig = getMessageById(messageId);
     if (!orig || orig.session_id !== sessionId || orig.role !== "user") {
       return { ok: false, error: "只能编辑本会话的历史用户消息" };
+    }
+
+    const finalImages = images !== null ? images : orig.images || [];
+    if (!cleanText && !finalImages.length) {
+      return { ok: false, error: "编辑后的内容或附件不能为空" };
+    }
+
+    const preCheck = this._validateProviderReady(providerId || meta.provider_id, sessionId, newReqId());
+    if (!preCheck.ok) {
+      this.broadcast({ type: "turn_error", session_id: sessionId, error: preCheck.error });
+      return { ok: false, error: preCheck.error };
     }
 
     // Create a sibling user message under the EXACT same parent_id (non-destructive branch!)
@@ -248,19 +320,19 @@ export class SessionOrchestrator {
       parentId: orig.parent_id,
       role: "user",
       contentText: cleanText,
-      images: images !== null ? images : orig.images || [],
+      images: finalImages,
     });
 
-    // Clean up previous CLI temp session file so repeated branching NEVER leaves scattered files on disk
     if (meta.claude_cli_sid) {
       cleanupClaudeSessionFiles([meta.claude_cli_sid]);
     }
     updateSessionMeta(sessionId, { claude_cli_sid: "" });
 
+    const nextTimeline = getSessionTimeline(sessionId);
     this.broadcast({
       type: "timeline_updated",
       session_id: sessionId,
-      timeline: getSessionTimeline(sessionId),
+      timeline: nextTimeline,
     });
 
     this._launchExecution({
@@ -271,6 +343,7 @@ export class SessionOrchestrator {
       thinkingLevel: thinkingLevel || meta.thinking_level || "auto",
       webSearchEnabled,
       forceNoCliResume: true,
+      prefetchedTimeline: nextTimeline,
     });
 
     return { ok: true, session_id: sessionId, message_id: newUserMsg.id };
@@ -291,18 +364,18 @@ export class SessionOrchestrator {
     if (!meta) return { ok: false, error: "会话不存在" };
 
     if (this.activeRuns.has(sessionId)) {
-      const err = classifyError({
-        message: "该会话正在运行，请先停止后再重新生成。",
-        sessionId,
-        codeHint: "ERR_SESSION_BUSY",
-      });
-      this.broadcast({ type: "turn_error", session_id: sessionId, error: err });
-      return { ok: false, error: err };
+      return { ok: false, busy: true, error: "该会话正在运行，请先停止后再重新生成。" };
     }
 
     const origAsst = getMessageById(assistantMessageId);
     if (!origAsst || origAsst.session_id !== sessionId || origAsst.role !== "assistant" || !origAsst.parent_id) {
       return { ok: false, error: "未找到对应的历史回复或父级用户提问" };
+    }
+
+    const preCheck = this._validateProviderReady(providerId || meta.provider_id, sessionId, newReqId());
+    if (!preCheck.ok) {
+      this.broadcast({ type: "turn_error", session_id: sessionId, error: preCheck.error });
+      return { ok: false, error: preCheck.error };
     }
 
     const parentUserId = origAsst.parent_id;
@@ -346,8 +419,10 @@ export class SessionOrchestrator {
       controller,
       reqId,
       liveBlocks: [{ type: "text", text: "正在压缩历史上下文…" }],
+      liveUsage: {},
       model: effectiveModel,
       providerName: provider.name,
+      engine: "compact",
       stoppedByUser: false,
     });
     this.broadcast({ type: "running_sessions", ids: this.runningSessionIds() });
@@ -363,6 +438,9 @@ export class SessionOrchestrator {
               signal: controller.signal,
             });
 
+      const curMeta = getSessionMeta(sessionId);
+      if (!curMeta || curMeta.archived) return { ok: false, error: "会话已被删除" };
+
       const compactMsg = addMessage({
         sessionId,
         parentId: timeline.last_message_id,
@@ -371,7 +449,7 @@ export class SessionOrchestrator {
         model: effectiveModel,
         providerName: provider.name,
       });
-      updateSessionMeta(sessionId, { compact_count: (meta.compact_count || 0) + 1, claude_cli_sid: "" });
+      updateSessionMeta(sessionId, { compact_count: (curMeta.compact_count || 0) + 1, claude_cli_sid: "" });
       this.broadcast({
         type: "turn_complete",
         session_id: sessionId,
@@ -405,8 +483,9 @@ export class SessionOrchestrator {
   }) {
     const reqId = newReqId();
     let meta = getSessionMeta(sessionId);
-    const provider = (providerId ? getProvider(providerId, true) : null) || getActiveProvider(true);
+    if (!meta || meta.archived) return;
 
+    const provider = (providerId ? getProvider(providerId, true) : null) || getActiveProvider(true);
     if (!provider || (provider.kind !== "claude_native" && !provider.api_key && !provider.base_url)) {
       const err = classifyError({ codeHint: "ERR_NO_PROVIDER", sessionId, reqId });
       this.lastError = err;
@@ -448,6 +527,10 @@ export class SessionOrchestrator {
       }
     }
 
+    const rt = process.env.OPENCODE_FORCE_API_DIRECT === "1" ? { mode: "missing" } : detectClaudeRuntime(false);
+    const useNativeClaudeCode =
+      process.env.OPENCODE_FORCE_API_DIRECT !== "1" && (provider.kind === "claude_native" || rt.mode !== "missing");
+
     const effectiveModel = model || provider.default_model || provider.models?.[0] || "sonnet";
     updateSessionMeta(sessionId, {
       provider_id: provider.id,
@@ -463,6 +546,7 @@ export class SessionOrchestrator {
       liveUsage: {},
       model: effectiveModel,
       providerName: provider.name,
+      engine: useNativeClaudeCode ? "claude_code" : "api",
       stoppedByUser: false,
     };
     this.activeRuns.set(sessionId, runState);
@@ -481,15 +565,8 @@ export class SessionOrchestrator {
         const settings = getAllSettings();
         const confirmDangerous =
           settings.permission_mode === "confirm_dangerous"
-            ? (info) => this._requestConfirm(sessionId, info)
+            ? (info) => this._requestConfirm(sessionId, info, controller.signal)
             : null;
-
-        // Primary engine: Native Claude Code CLI.
-        // Smooth fallback: if native binary is absent on non-native API providers (or forced in tests), seamlessly run built-in OpenCode API Engine!
-        const rt = process.env.OPENCODE_FORCE_API_DIRECT === "1" ? { mode: "missing" } : detectClaudeRuntime(false);
-        const useNativeClaudeCode =
-          process.env.OPENCODE_FORCE_API_DIRECT !== "1" &&
-          (provider.kind === "claude_native" || rt.mode !== "missing");
 
         let lastPushTs = 0;
         const pushLive = (force = false) => {
@@ -501,7 +578,7 @@ export class SessionOrchestrator {
             session_id: sessionId,
             model: effectiveModel,
             provider_name: provider.name,
-            engine: useNativeClaudeCode ? "claude_code" : "api",
+            engine: runState.engine,
             blocks: runState.liveBlocks,
             usage: runState.liveUsage,
           });
@@ -534,9 +611,6 @@ export class SessionOrchestrator {
         let result;
         if (useNativeClaudeCode) {
           const prevAsst = [...historyItems].reverse().find((m) => m.role === "assistant");
-          // Only resume the ephemeral CLI session when continuing on the SAME model;
-          // when switching models (e.g. DeepSeek -> Gemini -> GPT), start a clean CLI turn while
-          // `api_proxy.mjs` losslessly hydrates ALL prior turns from SQLite!
           const canResume =
             !forceNoCliResume &&
             Boolean(meta.claude_cli_sid) &&
@@ -558,7 +632,8 @@ export class SessionOrchestrator {
             signal: controller.signal,
             onEvent,
           });
-          if (result.cli_session_id) {
+          const checkMeta = getSessionMeta(sessionId);
+          if (result.cli_session_id && checkMeta && !checkMeta.archived) {
             updateSessionMeta(sessionId, { claude_cli_sid: result.cli_session_id });
           }
         } else {
@@ -578,7 +653,12 @@ export class SessionOrchestrator {
           });
         }
 
-        // Persist assistant response to unified SQLite tree
+        // Guard against race where user deleted/archived the session while it was running
+        const finalMeta = getSessionMeta(sessionId);
+        if (!finalMeta || finalMeta.archived) {
+          return;
+        }
+
         const asstMsg = addMessage({
           sessionId,
           parentId: userMessageId,
@@ -608,6 +688,9 @@ export class SessionOrchestrator {
           elapsed_ms: elapsed,
         });
       } catch (err) {
+        const finalMeta = getSessionMeta(sessionId);
+        if (!finalMeta || finalMeta.archived) return;
+
         const classified = err?.error_code
           ? err
           : classifyError({

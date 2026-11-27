@@ -23,22 +23,25 @@ for /f "tokens=2 delims=:, " %%v in ('findstr /r /c:"\"version\"[ ]*:" "%DIR%\pa
 )
 
 REM 2. Fast loopback health check (~25ms, strictly bypassing Clash / system HTTP proxy)
+set "TOK_FILE=%APPDATA%\OpenCodeStudio\.local_session_token"
 set "HFILE=%TEMP%\ocs_health_%PORT%.json"
 curl.exe --noproxy "*" -sf --connect-timeout 1 --max-time 1 "%URL%/api/health" -o "%HFILE%" >nul 2>&1
 if not errorlevel 1 (
   findstr /c:"\"version\":\"%PKG_VER%\"" "%HFILE%" >nul 2>&1
   if not errorlevel 1 (
-    del /q "%HFILE%" >nul 2>&1
-    goto :ready
+    if exist "%TOK_FILE%" (
+      del /q "%HFILE%" >nul 2>&1
+      goto :ready
+    )
   )
   del /q "%HFILE%" >nul 2>&1
-  echo [OpenCode Studio] New version v%PKG_VER% detected! Restarting local server cleanly ...
+  echo [OpenCode Studio] Updating local server to v%PKG_VER% ...
   for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":%PORT% " ^| findstr "LISTENING"') do (
     taskkill /PID %%p /T /F >nul 2>&1
   )
 )
 
-REM 3. Cold-start server & poll every 60ms via direct loopback socket (zero 1s timeout lag!)
+REM 3. Cold-start server & poll every 60ms via direct loopback socket
 echo [OpenCode Studio] Starting local server (v%PKG_VER%) on %URL% ...
 start "OpenCode Studio Server" /min cmd /c "cd /d ""%DIR%"" && set ""NO_PROXY=127.0.0.1,localhost,::1"" && node server\index.mjs"
 
@@ -50,5 +53,13 @@ if errorlevel 1 (
 )
 
 :ready
-start "" "%URL%"
+set "AUTH_TOK="
+if exist "%TOK_FILE%" (
+  set /p AUTH_TOK=<"%TOK_FILE%"
+)
+if defined AUTH_TOK (
+  start "" "%URL%/?ocs_auth=%AUTH_TOK%"
+) else (
+  start "" "%URL%"
+)
 exit /b 0

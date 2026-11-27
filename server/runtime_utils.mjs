@@ -13,7 +13,9 @@
 import { spawn } from "node:child_process";
 import http from "node:http";
 import https from "node:https";
+import { Readable } from "node:stream";
 import tls from "node:tls";
+import { isSafePublicUrl } from "./security.mjs";
 
 export function killProcessTree(proc, gracefulSignal = "SIGTERM", forceDelayMs = 1500) {
   if (!proc || proc.exitCode !== null) return;
@@ -45,15 +47,22 @@ export function killProcessTree(proc, gracefulSignal = "SIGTERM", forceDelayMs =
     return;
   }
 
-  try {
-    proc.kill(gracefulSignal);
-  } catch {}
+  // On Linux/macOS, kill process group (-pid) first when spawned detached, then fallback to pid
+  const signalGroupOrPid = (sig) => {
+    try {
+      process.kill(-pid, sig);
+      return;
+    } catch {}
+    try {
+      proc.kill(sig);
+    } catch {}
+  };
+
+  signalGroupOrPid(gracefulSignal);
   if (forceDelayMs > 0) {
     const t = setTimeout(() => {
       if (proc.exitCode === null) {
-        try {
-          proc.kill("SIGKILL");
-        } catch {}
+        signalGroupOrPid("SIGKILL");
       }
     }, forceDelayMs);
     t.unref?.();
@@ -81,9 +90,16 @@ function shouldBypassProxy(targetUrl) {
   }
 }
 
-function rawGetViaHttpProxy(targetUrl, proxyUrlObj, { headers = {}, signal = null, maxRedirects = 4 } = {}) {
+function rawGetViaHttpProxy(
+  targetUrl,
+  proxyUrlObj,
+  { headers = {}, signal = null, maxRedirects = 4, maxBytes = 40 * 1024 * 1024, streamBody = false } = {},
+) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(new Error("The operation was aborted"));
+    if (!isSafePublicUrl(targetUrl)) {
+      return reject(new Error("拒绝通过代理请求非公开本地/内网地址"));
+    }
 
     const target = new URL(targetUrl);
     const proxyHost = proxyUrlObj.hostname;
@@ -119,8 +135,44 @@ function rawGetViaHttpProxy(targetUrl, proxyUrlObj, { headers = {}, signal = nul
         res.resume();
         cleanupAbort();
         settled = true;
-        const nextUrl = new URL(loc, targetUrl).toString();
-        rawGetViaHttpProxy(nextUrl, proxyUrlObj, { headers, signal, maxRedirects: maxRedirects - 1 }).then(resolve, reject);
+        let nextUrl;
+        try {
+          nextUrl = new URL(loc, targetUrl).toString();
+        } catch {
+          return reject(new Error("重定向地址格式无效"));
+        }
+        if (!isSafePublicUrl(nextUrl)) {
+          return reject(new Error("已阻止重定向至本地或内网保留地址"));
+        }
+        rawGetViaHttpProxy(nextUrl, proxyUrlObj, {
+          headers,
+          signal,
+          maxRedirects: maxRedirects - 1,
+          maxBytes,
+          streamBody,
+        }).then(resolve, reject);
+        return;
+      }
+
+      const hdrMap = new Map(
+        Object.entries(res.headers).map(([k, v]) => [k.toLowerCase(), Array.isArray(v) ? v.join(", ") : String(v ?? "")]),
+      );
+
+      // True streaming body mode (used by large tarball/installer downloads with real-time progress)
+      if (streamBody) {
+        settled = true;
+        res.on("error", () => {
+          try { activeSocket?.destroy(); } catch {}
+        });
+        const webStream = Readable.toWeb(res);
+        resolve({
+          ok: status >= 200 && status < 300,
+          status,
+          headers: {
+            get: (name) => hdrMap.get(String(name || "").toLowerCase()) ?? null,
+          },
+          body: webStream,
+        });
         return;
       }
 
@@ -128,24 +180,28 @@ function rawGetViaHttpProxy(targetUrl, proxyUrlObj, { headers = {}, signal = nul
       let total = 0;
       res.on("data", (chunk) => {
         total += chunk.length;
-        if (total > 40 * 1024 * 1024) {
-          fail(new Error("响应体超过 40MB 上限"));
+        if (total > maxBytes) {
+          fail(new Error(`响应体超过 ${Math.round(maxBytes / (1024 * 1024))}MB 上限`));
           return;
         }
         chunks.push(chunk);
       });
       res.on("end", () => {
         if (settled) return;
+        if (!res.complete) {
+          fail(new Error("网络连接提前中断，响应数据不完整"));
+          return;
+        }
         settled = true;
         cleanupAbort();
         const buf = Buffer.concat(chunks);
-        const hdrMap = new Map(Object.entries(res.headers).map(([k, v]) => [k.toLowerCase(), Array.isArray(v) ? v.join(", ") : String(v ?? "")]));
         resolve({
           ok: status >= 200 && status < 300,
           status,
           headers: {
             get: (name) => hdrMap.get(String(name || "").toLowerCase()) ?? null,
           },
+          body: Readable.toWeb(Readable.from([buf])),
           arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
           text: async () => buf.toString("utf8"),
           json: async () => JSON.parse(buf.toString("utf8")),
@@ -188,6 +244,7 @@ function rawGetViaHttpProxy(targetUrl, proxyUrlObj, { headers = {}, signal = nul
 
     connectReq.on("connect", (connectRes, socket) => {
       activeSocket = socket;
+      socket.on("error", fail);
       if (connectRes.statusCode !== 200) {
         fail(new Error(`代理 CONNECT 失败 (HTTP ${connectRes.statusCode})`));
         return;
@@ -222,10 +279,13 @@ function rawGetViaHttpProxy(targetUrl, proxyUrlObj, { headers = {}, signal = nul
 /**
  * Drop-in GET fetch wrapper that uses `proxyUrl` when configured, or falls back to native `fetch`.
  */
-export async function proxyFetch(url, { headers = {}, signal = null, proxyUrl = "" } = {}) {
+export async function proxyFetch(
+  url,
+  { headers = {}, signal = null, proxyUrl = "", maxBytes = 40 * 1024 * 1024, streamBody = false } = {},
+) {
   const parsedProxy = normalizeProxyUrl(proxyUrl);
   if (!parsedProxy || shouldBypassProxy(url)) {
     return await fetch(url, { headers, signal });
   }
-  return await rawGetViaHttpProxy(url, parsedProxy, { headers, signal });
+  return await rawGetViaHttpProxy(url, parsedProxy, { headers, signal, maxBytes, streamBody });
 }

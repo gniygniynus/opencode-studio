@@ -3,14 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ws://127.0.0.1:* ws://localhost:*; frame-src 'self'; object-src 'none'; base-uri 'self';"
+  />
   <title>OpenCode Studio</title>
-  <script>
-    try {
-      const snap = JSON.parse(localStorage.getItem("ocs_ap_snap") || "null");
-      if (snap && snap.theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
-      if (snap && snap.fontSize) document.documentElement.style.setProperty("--font-size-base", snap.fontSize + "px");
-    } catch {}
-  </script>
+  <link rel="icon" type="image/png" href="/favicon.png" />
+  <script src="/theme_boot.js"></script>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
@@ -19,7 +18,7 @@
   <div id="wallpaper-layer-b" class="wallpaper-layer wallpaper-layer-b" aria-hidden="true"></div>
   <canvas id="wallpaper-canvas" class="wallpaper-canvas hidden"></canvas>
   <video id="wallpaper-video" class="wallpaper-video hidden" autoplay muted loop playsinline></video>
-  <iframe id="wallpaper-web" class="wallpaper-web hidden" sandbox="allow-scripts allow-same-origin" title="互动动态壁纸"></iframe>
+  <iframe id="wallpaper-web" class="wallpaper-web hidden" sandbox="allow-scripts" title="互动动态壁纸"></iframe>
   <div id="wallpaper-scrim" class="wallpaper-scrim"></div>
 
   <div id="app" class="app-shell">
@@ -713,7 +712,7 @@
           <div class="section-header-row">
             <div>
               <div class="section-label" style="margin:0;">OpenCode Studio 项目最新版本</div>
-              <p class="modal-sub" id="updater-current-line">当前版本：v2.2.4</p>
+              <p class="modal-sub" id="updater-current-line">当前版本：v2.3.0</p>
             </div>
             <div class="updater-controls">
               <button id="btn-check-update" class="btn-primary sm">检测最新版本</button>
@@ -869,6 +868,24 @@
         <div class="action-row" style="margin-top:14px;justify-content:flex-end;">
           <button id="btn-confirm-deny" class="btn-secondary">拒绝执行</button>
           <button id="btn-confirm-allow" class="btn-danger">确认允许</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: NATIVE DESKTOP INPUT & CONFIRM DIALOG ==================== -->
+  <div id="modal-ui-dialog" class="modal-backdrop hidden">
+    <div class="modal-card sm">
+      <div class="modal-header">
+        <h3 id="ui-dialog-title">提示</h3>
+        <button type="button" class="icon-btn xs" id="btn-ui-dialog-x" title="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <p id="ui-dialog-desc" class="modal-hint hidden" style="white-space:pre-line;"></p>
+        <div id="ui-dialog-fields" class="ui-dialog-fields"></div>
+        <div class="action-row" style="margin-top:16px;justify-content:flex-end;">
+          <button type="button" id="btn-ui-dialog-cancel" class="btn-secondary">取消</button>
+          <button type="button" id="btn-ui-dialog-ok" class="btn-primary">确定</button>
         </div>
       </div>
     </div>

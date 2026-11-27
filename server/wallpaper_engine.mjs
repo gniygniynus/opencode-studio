@@ -18,6 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { logEvent } from "./logger.mjs";
+import { streamFileWithRange } from "./security.mjs";
 
 const VIDEO_EXTS = new Set([".mp4", ".webm", ".mov", ".m4v", ".mkv", ".ogv"]);
 const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"]);
@@ -277,11 +278,31 @@ export function inspectCompleteSingleImageInPkg(pkgPath) {
       const boxStart = ftypIdx - 4;
       const boxSize = sub.readUInt32BE(boxStart);
       if (boxSize >= 16 && boxSize <= 128) {
-        const length = entry.fLen - boxStart;
+        const start = absStart + boxStart;
+        const length = Math.min(entry.fLen - boxStart, st.size - start);
+        if (start < st.size && length > 0) {
+          return {
+            media_kind: "video",
+            mime: "video/mp4",
+            start,
+            length,
+            width: 0,
+            height: 0,
+            size_mb: Math.round((length / (1024 * 1024)) * 10) / 10,
+          };
+        }
+      }
+    }
+
+    const webmIdx = sub.indexOf(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+    if (webmIdx >= 0 && webmIdx <= 4096) {
+      const start = absStart + webmIdx;
+      const length = Math.min(entry.fLen - webmIdx, st.size - start);
+      if (start < st.size && length > 0) {
         return {
           media_kind: "video",
-          mime: "video/mp4",
-          start: absStart + boxStart,
+          mime: "video/webm",
+          start,
           length,
           width: 0,
           height: 0,
@@ -290,31 +311,19 @@ export function inspectCompleteSingleImageInPkg(pkgPath) {
       }
     }
 
-    const webmIdx = sub.indexOf(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
-    if (webmIdx >= 0 && webmIdx <= 4096) {
-      const length = entry.fLen - webmIdx;
-      return {
-        media_kind: "video",
-        mime: "video/webm",
-        start: absStart + webmIdx,
-        length,
-        width: 0,
-        height: 0,
-        size_mb: Math.round((length / (1024 * 1024)) * 10) / 10,
-      };
-    }
-
     // Case C: Embedded lossless high-res PNG / JPEG
     const pngIdx = sub.indexOf(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
     if (pngIdx >= 0 && pngIdx + 24 <= sub.length) {
       const width = sub.readUInt32BE(pngIdx + 16);
       const height = sub.readUInt32BE(pngIdx + 20);
       if (width < 800 || height < 600) return null;
-      const length = entry.fLen - pngIdx;
+      const start = absStart + pngIdx;
+      const length = Math.min(entry.fLen - pngIdx, st.size - start);
+      if (start >= st.size || length <= 0) return null;
       return {
         media_kind: "image",
         mime: "image/png",
-        start: absStart + pngIdx,
+        start,
         length,
         width,
         height,
@@ -326,11 +335,13 @@ export function inspectCompleteSingleImageInPkg(pkgPath) {
     if (jpgIdx >= 0) {
       const dims = parseJpegDimensions(sub.subarray(jpgIdx));
       if (!dims || dims.width < 800 || dims.height < 600) return null;
+      const start = absStart + jpgIdx;
       // Check tail bytes for exact JPEG EOI (FF D9) so zero trailing TEX bytes are appended
-      let length = entry.fLen - jpgIdx;
+      let length = Math.min(entry.fLen - jpgIdx, st.size - start);
+      if (start >= st.size || length <= 0) return null;
       const tailLen = Math.min(length, 4096);
       const tailBuf = Buffer.alloc(tailLen);
-      fs.readSync(fd, tailBuf, 0, tailLen, absStart + jpgIdx + length - tailLen);
+      fs.readSync(fd, tailBuf, 0, tailLen, start + length - tailLen);
       const eoi = tailBuf.lastIndexOf(Buffer.from([0xff, 0xd9]));
       if (eoi >= 0) {
         length = length - tailLen + eoi + 2;
@@ -338,7 +349,7 @@ export function inspectCompleteSingleImageInPkg(pkgPath) {
       return {
         media_kind: "image",
         mime: "image/jpeg",
-        start: absStart + jpgIdx,
+        start,
         length,
         width: dims.width,
         height: dims.height,
@@ -634,32 +645,13 @@ export function streamAuthorizedMedia(req, res, item, kind = "file", authorizedD
       return res.end(JSON.stringify({ error: "未授权访问路径" }));
     }
     const { start: sliceStart, length: sliceTotal, mime } = item.pkg_image_slice;
-    const range = req.headers.range;
-    if (range) {
-      const m = range.match(/bytes=(\d*)-(\d*)/);
-      const rStart = m && m[1] ? Number(m[1]) : 0;
-      const requestedEnd = m && m[2] ? Number(m[2]) : Math.min(rStart + 4 * 1024 * 1024 - 1, sliceTotal - 1);
-      const rEnd = Math.min(requestedEnd, sliceTotal - 1);
-      if (rStart >= sliceTotal || rStart > rEnd) {
-        res.writeHead(416, { "Content-Range": `bytes */${sliceTotal}` });
-        return res.end();
-      }
-      res.writeHead(206, {
-        "Content-Type": mime,
-        "Content-Range": `bytes ${rStart}-${rEnd}/${sliceTotal}`,
-        "Accept-Ranges": "bytes",
-        "Content-Length": rEnd - rStart + 1,
-        "Cache-Control": "public, max-age=86400",
-      });
-      return fs.createReadStream(item.pkg_path, { start: sliceStart + rStart, end: sliceStart + rEnd }).pipe(res);
-    }
-    res.writeHead(200, {
-      "Content-Type": mime,
-      "Content-Length": sliceTotal,
-      "Accept-Ranges": "bytes",
-      "Cache-Control": "public, max-age=86400",
+    return streamFileWithRange(req, res, item.pkg_path, {
+      contentType: mime || "application/octet-stream",
+      cacheControl: "public, max-age=86400",
+      sliceStart,
+      sliceLength: sliceTotal,
+      supportRange: true,
     });
-    return fs.createReadStream(item.pkg_path, { start: sliceStart, end: sliceStart + sliceTotal - 1 }).pipe(res);
   }
 
   const targetPath = kind === "preview" && item.preview_path ? item.preview_path : item.file_path;
@@ -668,38 +660,13 @@ export function streamAuthorizedMedia(req, res, item, kind = "file", authorizedD
     return res.end(JSON.stringify({ error: "壁纸文件不存在或不在已授权目录内" }));
   }
 
-  const st = fs.statSync(targetPath);
-  const total = st.size;
   const ext = path.extname(targetPath).toLowerCase();
   const mime = STREAM_MIME[ext] || "application/octet-stream";
-  const range = req.headers.range;
-
-  if (range) {
-    const m = range.match(/bytes=(\d*)-(\d*)/);
-    const start = m && m[1] ? Number(m[1]) : 0;
-    const requestedEnd = m && m[2] ? Number(m[2]) : Math.min(start + 4 * 1024 * 1024 - 1, total - 1);
-    const end = Math.min(requestedEnd, total - 1);
-    if (start >= total || start > end) {
-      res.writeHead(416, { "Content-Range": `bytes */${total}` });
-      return res.end();
-    }
-    res.writeHead(206, {
-      "Content-Type": mime,
-      "Content-Range": `bytes ${start}-${end}/${total}`,
-      "Accept-Ranges": "bytes",
-      "Content-Length": end - start + 1,
-      "Cache-Control": "public, max-age=3600",
-    });
-    return fs.createReadStream(targetPath, { start, end }).pipe(res);
-  }
-
-  res.writeHead(200, {
-    "Content-Type": mime,
-    "Content-Length": total,
-    "Accept-Ranges": "bytes",
-    "Cache-Control": "public, max-age=3600",
+  return streamFileWithRange(req, res, targetPath, {
+    contentType: mime,
+    cacheControl: "public, max-age=3600",
+    supportRange: true,
   });
-  return fs.createReadStream(targetPath).pipe(res);
 }
 
 function buildWeWebRuntimeShimScript(dirPath) {
@@ -754,12 +721,12 @@ function buildWeWebRuntimeShimScript(dirPath) {
     }
   }, 33);
   window.addEventListener("keydown", function(ev){
-    if (ev.key === "Escape" || (ev.altKey && (ev.key === "w" || ev.key === "W"))) {
-      try { window.parent.postMessage({ type: "ocs_zen_exit" }, window.location.origin); } catch(e){}
-    }
-  });
-})();
-</script>`;
+      if (ev.key === "Escape" || (ev.altKey && (ev.key === "w" || ev.key === "W"))) {
+        try { window.parent.postMessage({ type: "ocs_zen_exit" }, "*"); } catch(e){}
+      }
+    });
+  })();
+  </script>`;
 }
 
 export function serveAuthorizedWebAsset(req, res, item, relSubpath, authorizedDirs = []) {
@@ -790,15 +757,17 @@ export function serveAuthorizedWebAsset(req, res, item, relSubpath, authorizedDi
         "Content-Type": "text/html; charset=utf-8",
         "Content-Length": buf.length,
         "Cache-Control": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        // Strictly sandboxed without `allow-same-origin` so 3rd-party Workshop scripts run in an opaque `null` origin!
+        "Content-Security-Policy": "sandbox allow-scripts; frame-ancestors 'self'",
       });
       return res.end(buf);
     } catch {}
   }
-  res.writeHead(200, {
-    "Content-Type": STREAM_MIME[ext] || "application/octet-stream",
-    "Cache-Control": "no-cache",
+  return streamFileWithRange(req, res, fullPath, {
+    contentType: STREAM_MIME[ext] || "application/octet-stream",
+    cacheControl: "no-cache",
   });
-  return fs.createReadStream(fullPath).pipe(res);
 }
 
 export function serializeWeItemForClient(it) {

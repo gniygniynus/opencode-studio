@@ -124,9 +124,14 @@ async function handleRequest(msg) {
 }
 
 let buffer = "";
+process.stdout.on("error", () => process.exit(0));
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
+  if (buffer.length > 4 * 1024 * 1024) {
+    buffer = "";
+    return;
+  }
   const lines = buffer.split(/\r?\n/);
   buffer = lines.pop() || "";
   for (const raw of lines) {
@@ -134,7 +139,11 @@ process.stdin.on("data", (chunk) => {
     if (!trimmed) continue;
     try {
       const msg = JSON.parse(trimmed);
-      handleRequest(msg);
+      handleRequest(msg).catch((err) => {
+        if (msg?.id !== undefined) {
+          sendJsonRpc({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: err?.message || "Internal error" } });
+        }
+      });
     } catch {}
   }
 });

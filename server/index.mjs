@@ -74,7 +74,17 @@ import { recordDeletedDiskMemory, resetMemorySyncCache, syncDiskMemoriesToDb, sy
 import { enrichProviderForClient, fetchProviderModels, testProviderConnection } from "./model_registry.mjs";
 import { SessionOrchestrator } from "./orchestrator.mjs";
 import { getPaths, PUBLIC_DIR } from "./paths.mjs";
-import { proxyFetch } from "./runtime_utils.mjs";
+import { killProcessTree, proxyFetch } from "./runtime_utils.mjs";
+import {
+  atomicWriteFileSync,
+  capMapSize,
+  isRealPathInsideDir,
+  isSafePublicUrl,
+  isValidInternalRequest,
+  parseCookies,
+  safeTokenEqual,
+  streamFileWithRange,
+} from "./security.mjs";
 import {
   downloadRemoteSkillContent,
   importPublicSkillFromUrl,
@@ -255,6 +265,7 @@ function cleanupLegacyResidues(paths, activeSessionIds = [], purgeArchived = fal
     let sum = 0;
     try {
       for (const ent of fs.readdirSync(dirPath, { withFileTypes: true })) {
+        if (ent.isSymbolicLink()) continue;
         const full = path.join(dirPath, ent.name);
         if (ent.isFile()) {
           try {
@@ -268,15 +279,25 @@ function cleanupLegacyResidues(paths, activeSessionIds = [], purgeArchived = fal
     return sum;
   };
 
-  // 1. Clean exited electron-builder portable temp extraction folders (`%TEMP%/...` containing `OpenCode Studio.exe`)
+  // 1. Clean exited electron-builder portable temp extraction folders (`%TEMP%/...` containing `OpenCode Studio.exe` + `resources/app.asar`)
   try {
     const tmpRoot = os.tmpdir();
     for (const ent of fs.readdirSync(tmpRoot, { withFileTypes: true })) {
-      if (!ent.isDirectory()) continue;
+      if (!ent.isDirectory() || ent.isSymbolicLink()) continue;
       const candDir = path.join(tmpRoot, ent.name);
       if (path.resolve(candDir).toLowerCase() === currentExecDir) continue;
       const markerExe = path.join(candDir, "OpenCode Studio.exe");
-      if (!fs.existsSync(markerExe)) continue;
+      const markerAsar = path.join(candDir, "resources", "app.asar");
+      if (!fs.existsSync(markerExe) || !fs.existsSync(markerAsar)) continue;
+      // Verify EXE is not locked by a running instance before removing directory
+      let isLocked = false;
+      try {
+        const fd = fs.openSync(markerExe, "r+");
+        fs.closeSync(fd);
+      } catch {
+        isLocked = true;
+      }
+      if (isLocked) continue;
       const bytes = dirSizeBytes(candDir);
       try {
         fs.rmSync(candDir, { recursive: true, force: true });
@@ -290,10 +311,17 @@ function cleanupLegacyResidues(paths, activeSessionIds = [], purgeArchived = fal
     }
   } catch {}
 
-  // 2. Clean leftover temporary system prompt files in logsDir (`prompt_*.txt` older than 2 minutes)
+  // 2. Clean leftover temporary system prompt & MCP config files older than 5 minutes
   let orphanPromptsRemoved = 0;
   try {
-    const cutoff = Date.now() - 2 * 60 * 1000;
+    const cutoff = Date.now() - 5 * 60 * 1000;
+    for (const f of fs.readdirSync(paths.mcpDir)) {
+      if (!/^mcp_cfg_.*\.json$/i.test(f)) continue;
+      const fp = path.join(paths.mcpDir, f);
+      try {
+        if (fs.statSync(fp).mtimeMs < cutoff) fs.unlinkSync(fp);
+      } catch {}
+    }
     for (const f of fs.readdirSync(paths.logsDir)) {
       if (!/^prompt_.*\.txt$/i.test(f)) continue;
       const fp = path.join(paths.logsDir, f);
@@ -478,7 +506,7 @@ function spawnAsyncStdout(cmd, args, opts = {}) {
     let stderr = "";
     const proc = spawn(cmd, args, { ...opts, stdio: ["ignore", "pipe", "pipe"] });
     const timer = setTimeout(() => {
-      try { proc.kill(); } catch {}
+      killProcessTree(proc);
       resolve({ status: -1, stdout, stderr: stderr + " timeout" });
     }, opts.timeout || 180000);
     proc.stdout?.on("data", (d) => { stdout += d.toString("utf8"); });
@@ -639,28 +667,7 @@ if ($picked) { Write-Output $picked }
 }
 
 function isPublicMediaUrl(rawUrl) {
-  try {
-    const u = new URL(rawUrl);
-    if (u.protocol !== "http:" && u.protocol !== "https:") return false;
-    const h = u.hostname.toLowerCase();
-    if (
-      h === "localhost" ||
-      h.endsWith(".local") ||
-      h === "::1" ||
-      h.startsWith("[::1]") ||
-      h.startsWith("127.") ||
-      h.startsWith("10.") ||
-      h.startsWith("192.168.") ||
-      h.startsWith("169.254.") ||
-      h.startsWith("0.") ||
-      /^172\.(1[6-9]|2\d|3[01])\./.test(h)
-    ) {
-      return false;
-    }
-    return true;
-  } catch {
-    return false;
-  }
+  return isSafePublicUrl(rawUrl);
 }
 
 function enforceWallpaperCacheBudget(dir, maxBytes = 80 * 1024 * 1024) {
@@ -711,6 +718,15 @@ function serveStaticFile(req, res, fp) {
   const ext = path.extname(fp).toLowerCase();
   const contentType = MIME[ext] || "application/octet-stream";
   const compressible = /\.(html|css|js|mjs|json|svg)$/i.test(ext);
+  const secHeaders = {
+    "X-Content-Type-Options": "nosniff",
+    ...(ext === ".html"
+      ? {
+          "X-Frame-Options": "SAMEORIGIN",
+          "Referrer-Policy": "no-referrer",
+        }
+      : {}),
+  };
 
   if (st.size <= 2 * 1024 * 1024) {
     let cached = _staticAssetCache.get(fp);
@@ -720,10 +736,11 @@ function serveStaticFile(req, res, fp) {
       const etag = `W/"${st.size.toString(16)}-${Math.trunc(st.mtimeMs).toString(16)}"`;
       cached = { mtimeMs: st.mtimeMs, size: st.size, etag, raw, gzip };
       _staticAssetCache.set(fp, cached);
+      capMapSize(_staticAssetCache, 64);
     }
 
     if (req.headers["if-none-match"] === cached.etag) {
-      res.writeHead(304, { ETag: cached.etag, "Cache-Control": "no-cache" });
+      res.writeHead(304, { ETag: cached.etag, "Cache-Control": "no-cache", ...secHeaders });
       return res.end();
     }
 
@@ -735,14 +752,18 @@ function serveStaticFile(req, res, fp) {
       ETag: cached.etag,
       "Cache-Control": "no-cache",
       Vary: "Accept-Encoding",
+      ...secHeaders,
     };
     if (useGzip) headers["Content-Encoding"] = "gzip";
     res.writeHead(200, headers);
     return res.end(outBuf);
   }
 
-  res.writeHead(200, { "Content-Type": contentType, "Content-Length": st.size, "Cache-Control": "no-cache" });
-  return fs.createReadStream(fp).pipe(res);
+  return streamFileWithRange(req, res, fp, {
+    contentType,
+    cacheControl: "no-cache",
+    extraHeaders: secHeaders,
+  });
 }
 
 function sendJson(res, status, data) {
@@ -753,6 +774,7 @@ function sendJson(res, status, data) {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": outBuf.length,
     "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
   };
   if (useGzip) {
     headers["Content-Encoding"] = "gzip";
@@ -763,6 +785,16 @@ function sendJson(res, status, data) {
 }
 
 async function readJsonBody(req, maxBytes = 25 * 1024 * 1024) {
+  const ctype = String(req.headers?.["content-type"] || "").toLowerCase();
+  if (ctype && !ctype.includes("application/json")) {
+    const err = new Error("仅接受 Content-Type: application/json 请求");
+    err.code = "ERR_UNSUPPORTED_MEDIA_TYPE";
+    throw err;
+  } else if (!ctype && Number(req.headers?.["content-length"] || 0) > 0) {
+    const err = new Error("缺少 Content-Type: application/json 请求头");
+    err.code = "ERR_UNSUPPORTED_MEDIA_TYPE";
+    throw err;
+  }
   const chunks = [];
   let total = 0;
   for await (const chunk of req) {
@@ -848,9 +880,24 @@ function scanWorkspaceFiles(cwd, query = "") {
   return out;
 }
 
-export async function startServer({ host = "127.0.0.1", port = Number(process.env.OPENCODE_PORT || 17620) } = {}) {
+export async function startServer({
+  host = "127.0.0.1",
+  port = Number(process.env.OPENCODE_PORT || 17620),
+  desktopMode = process.env.OPENCODE_DESKTOP_MODE === "1",
+  requireAuth = true,
+} = {}) {
   const paths = getPaths();
   getDb(); // initialize SQLite WAL schema
+
+  // Instance-scoped cryptographic session token (prevents CSWSH, CSRF, DNS rebinding & external browser snooping!)
+  const authToken = crypto.randomBytes(32).toString("hex");
+  let desktopBootNonce = crypto.randomBytes(24).toString("hex");
+  const localTokenFile = path.join(paths.dataRoot, ".local_session_token");
+  if (!desktopMode && requireAuth) {
+    try {
+      atomicWriteFileSync(localTokenFile, authToken, { encoding: "utf8", mode: 0o600 });
+    } catch {}
+  }
 
   const mcpManager = new McpManager();
   mcpManager.syncFromDb().catch(() => {});
@@ -872,6 +919,31 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
   const orchestrator = new SessionOrchestrator({ broadcast, mcpManager, getPort: () => boundPort });
   const appVersion = getAppVersion();
 
+  const isAllowedHostHeader = (rawHost) => {
+    if (!rawHost) return false;
+    const h = String(rawHost).trim().toLowerCase();
+    return (
+      h === `127.0.0.1:${boundPort}` ||
+      h === `localhost:${boundPort}` ||
+      (boundPort === 80 && (h === "127.0.0.1" || h === "localhost"))
+    );
+  };
+
+  const isAllowedOriginHeader = (rawOrigin) => {
+    if (!rawOrigin) return true;
+    const o = String(rawOrigin).trim().toLowerCase();
+    return o === `http://127.0.0.1:${boundPort}` || o === `http://localhost:${boundPort}`;
+  };
+
+  const isRequestAuthenticated = (req) => {
+    if (!requireAuth) return true;
+    const headerTok = String(req.headers?.["x-ocs-token"] || "").trim();
+    if (headerTok && safeTokenEqual(headerTok, authToken)) return true;
+    const cookies = parseCookies(req.headers?.cookie);
+    if (cookies.ocs_session && safeTokenEqual(cookies.ocs_session, authToken)) return true;
+    return false;
+  };
+
   // Warm up Claude runtime & auth status asynchronously in background so first `/api/bootstrap` never blocks!
   refreshClaudeRuntimeAndAuthAsync(false)
     .then((status) => broadcast({ type: "claude_status_updated", claude_native: status }))
@@ -881,8 +953,19 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
     res._req = req;
     const reqId = newReqId();
     try {
+      // 1. Strict Host validation against DNS rebinding attacks
+      if (requireAuth && !isAllowedHostHeader(req.headers.host)) {
+        res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+        return res.end("Forbidden: Invalid Host header");
+      }
+
       const urlObj = new URL(req.url || "/", `http://${host}:${boundPort || port}`);
-      const pathname = decodeURIComponent(urlObj.pathname);
+      let pathname;
+      try {
+        pathname = decodeURIComponent(urlObj.pathname);
+      } catch {
+        return sendJson(res, 400, { ok: false, error: "Invalid URL encoding" });
+      }
       const method = (req.method || "GET").toUpperCase();
 
       // ==================== BUILT-IN TRANSPARENT API PROXY FOR NATIVE CLAUDE CODE ====================
@@ -890,11 +973,55 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       if (method === "POST" && proxyMatch) {
         const thinkingHint = proxyMatch[2] ? decodeURIComponent(proxyMatch[2]) : "";
         const sessionIdHint = proxyMatch[3] ? decodeURIComponent(proxyMatch[3]) : "";
-        return await handleProviderProxyRequest(req, res, proxyMatch[1], proxyMatch[4], thinkingHint, sessionIdHint);
+        return await handleProviderProxyRequest(
+          req,
+          res,
+          proxyMatch[1],
+          proxyMatch[4],
+          thinkingHint,
+          sessionIdHint,
+          requireAuth,
+        );
       }
 
-      // ==================== HEALTH & BOOTSTRAP ====================
+      // ==================== INTERNAL PERMISSION GUARD CALLBACK ====================
+      if (method === "POST" && pathname === "/api/internal/confirm") {
+        if (!isValidInternalRequest(req)) {
+          return sendJson(res, 401, { ok: false, error: "Unauthorized internal guard call" });
+        }
+        const body = await readJsonBody(req);
+        const approved = await orchestrator.requestExternalConfirm(String(body.session_id || ""), {
+          tool: String(body.tool || "Bash"),
+          command: String(body.command || ""),
+          reason: String(body.reason || "检测到高风险操作，请确认是否允许执行："),
+        });
+        return sendJson(res, 200, { ok: true, approved: Boolean(approved) });
+      }
+
+      // ==================== ONE-TIME BOOTSTRAP COOKIE HANDSHAKE ====================
+      if (method === "GET" && pathname === "/") {
+        const bootParam = urlObj.searchParams.get("ocs_boot") || "";
+        const authParam = urlObj.searchParams.get("ocs_auth") || "";
+        const validDesktopBoot = desktopMode && bootParam && safeTokenEqual(bootParam, desktopBootNonce);
+        const validLocalAuth = !desktopMode && authParam && safeTokenEqual(authParam, authToken);
+        if (validDesktopBoot || validLocalAuth) {
+          if (validDesktopBoot) {
+            desktopBootNonce = crypto.randomBytes(24).toString("hex");
+          }
+          res.writeHead(302, {
+            Location: "/",
+            "Set-Cookie": `ocs_session=${authToken}; Path=/; HttpOnly; SameSite=Strict`,
+            "Cache-Control": "no-store",
+          });
+          return res.end();
+        }
+      }
+
+      // ==================== HEALTH PROBE (MINIMAL WHEN UNAUTHENTICATED) ====================
       if (method === "GET" && pathname === "/api/health") {
+        if (!isRequestAuthenticated(req)) {
+          return sendJson(res, 200, { ok: true, app: "OpenCode Studio", version: appVersion });
+        }
         const activeProv = enrichProviderForClient(getActiveProvider(false));
         return sendJson(res, 200, {
           ok: true,
@@ -907,6 +1034,33 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
           active_provider: activeProv,
           running_sessions: orchestrator.runningSessionIds(),
         });
+      }
+
+      // ==================== ORIGIN & SESSION AUTH GATE ====================
+      // Allow read-only sandboxed Wallpaper Engine Web assets (`Origin: null` inside `<iframe sandbox="allow-scripts">`)
+      const isSandboxedWeReadOnly =
+        method === "GET" && (pathname.startsWith("/api/we/web/") || pathname === "/api/we/media");
+
+      if (requireAuth && !isSandboxedWeReadOnly) {
+        if (req.headers.origin && !isAllowedOriginHeader(req.headers.origin)) {
+          return sendJson(res, 403, { ok: false, error: "拒绝跨站 Origin 请求" });
+        }
+        if (pathname.startsWith("/api/")) {
+          if (!isRequestAuthenticated(req)) {
+            return sendJson(res, 401, { ok: false, error: "未授权访问本地服务，请通过应用窗口或官方启动器打开。" });
+          }
+        } else if (desktopMode && !isRequestAuthenticated(req)) {
+          // Pure Desktop Mode: strictly block external web browsers from loading the UI!
+          res.writeHead(403, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+          return res.end(
+            `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>OpenCode Studio 桌面安全隔离</title></head>` +
+              `<body style="font-family:system-ui,sans-serif;background:#0f1116;color:#e5e7eb;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">` +
+              `<div style="max-width:460px;padding:28px;border-radius:16px;background:#181b23;border:1px solid rgba(255,255,255,0.1);text-align:center;">` +
+              `<h3 style="margin:0 0 10px;">OpenCode Studio 独立桌面客户端</h3>` +
+              `<p style="margin:0;color:#9ca3af;font-size:14px;line-height:1.6;">当前运行于非网页独立桌面安全隔离模式，已禁止任何外部浏览器或网页访问内部进程端口。</p>` +
+              `</div></body></html>`,
+          );
+        }
       }
 
       if (method === "GET" && pathname === "/api/bootstrap") {
@@ -1187,6 +1341,9 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       }
       if (method === "POST" && pathname.match(/^\/api\/sessions\/([^/]+)\/switch-branch$/)) {
         const sid = pathname.split("/")[3];
+        if (orchestrator.runningSessionIds().includes(sid)) {
+          return sendJson(res, 409, { ok: false, error: "当前会话正在运行，请等待完成或点击停止后再切换历史分支" });
+        }
         const body = await readJsonBody(req);
         const timeline = switchBranch(sid, body.message_id);
         broadcast({ type: "timeline_updated", session_id: sid, timeline });
@@ -1316,28 +1473,11 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
 
         const serveCachedFile = () => {
           const mime = fs.readFileSync(metaPath, "utf8").trim() || "application/octet-stream";
-          const total = fs.statSync(cachePath).size;
-          const range = req.headers.range;
-          if (range && mime.startsWith("video/")) {
-            const m = range.match(/bytes=(\d*)-(\d*)/);
-            const start = m && m[1] ? Number(m[1]) : 0;
-            const end = m && m[2] ? Math.min(Number(m[2]), total - 1) : total - 1;
-            res.writeHead(206, {
-              "Content-Type": mime,
-              "Content-Range": `bytes ${start}-${end}/${total}`,
-              "Accept-Ranges": "bytes",
-              "Content-Length": end - start + 1,
-              "Cache-Control": "public, max-age=86400",
-            });
-            return fs.createReadStream(cachePath, { start, end }).pipe(res);
-          }
-          res.writeHead(200, {
-            "Content-Type": mime,
-            "Content-Length": total,
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "public, max-age=86400",
+          return streamFileWithRange(req, res, cachePath, {
+            contentType: mime,
+            cacheControl: "public, max-age=86400",
+            supportRange: true,
           });
-          return fs.createReadStream(cachePath).pipe(res);
         };
 
         if (fs.existsSync(cachePath) && fs.existsSync(metaPath)) {
@@ -1346,8 +1486,8 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
 
         try {
           const fetched = await fetchPublicMediaBuffer(rawUrl, fbUrl);
-          fs.writeFileSync(cachePath, fetched.buf);
-          fs.writeFileSync(metaPath, fetched.mime, "utf8");
+          atomicWriteFileSync(cachePath, fetched.buf);
+          atomicWriteFileSync(metaPath, fetched.mime, "utf8");
           // Strictly cap browse thumbnail cache to 35MB (NEVER touches active_wallpaper_* or user uploads!)
           enforceWallpaperCacheBudget(paths.backgroundsDir, 35 * 1024 * 1024);
           return serveCachedFile();
@@ -1519,31 +1659,16 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       if (method === "GET" && pathname.startsWith("/api/bg-files/")) {
         const fname = path.basename(pathname.slice("/api/bg-files/".length));
         const fp = path.join(paths.backgroundsDir, fname);
-        if (!fs.existsSync(fp)) return sendJson(res, 404, { error: "not found" });
-        const ext = path.extname(fp).toLowerCase();
-        const total = fs.statSync(fp).size;
-        const mime = MIME[ext] || "application/octet-stream";
-        const range = req.headers.range;
-        if (range && mime.startsWith("video/")) {
-          const m = range.match(/bytes=(\d*)-(\d*)/);
-          const start = m && m[1] ? Number(m[1]) : 0;
-          const end = m && m[2] ? Math.min(Number(m[2]), total - 1) : total - 1;
-          res.writeHead(206, {
-            "Content-Type": mime,
-            "Content-Range": `bytes ${start}-${end}/${total}`,
-            "Accept-Ranges": "bytes",
-            "Content-Length": end - start + 1,
-            "Cache-Control": "public, max-age=31536000",
-          });
-          return fs.createReadStream(fp, { start, end }).pipe(res);
+        if (!isRealPathInsideDir(fp, paths.backgroundsDir) || !fs.existsSync(fp)) {
+          return sendJson(res, 404, { error: "not found" });
         }
-        res.writeHead(200, {
-          "Content-Type": mime,
-          "Content-Length": total,
-          "Accept-Ranges": "bytes",
-          "Cache-Control": "public, max-age=31536000",
+        const ext = path.extname(fp).toLowerCase();
+        const mime = MIME[ext] || "application/octet-stream";
+        return streamFileWithRange(req, res, fp, {
+          contentType: mime,
+          cacheControl: "public, max-age=31536000",
+          supportRange: true,
         });
-        return fs.createReadStream(fp).pipe(res);
       }
 
       // ==================== UNIVERSAL CHAT ATTACHMENTS (IMAGES + TXT/CODE + ANY FILES) ====================
@@ -1610,11 +1735,32 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       if (method === "GET" && pathname.startsWith("/api/uploads/")) {
         const fname = path.basename(pathname.slice("/api/uploads/".length));
         const fp = path.join(paths.uploadsDir, fname);
-        if (!fs.existsSync(fp)) return sendJson(res, 404, { error: "not found" });
+        if (!isRealPathInsideDir(fp, paths.uploadsDir) || !fs.existsSync(fp)) {
+          return sendJson(res, 404, { error: "not found" });
+        }
         const ext = path.extname(fp).toLowerCase();
-        const contentType = MIME[ext] || (TEXT_FILE_EXTS.has(ext) ? "text/plain; charset=utf-8" : "application/octet-stream");
-        res.writeHead(200, { "Content-Type": contentType });
-        return fs.createReadStream(fp).pipe(res);
+        const safeInlineImage = [".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(ext);
+        // Never serve uploaded .html/.svg/.xml/.js as executable inline documents on our origin!
+        const contentType = safeInlineImage
+          ? MIME[ext]
+          : TEXT_FILE_EXTS.has(ext) || [".html", ".htm", ".svg", ".xml", ".js", ".mjs"].includes(ext)
+            ? "text/plain; charset=utf-8"
+            : "application/octet-stream";
+        const extraHeaders = {
+          "Content-Security-Policy": "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox",
+          ...(safeInlineImage
+            ? {}
+            : { "Content-Disposition": `inline; filename="${encodeURIComponent(fname)}"` }),
+        };
+        if (!safeInlineImage && contentType === "application/octet-stream") {
+          extraHeaders["Content-Disposition"] = `attachment; filename="${encodeURIComponent(fname)}"`;
+        }
+        return streamFileWithRange(req, res, fp, {
+          contentType,
+          cacheControl: "private, max-age=3600",
+          extraHeaders,
+          supportRange: false,
+        });
       }
 
       // ==================== WORKDIR & FILES ====================
@@ -1689,14 +1835,19 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
       if (method === "GET") {
         const rel = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
         const fp = path.join(PUBLIC_DIR, rel);
-        if (fp.startsWith(PUBLIC_DIR) && fs.existsSync(fp) && fs.statSync(fp).isFile()) {
+        if (isRealPathInsideDir(fp, PUBLIC_DIR) && fs.existsSync(fp) && fs.statSync(fp).isFile()) {
           return serveStaticFile(req, res, fp);
         }
       }
 
       sendJson(res, 404, { ok: false, error: `Not Found: ${pathname}` });
     } catch (err) {
-      const code = err.code === "ERR_MEMORY_CONFLICT" ? 409 : 500;
+      const code =
+        err.code === "ERR_MEMORY_CONFLICT"
+          ? 409
+          : err.code === "ERR_UNSUPPORTED_MEDIA_TYPE"
+            ? 415
+            : 500;
       logEvent("ERROR", "http", "unhandled", `${req.method} ${req.url}: ${err.message}`, { reqId, layer: "web-server" });
       sendJson(res, code, {
         ok: false,
@@ -1705,8 +1856,30 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
     }
   });
 
-  // ==================== WEBSOCKET MULTIPLEXER ====================
-  const wss = new WebSocketServer({ server, path: "/ws" });
+  // ==================== WEBSOCKET MULTIPLEXER (PROTECTED AGAINST CSWSH) ====================
+  const wss = new WebSocketServer({
+    server,
+    path: "/ws",
+    verifyClient: (info, cb) => {
+      if (!requireAuth) return cb(true);
+      const req = info.req;
+      if (!isAllowedHostHeader(req.headers.host)) {
+        return cb(false, 403, "Forbidden Host");
+      }
+      if (!isAllowedOriginHeader(req.headers.origin) || req.headers.origin === "null") {
+        return cb(false, 403, "Forbidden Origin");
+      }
+      if (!isRequestAuthenticated(req)) {
+        try {
+          const u = new URL(req.url || "/ws", `http://${host}:${boundPort || port}`);
+          const qTok = u.searchParams.get("token") || "";
+          if (qTok && safeTokenEqual(qTok, authToken)) return cb(true);
+        } catch {}
+        return cb(false, 401, "Unauthorized WebSocket");
+      }
+      return cb(true);
+    },
+  });
   wss.on("connection", (ws) => {
     wsClients.add(ws);
     const providers = listProviders(false).map(enrichProviderForClient);
@@ -1731,7 +1904,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
         if (msg.type === "ping") {
           ws.send(JSON.stringify({ type: "pong" }));
         } else if (msg.type === "send_message") {
-          await orchestrator.sendMessage({
+          const r = await orchestrator.sendMessage({
             sessionId: msg.session_id || "",
             text: msg.text || "",
             images: msg.images || [],
@@ -1740,9 +1913,11 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
             model: msg.model || "",
             thinkingLevel: msg.thinking_level || "auto",
             webSearchEnabled: msg.web_search !== undefined ? Boolean(msg.web_search) : null,
+            clientReqId: msg.client_req_id || "",
           });
+          if (r?.busy) ws.send(JSON.stringify({ type: "busy_notice", session_id: msg.session_id || "", message: r.error }));
         } else if (msg.type === "edit_resend") {
-          await orchestrator.editAndResend({
+          const r = await orchestrator.editAndResend({
             sessionId: msg.session_id,
             messageId: msg.message_id,
             newText: msg.new_text,
@@ -1752,8 +1927,9 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
             thinkingLevel: msg.thinking_level || "",
             webSearchEnabled: msg.web_search !== undefined ? Boolean(msg.web_search) : null,
           });
+          if (r?.busy) ws.send(JSON.stringify({ type: "busy_notice", session_id: msg.session_id || "", message: r.error }));
         } else if (msg.type === "regenerate_reply") {
-          await orchestrator.regenerateReply({
+          const r = await orchestrator.regenerateReply({
             sessionId: msg.session_id,
             assistantMessageId: msg.assistant_message_id,
             providerId: msg.provider_id || "",
@@ -1761,6 +1937,7 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
             thinkingLevel: msg.thinking_level || "",
             webSearchEnabled: msg.web_search !== undefined ? Boolean(msg.web_search) : null,
           });
+          if (r?.busy) ws.send(JSON.stringify({ type: "busy_notice", session_id: msg.session_id || "", message: r.error }));
         } else if (msg.type === "stop_turn") {
           orchestrator.stopTurn(msg.session_id);
         } else if (msg.type === "confirm_response") {
@@ -1796,22 +1973,33 @@ export async function startServer({ host = "127.0.0.1", port = Number(process.en
   const actualPort = typeof addr === "object" && addr ? addr.port : port;
   boundPort = actualPort;
   const url = `http://${host}:${actualPort}`;
-  logEvent("INFO", "server", "started", `OpenCode Studio v${appVersion} 启动于 ${url} (data=${paths.dataRoot})`);
+  logEvent(
+    "INFO",
+    "server",
+    "started",
+    `OpenCode Studio v${appVersion} 启动于 ${url} (mode=${desktopMode ? "desktop-isolated" : "local"}, data=${paths.dataRoot})`,
+  );
 
   return {
     server,
     wss,
     url,
+    get desktopBootUrl() {
+      return `${url}/?ocs_boot=${desktopBootNonce}`;
+    },
+    authToken,
     port: actualPort,
     mcpManager,
     orchestrator,
     async stop() {
+      orchestrator.stopAll();
       mcpManager.stopAll();
       for (const ws of wsClients) {
         try {
           ws.close();
         } catch {}
       }
+      server.closeAllConnections?.();
       await new Promise((r) => server.close(() => r()));
     },
   };

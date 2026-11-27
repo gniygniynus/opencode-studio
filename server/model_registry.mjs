@@ -11,6 +11,7 @@
  */
 
 import { logEvent } from "./logger.mjs";
+import { fetchUpstreamWithSafeRedirects } from "./security.mjs";
 
 export const THINKING_BUDGETS = {
   off: 0,
@@ -175,7 +176,7 @@ export function detectModelCapabilities(modelId, providerKind = "openai", remote
   // --- GLM / Kimi / MiniMax / Step / Hunyuan ---
   else if (/glm-4\.5|glm-4\.6|glm-5|kimi-k2|minimax-m|step-r|hunyuan-t1/.test(low)) {
     cap.family = "cn-flagship";
-    cap.vision = /v|vision|4\.5v|5|k2\.5/.test(low);
+    cap.vision = /(?:^|[-_./])(?:vl|vision|4\.5v|4\.6v|glm-5v)(?:$|[-_.\[])|kimi-k2\.5/.test(low);
     cap.context_window = explicitCtx || 200_000;
     if (/think|glm-4\.[56]|glm-5|kimi-k2|minimax-m|step-r|t1/.test(low)) {
       cap.thinking_supported = true;
@@ -224,6 +225,13 @@ export function detectModelCapabilities(modelId, providerKind = "openai", remote
     if (userOverride.thinking_mode) cap.thinking_mode = userOverride.thinking_mode;
     if (Array.isArray(userOverride.thinking_levels) && userOverride.thinking_levels.length) {
       cap.thinking_levels = userOverride.thinking_levels;
+    }
+    if (cap.thinking_supported) {
+      if (cap.thinking_mode === "none") cap.thinking_mode = "toggle";
+      if (!cap.thinking_levels.length) cap.thinking_levels = ["off", "on"];
+      if (!cap.default_thinking || cap.default_thinking === "off") {
+        cap.default_thinking = cap.thinking_levels.find((l) => l !== "off") || "on";
+      }
     }
     if (Number(userOverride.context_window) > 0) cap.context_window = Number(userOverride.context_window);
     if (typeof userOverride.vision === "boolean") cap.vision = userOverride.vision;
@@ -286,7 +294,7 @@ export async function fetchProviderModels(provider) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12000);
   try {
-    const res = await fetch(url, { method: "GET", headers, signal: controller.signal });
+    const res = await fetchUpstreamWithSafeRedirects(url, { method: "GET", headers, signal: controller.signal });
     const text = await res.text();
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}: ${text.slice(0, 300)}`);
@@ -375,7 +383,7 @@ export async function testProviderConnection(provider) {
         headers["x-api-key"] = provider.api_key;
         headers["Authorization"] = `Bearer ${provider.api_key}`;
       }
-      const res = await fetch(url, {
+      const res = await fetchUpstreamWithSafeRedirects(url, {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -413,7 +421,7 @@ export async function testProviderConnection(provider) {
     const headers = { "Content-Type": "application/json" };
     if (provider.api_key) headers["Authorization"] = `Bearer ${provider.api_key}`;
 
-    let res = await fetch(url, {
+    let res = await fetchUpstreamWithSafeRedirects(url, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -426,7 +434,7 @@ export async function testProviderConnection(provider) {
     });
 
     if (res.status === 400 || res.status === 422) {
-      const retryRes = await fetch(url, {
+      const retryRes = await fetchUpstreamWithSafeRedirects(url, {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -437,7 +445,12 @@ export async function testProviderConnection(provider) {
         }),
         signal: controller.signal,
       });
-      if (retryRes.ok) res = retryRes;
+      if (retryRes.ok) {
+        try { await res.body?.cancel(); } catch {}
+        res = retryRes;
+      } else {
+        try { await retryRes.body?.cancel(); } catch {}
+      }
     }
 
     const latencyMs = Math.round(performance.now() - t0);
